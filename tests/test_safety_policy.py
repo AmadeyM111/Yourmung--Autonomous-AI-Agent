@@ -126,6 +126,31 @@ def test_policy_check_calls_llm(monkeypatch):
     assert len(stub.calls) == 1
 
 
+@pytest.mark.parametrize(
+    ("model", "key_name"),
+    [
+        ("poolside/laguna-xs.2:free", "LAGUNA_API_KEY"),
+        ("google/gemma-4-26b-a4b-it:free", "GEMMA_API_KEY"),
+        ("google/gemma-4-31b-it:free", "GEMA_API_KEY"),
+        ("nvidia/nemotron-3-nano-30b-a3b:free", "NEMOTRON_API_KEY"),
+    ],
+)
+def test_model_scoped_openrouter_key_enables_safety_backend(monkeypatch, model, key_name):
+    from ouroboros.safety import check_safety
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv(key_name, "model-scoped-key")
+    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", model)
+    stub = _StubLLMClient('{"status":"SAFE","reason":"ok"}')
+    _patch_llm_client(monkeypatch, stub)
+
+    ok, msg = check_safety("comment_on_pr", {"pr_number": 1, "body": "hi"})
+
+    assert ok is True
+    assert msg == ""
+    assert stub.calls[0]["model"] == model
+
+
 def test_unknown_tool_defaults_to_check(monkeypatch):
     """A tool name not present in TOOL_POLICY must fall through to a LLM check."""
     from ouroboros.safety import check_safety
@@ -346,6 +371,39 @@ def test_llm_api_failure_blocks(monkeypatch):
     assert ok is False
     assert "SAFETY_UNAVAILABLE" in msg
     assert "network down" in msg
+
+
+def test_remote_safety_failure_uses_configured_fallback(monkeypatch):
+    """An unavailable remote light model must not bypass the configured slave."""
+    from ouroboros.safety import check_safety
+    import ouroboros.safety as safety
+
+    monkeypatch.setenv("GIGACHAT_CREDENTIALS", "fake-gigachat")
+    monkeypatch.setenv("QWEN_API_KEY", "fake-qwen")
+    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "gigachat::GigaChat-2-Max")
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACK", "qwen/qwen3.6-flash")
+
+    class _FallbackClient:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, *, messages, model, use_local):
+            self.calls.append({"messages": messages, "model": model, "use_local": use_local})
+            if model.startswith("gigachat::"):
+                raise RuntimeError("No such model")
+            return {"content": '{"status":"SAFE","reason":"ok"}'}, {}
+
+    stub = _FallbackClient()
+    monkeypatch.setattr(safety, "LLMClient", lambda: stub)
+
+    ok, msg = check_safety("create_github_issue", {"title": "x"})
+
+    assert ok is True
+    assert msg == ""
+    assert [call["model"] for call in stub.calls] == [
+        "gigachat::GigaChat-2-Max",
+        "qwen/qwen3.6-flash",
+    ]
 
 
 # ---------------------------------------------------------------------------

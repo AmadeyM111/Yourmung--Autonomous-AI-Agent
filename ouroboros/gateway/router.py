@@ -81,6 +81,7 @@ def collect_routes(
     from ouroboros.gateway.widgets import api_widget_fault_post, api_widgets
     from ouroboros.gateway.contributions import api_extension_host_asset
     from ouroboros.gateway.files import (
+        api_audio_upload,
         api_chat_upload,
         api_chat_upload_delete,
         file_browser_routes,
@@ -288,6 +289,7 @@ def collect_routes(
         Route("/api/logs/{name}", endpoint=api_logs_tail, methods=["GET"]),
         Route("/api/chat/upload", endpoint=api_chat_upload, methods=["POST"]),
         Route("/api/chat/upload", endpoint=api_chat_upload_delete, methods=["DELETE"]),
+        Route("/api/audio/upload", endpoint=api_audio_upload, methods=["POST"]),
         Route("/api/openai-compatible/models", endpoint=api_openai_compatible_models, methods=["POST"]),
         Route("/api/providers/test", endpoint=api_provider_test, methods=["POST"]),
         Route("/api/local-model/start", endpoint=api_local_model_start, methods=["POST"]),
