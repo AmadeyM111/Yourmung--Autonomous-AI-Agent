@@ -253,7 +253,12 @@ def _start_server(repo_dir: pathlib.Path, *, host: str, port: int, data_dir: pat
     env["OUROBOROS_DATA_DIR"] = str(data_dir)
     env["OUROBOROS_REPO_DIR"] = str(repo_dir)
     env["OUROBOROS_FILE_BROWSER_DEFAULT"] = env.get("OUROBOROS_FILE_BROWSER_DEFAULT", str(repo_dir))
-    return subprocess.Popen(_server_command(repo_dir, host=host, port=port), env=env)
+    from ouroboros.process_custody import spawn_supervised
+
+    return spawn_supervised(
+        _server_command(repo_dir, host=host, port=port), env=env,
+        drive_root=data_dir, purpose="telegram_runtime_server", scope="daemon",
+    )
 
 
 def launch_telegram_runtime(
@@ -311,7 +316,9 @@ def launch_telegram_runtime(
                 pass
 
     previous_handlers = {}
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    from ouroboros.platform_layer import SHUTDOWN_SIGNALS
+
+    for sig in SHUTDOWN_SIGNALS:
         try:
             previous_handlers[sig] = signal.getsignal(sig)
             signal.signal(sig, _shutdown)

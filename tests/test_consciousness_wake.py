@@ -459,7 +459,7 @@ def test_render_substitutes_every_placeholder_and_keeps_every_event(tmp_path, mo
         running=1, max_tasks=2, interval=3300, events=observation.full_text())
     for key in wake.PLACEHOLDERS:
         assert "{" + key + "}" not in text, key
-    assert text.startswith("You are Ouroboros. No one has asked for a task")
+    assert text.startswith("You are Jormung. No one has asked for a task")
     assert "1 h 30 min ago" in text and "autonomy: Acts — Also acts on its own:" in text
     assert "toggle_evolution, request_restart" in text
     assert "allowance known spend (last 24 h): 4.00 / 20.00 USD" in text and "tasks running: 1/2" in text

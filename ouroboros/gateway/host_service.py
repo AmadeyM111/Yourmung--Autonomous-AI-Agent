@@ -578,8 +578,9 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
         if payload.get("reply_to"):  # no reference adds nothing to a plain inject's kwargs
             metadata["reply_to"] = payload["reply_to"]
         extra_metadata = payload.get("task_metadata") if isinstance(payload.get("task_metadata"), dict) else {}
-        for key, value in extra_metadata.items():  # delivery-correlation hints never override host-stamped keys
-            metadata.setdefault(str(key), value)
+        for key in ("transport_task_id", "delivery_mode"):  # client hints are an allowlist; identity keys stay host-stamped
+            if key in extra_metadata:
+                metadata.setdefault(key, extra_metadata[key])
         response_task_id = str(extra_metadata.get("transport_task_id") or "")
         bridge = ctx.bridge_getter()
         response_event: asyncio.Event = asyncio.Event()

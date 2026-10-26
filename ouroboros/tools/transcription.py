@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import mimetypes
 import pathlib
@@ -25,11 +26,16 @@ def _path_is_within(path: pathlib.Path, root: pathlib.Path) -> bool:
 
 
 def _queue_transcript_document(ctx: ToolContext, record: dict[str, Any]) -> None:
+    # Upstream's send_document handler takes bytes (``file_base64``), never a local path.
+    path = pathlib.Path(str(record["path"]))
+    if not path.is_file():
+        return
     event = {
         "type": "send_document",
         "chat_id": int(ctx.current_chat_id),
-        "file_path": str(record["path"]),
+        "file_base64": base64.b64encode(path.read_bytes()).decode("ascii"),
         "filename": str(record["name"]),
+        "mime": mimetypes.guess_type(str(record["name"]))[0] or "text/plain",
         "caption": "Стенограмма аудиозаписи",
     }
     event_queue = getattr(ctx, "event_queue", None)

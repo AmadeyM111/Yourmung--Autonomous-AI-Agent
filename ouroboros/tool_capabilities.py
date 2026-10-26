@@ -408,7 +408,6 @@ REVIEWED_MUTATIVE_TOOLS: frozenset[str] = frozenset({
 FOREGROUND_MUTATIVE_TOOLS: frozenset[str] = frozenset({
     "submit_skill_to_hub",
     "write_file", "edit_text", "edit_batch", "apply_patch",
-    "transcribe_audio",
 })
 
 

@@ -35,7 +35,7 @@ def test_supervisor_dispatches_document_file(tmp_path):
         DRIVE_ROOT=tmp_path,
         append_jsonl=append_jsonl,
         bridge=SimpleNamespace(
-            send_document=lambda chat_id, data, filename, caption="", mime="": (
+            send_document=lambda chat_id, data, filename="", caption="", mime="", **_kw: (
                 sent.append((chat_id, data, filename, caption, mime)) or (True, "ok")
             ),
         ),
@@ -44,8 +44,9 @@ def test_supervisor_dispatches_document_file(tmp_path):
     dispatch_event({
         "type": "send_document",
         "chat_id": 42,
-        "file_path": str(document),
+        "file_base64": base64.b64encode(document.read_bytes()).decode("ascii"),
         "filename": document.name,
+        "mime": "text/plain",
         "caption": "ready",
     }, ctx)
 

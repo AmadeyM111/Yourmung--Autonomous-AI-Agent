@@ -1225,7 +1225,7 @@ def transcribe_audio(
         max_speakers=None,
         custom_vocabulary=vocabulary,
     )
-    checkpoint_path = pathlib.Path(state_dir) / job_id / "checkpoint.json"
+    checkpoint_path = pathlib.Path(state_dir).joinpath(job_id, "checkpoint.json")
     if resolved_provider == "whisperx":
         return _run_whisperx_profile(
             source=source, source_hash=source_hash, state_dir=pathlib.Path(state_dir),

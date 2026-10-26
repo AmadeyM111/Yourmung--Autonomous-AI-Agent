@@ -690,6 +690,9 @@ def test_setup_contract_has_no_secret_values():
 # client on the LAN could read whatever the bootstrap carries.
 
 _SECRET_CANARIES = {
+    "GEMINI_API_KEY": "gemini-canary",
+    "DEEPGRAM_API_KEY": "deepgram-canary",
+    "HF_TOKEN": "hf-canary",
     "OPENROUTER_API_KEY": "sk-or-SECRETCANARY123",
     "OPENAI_API_KEY": "sk-openai-SECRETCANARY124",
     "OPENAI_COMPATIBLE_API_KEY": "compat-SECRETCANARY125",

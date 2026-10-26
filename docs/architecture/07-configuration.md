@@ -64,6 +64,28 @@ One row per key (`settings_defaults.py`). Env-only rows have no settings.json ca
 | DEEPSEEK_API_KEY | "" | DeepSeek direct key (`deepseek::` values; Direct-provider routes) |
 | ZAI_API_KEY | "" | Z.ai direct key (`zai::` values; Direct-provider routes) |
 | ZAI_PLAN | "" | Z.ai endpoint: empty/`payg` = pay-as-you-go, `coding` = Coding Plan |
+| GEMINI_API_KEY | "" | Gemini credential for the opt-in transcription provider (fork) |
+| DEEPGRAM_API_KEY | "" | Deepgram credential for the opt-in transcription provider (fork) |
+| HF_TOKEN | "" | Hugging Face token for the optional pyannote diarization model (fork) |
+| TRANSCRIPTION_PROVIDER | local | Long-form transcription provider: `local`, `gemini` or `deepgram` (fork) |
+| TRANSCRIPTION_WHISPERX_MODEL | large-v3 | WhisperX model (fork) |
+| TRANSCRIPTION_WHISPERX_DEVICE | auto | WhisperX device (fork) |
+| TRANSCRIPTION_WHISPERX_COMPUTE_TYPE | float16 | WhisperX compute type (fork) |
+| TRANSCRIPTION_WHISPERX_BATCH_SIZE | 8 | WhisperX batch size (fork) |
+| TRANSCRIPTION_GEMINI_MODEL | gemini-3.5-transcribe | Gemini transcription model (fork) |
+| TRANSCRIPTION_GEMINI_MAX_BYTES | 268435456 | Gemini per-request byte limit (fork) |
+| TRANSCRIPTION_GEMINI_MAX_DURATION_SEC | 7200 | Gemini per-request duration limit (fork) |
+| TRANSCRIPTION_GEMINI_MAX_CHUNKS | 8 | Gemini chunk-count limit (fork) |
+| TRANSCRIPTION_GEMINI_VOCAB_PHRASE_MAX_CHARS | 200 | Gemini vocabulary phrase length cap (fork) |
+| TRANSCRIPTION_GEMINI_VOCAB_MAX_BYTES | 32768 | Gemini vocabulary total byte cap (fork) |
+| TRANSCRIPTION_DEEPGRAM_MODEL | nova-3 | Deepgram transcription model (fork) |
+| TRANSCRIPTION_DEEPGRAM_MAX_BYTES | 268435456 | Deepgram per-request byte limit (fork) |
+| TRANSCRIPTION_DEEPGRAM_MAX_DURATION_SEC | 7200 | Deepgram per-request duration limit (fork) |
+| TRANSCRIPTION_DEEPGRAM_MAX_CHUNKS | 8 | Deepgram chunk-count limit (fork) |
+| TRANSCRIPTION_DIARIZATION | off | Speaker diarization: `off`, provider labels or `pyannote` (fork) |
+| TRANSCRIPTION_PYANNOTE_MODEL | pyannote/speaker-diarization-community-1 | pyannote diarization pipeline (fork) |
+| TRANSCRIPTION_PYANNOTE_DEVICE | auto | pyannote device (fork) |
+| TRANSCRIPTION_PYANNOTE_MAX_DURATION_SEC | 14400 | pyannote maximum source duration (fork) |
 | OUROBOROS_NETWORK_PASSWORD | "" | Non-loopback HTTP gate password; unset only warns (§8 Docker) |
 | OUROBOROS_SERVER_HOST | 127.0.0.1 | HTTP bind host (`0.0.0.0` for Docker/non-loopback) |
 | OUROBOROS_UI_DIR | "" | Interface (§4, optional setup/login included): empty builtin, `none`, or a trusted directory with `index.html`; restart-required; a saved value, blank too, beats the environment, is never exported, and a merged save never authors an absent one (`SAVED_CHOICE_SETTINGS`) |

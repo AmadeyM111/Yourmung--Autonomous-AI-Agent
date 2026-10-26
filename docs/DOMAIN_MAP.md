@@ -8,27 +8,27 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 
 | domain | name | modules | proposed |
 |---|---|---:|---:|
-| D01 | Agent core & main loop | 54 | 0 |
+| D01 | Agent core & main loop | 55 | 0 |
 | D02 | LLM client, routing & providers | 43 | 0 |
 | D03 | Context assembly, fit & compaction | 25 | 0 |
 | D04 | Tool execution: registry, access & typed results | 23 | 0 |
-| D05 | Tool surfaces: files, code, shell, media, external | 43 | 0 |
+| D05 | Tool surfaces: files, code, shell, media, external | 52 | 0 |
 | D06 | Review stack | 95 | 0 |
 | D07 | Delegation, subagents & Claudexor | 86 | 0 |
 | D08 | Supervisor: queue, workers, events & runtime control | 73 | 0 |
 | D09 | Cancellation, owner control & process custody | 23 | 0 |
 | D10 | Git, update & release machinery | 36 | 0 |
 | D11 | Gateway, server & Web UI | 101 | 0 |
-| D12 | Settings & configuration | 22 | 0 |
+| D12 | Settings & configuration | 21 | 0 |
 | D13 | Safety, guards & runtime mode | 11 | 0 |
-| D14 | Skills & extensions | 69 | 0 |
+| D14 | Skills & extensions | 75 | 0 |
 | D15 | Memory, knowledge, consciousness & self-evolution | 32 | 0 |
-| D16 | Observability, usage accounting & cost | 24 | 0 |
+| D16 | Observability, usage accounting & cost | 25 | 0 |
 | D17 | Projects, workspaces & task results | 48 | 0 |
 | D18 | Launcher, packaging, platform & shared substrate | 32 | 0 |
 | D19 | Frozen contracts (ABI) | 12 | 0 |
 | D20 | Presence | 18 | 0 |
-| **total** | | **870** | **0** |
+| **total** | | **886** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -210,6 +210,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/control_actor.py`
 - `ouroboros/deadline_utils.py`
 - `ouroboros/delivery_seal.py`
+- `ouroboros/direct_routes.py`
 - `ouroboros/external_runs.py`
 - `ouroboros/focus.py`
 - `ouroboros/live_works.py`
@@ -367,6 +368,8 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/code_navigation.py`
 - `ouroboros/code_occurrences.py`
 - `ouroboros/code_search_rg.py`
+- `ouroboros/diarization.py`
+- `ouroboros/local_stt.py`
 - `ouroboros/mcp_catalog.py`
 - `ouroboros/mcp_client.py`
 - `ouroboros/mcp_headers.py`
@@ -374,6 +377,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/mcp_schema.py`
 - `ouroboros/process_interpreters.py`
 - `ouroboros/query_data_sql.py`
+- `ouroboros/spreadsheets.py`
 - `ouroboros/tools/browser.py`
 - `ouroboros/tools/cards.py`
 - `ouroboros/tools/control_relay.py`
@@ -396,9 +400,15 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/tools/shell_effects.py`
 - `ouroboros/tools/shell_outputs.py`
 - `ouroboros/tools/shell_process.py`
+- `ouroboros/tools/spreadsheets.py`
+- `ouroboros/tools/transcription.py`
 - `ouroboros/tools/verify.py`
 - `ouroboros/tools/vision.py`
 - `ouroboros/tools/vision_process.py`
+- `ouroboros/transcription.py`
+- `ouroboros/transcription_deepgram.py`
+- `ouroboros/transcription_gemini.py`
+- `ouroboros/transcription_whisperx.py`
 
 ### D06 — Review stack
 
@@ -834,7 +844,6 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 
 ### D12 — Settings & configuration
 
-- `ouroboros/telegram_bridge_setup.py`
 - `ouroboros/composer_cognition.py`
 - `ouroboros/config.py`
 - `ouroboros/i18n_memory.py`
@@ -937,6 +946,12 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/skill_starter.py`
 - `ouroboros/skill_token.py`
 - `ouroboros/skill_uninstall_state.py`
+- `ouroboros/telegram_audio_attachment_patch.py`
+- `ouroboros/telegram_bootstrap.py`
+- `ouroboros/telegram_bridge_setup.py`
+- `ouroboros/telegram_delivery_patch.py`
+- `ouroboros/telegram_local_stt_patch.py`
+- `ouroboros/telegram_subscription_menu_patch.py`
 - `ouroboros/tools/review_skill.py`
 - `ouroboros/tools/skill_exec.py`
 - `ouroboros/tools/skill_preflight.py`
@@ -993,6 +1008,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/finalization_timing.py`
 - `ouroboros/model_send_seal.py`
 - `ouroboros/observability.py`
+- `ouroboros/phoenix_tracing.py`
 - `ouroboros/physical_attempt_context.py`
 - `ouroboros/process_logging.py`
 - `ouroboros/source_retention.py`

@@ -63,6 +63,7 @@ Files routes: `gateway/files.py::file_browser_routes()` (envelopes/parity: §11)
 | GET | `/api/files/content` | |
 | GET | `/api/files/download` | `upload`: a chat attachment, separate authority (above) |
 | POST | `/api/files/upload` | |
+| POST | `/api/audio/upload` | streams supported audio to `data/uploads` under `OUROBOROS_AUDIO_UPLOAD_MAX_BYTES` (fork) |
 | POST | `/api/files/mkdir` | |
 | POST | `/api/files/write` | |
 | POST | `/api/files/delete` | |

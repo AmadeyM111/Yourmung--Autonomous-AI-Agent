@@ -150,7 +150,7 @@ def test_the_main_round_measures_and_sends_the_fitted_list(monkeypatch):
         return {"role": "assistant", "content": "ok"}, 0.0
 
     monkeypatch.setattr(loop_module, "_dispatch_round_model", dispatch)
-    for total, expected in ((129, 128), (128, 128), (100, 100)):
+    for total, expected in ((129, 128), (128, 128), (len(PINNED), len(PINNED))):
         seen.clear()
         loop_model_call._call_round_model(_round_ctx(_catalog(total)))
         assert seen == {"measured": expected, "sent": expected}

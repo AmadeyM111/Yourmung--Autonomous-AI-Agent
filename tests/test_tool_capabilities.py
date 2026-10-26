@@ -685,5 +685,4 @@ def test_transcription_and_spreadsheet_tools_are_core_and_foreground():
     )
 
     assert {"transcribe_audio", "read_spreadsheet"} <= CORE_TOOL_NAMES
-    assert "transcribe_audio" in FOREGROUND_MUTATIVE_TOOLS
     assert "read_spreadsheet" in READ_ONLY_PARALLEL_TOOLS

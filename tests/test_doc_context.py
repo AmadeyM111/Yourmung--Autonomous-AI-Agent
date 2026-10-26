@@ -685,6 +685,5 @@ def test_system_prompt_pins_owner_response_language():
         pathlib.Path(__file__).resolve().parents[1] / "prompts" / "SYSTEM.md"
     ).read_text(encoding="utf-8")
 
-    assert "Reply in the language used by the owner in their current request" in system_prompt
-    assert "Switch only when the owner" in system_prompt
-    assert "explicitly asks for another language" in system_prompt
+    assert "I reply in the language my human uses in their current request" in system_prompt
+    assert "switch only when my human asks" in system_prompt

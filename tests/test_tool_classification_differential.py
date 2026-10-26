@@ -955,6 +955,7 @@ _RESIDUAL_TEXT_INSPECTIONS: Mapping[str, tuple[int, str]] = MappingProxyType({
     "ouroboros/tools/services.py": (1, "private helper-failure check between two functions of one tool"),
     "ouroboros/tools/core.py": (1, "private helper-failure check between two functions of one tool"),
     "ouroboros/tools/control_delegation.py": (1, "private helper-failure check between two functions of one tool"),
+    "ouroboros/direct_routes.py": (5, "fork shortcut routes check their own extension-tool result before answering directly"),
 })
 _RESIDUAL_PATTERNS = ('startswith("⚠️', 'startswith(("⚠️', "_ERROR_MARKERS", "_INFRA_TEXT_PREFIXES")
 
