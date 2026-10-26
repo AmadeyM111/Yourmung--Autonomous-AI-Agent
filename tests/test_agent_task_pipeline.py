@@ -373,6 +373,38 @@ def test_truncate_with_notice_uses_utils_ssot():
     assert pipeline._truncate_with_notice(None, 10) == ""
 
 
+def test_emit_task_results_suppresses_silent_schedule_chat_message(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, "_store_task_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "_run_scratchpad_consolidation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "_run_post_task_processing_async", lambda *args, **kwargs: None)
+    pending_events = []
+    drive_logs = tmp_path / "logs"
+    drive_logs.mkdir(parents=True)
+
+    pipeline.emit_task_results(
+        env=SimpleNamespace(drive_root=tmp_path),
+        memory=object(),
+        llm=object(),
+        pending_events=pending_events,
+        task={
+            "id": "scheduled-1",
+            "type": "task",
+            "chat_id": 0,
+            "text": "run broadcast",
+            "metadata": {"delivery_mode": "silent"},
+        },
+        text="⚠️ post_broadcast vision analysis failed",
+        usage={"rounds": 1, "cost": 0},
+        llm_trace={"tool_calls": [], "reasoning_notes": []},
+        start_time=0.0,
+        drive_logs=drive_logs,
+        ctx=SimpleNamespace(pending_restart_reason=""),
+    )
+
+    assert "send_message" not in [evt["type"] for evt in pending_events]
+    assert [evt["type"] for evt in pending_events] == ["task_metrics", "task_done"]
+
+
 def test_emit_task_results_surfaces_receipt_absent_flag_in_event_stream(tmp_path, monkeypatch):
     # Regression: the receipt_absent / expected_output_ungrounded objective-axis flag must reach
     # the task_eval (events.jsonl) and task_metrics (pending_events) monitoring streams — where the
@@ -750,3 +782,29 @@ def test_task_done_carries_the_custody_debt_list_the_row_holds(tmp_path, monkeyp
     )
     plain = next(row for row in plain_events if row["type"] == "task_done")
     assert "delegated_runs_unreconciled" not in plain
+
+
+def test_emit_task_results_suppresses_silent_delivery_chat_message(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, "_store_task_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "_run_scratchpad_consolidation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "_run_post_task_processing_async", lambda *args, **kwargs: None)
+    pending_events = []
+    drive_logs = tmp_path / "logs"
+    drive_logs.mkdir(parents=True)
+
+    pipeline.emit_task_results(
+        env=SimpleNamespace(drive_root=tmp_path),
+        memory=object(),
+        llm=object(),
+        pending_events=pending_events,
+        task={"id": "scheduled-1", "type": "task", "chat_id": 0, "text": "run broadcast",
+              "metadata": {"delivery_mode": "silent"}},
+        text="post_broadcast vision analysis failed",
+        usage={"rounds": 1, "cost": 0},
+        llm_trace={"tool_calls": [], "reasoning_notes": []},
+        start_time=0.0,
+        drive_logs=drive_logs,
+        ctx=SimpleNamespace(pending_restart_reason=""),
+    )
+
+    assert "send_message" not in [evt["type"] for evt in pending_events]

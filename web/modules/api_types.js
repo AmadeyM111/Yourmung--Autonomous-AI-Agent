@@ -853,9 +853,11 @@
  * @property {string} display_name
  * @property {string} path
  * @property {number} size
+ * @property {string=} sha256
  * @property {string} mime
  * @property {number} duration_sec
  * @property {string} codec
+ * @property {NonNullable<UploadResponse['view']>=} view
  */
 
 /**

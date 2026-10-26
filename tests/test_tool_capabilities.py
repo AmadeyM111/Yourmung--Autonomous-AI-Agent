@@ -677,3 +677,13 @@ def test_escalate_is_available_wherever_planning_runs():
 
     assert all("escalate" in names for names in
                (CORE_TOOL_NAMES, LOCAL_READONLY_SUBAGENT_TOOL_NAMES, ACTING_SUBAGENT_TOOL_NAMES))
+
+
+def test_transcription_and_spreadsheet_tools_are_core_and_foreground():
+    from ouroboros.tool_capabilities import (
+        CORE_TOOL_NAMES, FOREGROUND_MUTATIVE_TOOLS, READ_ONLY_PARALLEL_TOOLS,
+    )
+
+    assert {"transcribe_audio", "read_spreadsheet"} <= CORE_TOOL_NAMES
+    assert "transcribe_audio" in FOREGROUND_MUTATIVE_TOOLS
+    assert "read_spreadsheet" in READ_ONLY_PARALLEL_TOOLS

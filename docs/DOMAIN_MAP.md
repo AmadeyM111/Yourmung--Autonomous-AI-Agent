@@ -834,7 +834,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 
 ### D12 — Settings & configuration
 
-- `ouroboros/colab_bootstrap.py`
+- `ouroboros/telegram_bridge_setup.py`
 - `ouroboros/composer_cognition.py`
 - `ouroboros/config.py`
 - `ouroboros/i18n_memory.py`

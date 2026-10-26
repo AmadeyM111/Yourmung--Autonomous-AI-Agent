@@ -148,21 +148,6 @@ def test_migrate_legacy_slot_keys_ssot():
     assert s2 == {"OUROBOROS_MODEL_HEAVY": "new"}
 
 
-def test_colab_settings_migrate_legacy_drive_keys():
-    # A Colab re-run with legacy Drive settings.json must keep the owner's prior
-    # code/heavy + fallback customizations (not silently drop them).
-    from ouroboros.colab_bootstrap import build_colab_settings
-    existing = {
-        "OUROBOROS_MODEL": "openai::gpt-5.5",
-        "OUROBOROS_MODEL_CODE": "openai::gpt-5.5-custom-heavy",
-        "OUROBOROS_MODEL_FALLBACK": "openai::gpt-5.5-mini",
-        "OPENAI_API_KEY": "sk-openai-existing",
-    }
-    out = build_colab_settings({}, models=None, existing=existing)
-    assert out.get("OUROBOROS_MODEL_HEAVY") == "openai::gpt-5.5-custom-heavy"
-    assert out.get("OUROBOROS_MODEL_FALLBACKS") == "openai::gpt-5.5-mini"
-    assert "OUROBOROS_MODEL_CODE" not in out
-    assert "OUROBOROS_MODEL_FALLBACK" not in out
 
 
 # ---------------------------------------------------------------- cooldown

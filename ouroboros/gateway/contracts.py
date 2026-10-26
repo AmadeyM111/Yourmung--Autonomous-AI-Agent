@@ -977,6 +977,21 @@ class UploadResponse(TypedDict):
     view: NotRequired[ChatAttachmentView]  # the sender's own bubble renders exactly this (kind proven from bytes)
 
 
+class AudioUploadResponse(TypedDict):
+    """Shape of a successful ``POST /api/audio/upload`` response (a long-form transcription source)."""
+
+    ok: Literal[True]
+    filename: str
+    display_name: str
+    path: str
+    size: int
+    sha256: NotRequired[str]
+    mime: str
+    duration_sec: float
+    codec: str
+    view: NotRequired[ChatAttachmentView]
+
+
 class SkillPublishPreflightResponse(TypedDict):
     """Safe selected-skill publication facts; never raw scanner output."""
 
@@ -1501,6 +1516,7 @@ __all__ = [
     "EvolutionRefresh",
     "ScheduledTasksResponse", "ScheduleUpsertResponse", "ScheduleDeleteResponse", "ScheduleActionResponse",
     "UploadResponse",
+    "AudioUploadResponse",
     "ExtensionsIndexResponse", "ExtensionLiveSnapshot", "WidgetTab",
     "WidgetsResponse", "WidgetFaultRequest", "WidgetFaultResponse",
     "SkillPublishPreflightResponse",

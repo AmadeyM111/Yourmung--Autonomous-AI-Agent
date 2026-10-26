@@ -98,7 +98,7 @@ ouroboros/ — agent core and shared runtime (§6)
   update_channels.py — Stable/QA/Development channel mapping (§8)
   update_letter.py — the update letter: `base..target` commit material from one accounted light-slot call (§7; §3 Updates)
   evolution_history.py — Evolution's version history (§3)
-  colab_bootstrap.py — Google Colab source-mode bootstrap (official source, Drive-backed data, no-UI server)
+  telegram_bridge_setup.py — Telegram bridge + bundled-skill bootstrap (fork addition)
   cli.py — source/headless CLI over gateway tasks, logs, settings, skills, local model and MCP (CLI / Headless Boundary below)
   packaged_cli.py, packaged_cli_install.py — packaged desktop CLI bridge and its command-shim installer
   agent.py — task orchestrator; a loop crash is projected from captured evidence or an explicit `loop_evidence_unavailable`, never invented counters (§6 Task lifecycle)

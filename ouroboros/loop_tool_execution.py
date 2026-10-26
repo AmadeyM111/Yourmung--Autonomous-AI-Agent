@@ -345,6 +345,19 @@ def _deadline_clamped_timeout(tools: ToolRegistry, tool_name: str, base_timeout:
     return int(max(1.0, min(float(base_timeout), window)))
 
 
+def direct_final_response_from_tool(fn_name: str, result: Any) -> str:
+    """Allow reviewed extension tools to finish deterministic text workflows."""
+    if not str(fn_name or "").startswith("ext_"):
+        return ""
+    try:
+        payload = json.loads(str(result or ""))
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(payload, dict) or str(payload.get("final_response_mode") or "") != "direct":
+        return ""
+    return str(payload.get("final_response") or "").strip()
+
+
 def _truncate_tool_result(
     result: Any,
     tool_name: str = "",
@@ -1496,6 +1509,12 @@ def process_tool_results(
                 "host_annotations": list(typed.host_annotations)}
                if isinstance(typed, ToolResult) and typed.producer_text is not None else {}),
         })
+        direct_final = "" if is_error else direct_final_response_from_tool(fn_name, exec_result["result"])
+        if direct_final:
+            llm_trace["_direct_final_response"] = direct_final
+            llm_trace["reasoning_notes"].append(
+                f"{fn_name} returned a direct final response; skipped LLM rewrite."
+            )
 
     # These resident facts and exact bodies were included before allocation. Append
     # only after the complete assistant/tool block, before an owner-wait can park.
@@ -1518,3 +1537,6 @@ def process_tool_results(
             row["image_attachment"] = observation
 
     return error_count
+
+
+_direct_final_response_from_tool = direct_final_response_from_tool  # fork alias used by skills/tests

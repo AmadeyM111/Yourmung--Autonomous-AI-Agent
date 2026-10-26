@@ -91,6 +91,14 @@ linux-desktop = [
     "pycairo==1.26.1; sys_platform == 'linux'",
 ]
 local-model = ["llama-cpp-python"]
+# Jormung fork: optional audio transcription and tracing.
+transcription = ["faster-whisper==1.2.1"]
+# diarization / WhisperX (PyTorch stack, pins huggingface_hub<1) are NOT extras:
+# install them from requirements-diarization.txt / requirements-whisperx.txt.
+tracing = [
+    "arize-phoenix-otel>=0.16.1,<0.17.0",
+    "openinference-instrumentation-openai>=0.1.52,<0.2.0",
+]
 build = ["pyinstaller>=6.0"]
 all = [
     "playwright",

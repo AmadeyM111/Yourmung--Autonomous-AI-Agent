@@ -99,6 +99,9 @@ TOOL_POLICY: Dict[str, str] = {
     "switch_model": POLICY_SKIP,
     "service_status": POLICY_SKIP,
     "service_logs": POLICY_SKIP,
+    "read_spreadsheet": POLICY_SKIP,
+    # Local, path-confined, foreground pipeline; writes only checkpoint/artifacts.
+    "transcribe_audio": POLICY_SKIP,
 
     "write_file": POLICY_SKIP,
     "edit_text": POLICY_SKIP,
@@ -648,6 +651,10 @@ def _classify_safety_parse_failure(msg: Dict[str, Any], usage: Optional[Dict[str
 
 _REMOTE_PROVIDER_KEYS = (
     "OPENROUTER_API_KEY",
+    "LAGUNA_API_KEY",  # model-scoped OpenRouter keys (llm_routing.openrouter_key_for_model)
+    "GEMMA_API_KEY",
+    "GEMA_API_KEY",
+    "NEMOTRON_API_KEY",
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
     "MINIMAX_API_KEY",
@@ -714,6 +721,12 @@ def _light_model_has_reachable_provider(light_model: str) -> bool:
     env_key = _PROVIDER_KEY_ENV.get(key_type)
     if env_key is None:
         return True
+    if key_type == "openrouter":
+        from ouroboros.llm_routing import model_scoped_openrouter_key_names
+
+        if any(str(runtime_setting(name, "") or "").strip()
+               for name in model_scoped_openrouter_key_names(light_model)):
+            return True
     return bool(str(runtime_setting(env_key, "") or "").strip())
 
 
@@ -1118,12 +1131,43 @@ def _run_llm_check(
         else:
             _record_safety_usage(ctx, usage_payload)
 
+    # An unavailable remote safety model falls back to the configured fallback
+    # model when its provider is reachable (never to "no check").
+    fallback_model = str(runtime_setting("OUROBOROS_MODEL_FALLBACK", "") or "").strip()
+    if (
+        _use_local_light
+        or not fallback_model
+        or fallback_model == light_model
+        or not _light_model_has_reachable_provider(fallback_model)
+    ):
+        fallback_model = ""
+
+    def _checked_call() -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        nonlocal light_model
+        try:
+            return _safety_model_call(
+                client=client, ctx=ctx, tool_name=tool_name, light_model=light_model,
+                use_local=_use_local_light, call_type="safety_supervisor",
+                user_prompt=prompt, on_usage=_emit_safety_usage, system_prompt=system_prompt,
+            )
+        except _SafetyRateLimited:
+            raise
+        except Exception as primary_exc:
+            from ouroboros.llm_claudexor import propagate_model_error
+            propagate_model_error(primary_exc)
+            if not fallback_model:
+                raise
+            log.warning("Safety model %s failed for %s; retrying with fallback %s",
+                        light_model, tool_name, fallback_model)
+            light_model = fallback_model
+            return _safety_model_call(
+                client=client, ctx=ctx, tool_name=tool_name, light_model=light_model,
+                use_local=_use_local_light, call_type="safety_supervisor",
+                user_prompt=prompt, on_usage=_emit_safety_usage, system_prompt=system_prompt,
+            )
+
     try:
-        msg, usage = _safety_model_call(
-            client=client, ctx=ctx, tool_name=tool_name, light_model=light_model,
-            use_local=_use_local_light, call_type="safety_supervisor",
-            user_prompt=prompt, on_usage=_emit_safety_usage, system_prompt=system_prompt,
-        )
+        msg, usage = _checked_call()
     except _SafetyRateLimited as e:
         return _Assessment(*_rate_limited_outcome(
             ctx, tool_name, str(e),

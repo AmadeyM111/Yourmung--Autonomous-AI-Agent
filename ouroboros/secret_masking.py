@@ -29,6 +29,9 @@ MASKED_SECRET_SETTING_KEYS = frozenset(
         "MINIMAX_API_KEY",
         "DEEPSEEK_API_KEY",
         "ZAI_API_KEY",
+        "GEMINI_API_KEY",
+        "DEEPGRAM_API_KEY",
+        "HF_TOKEN",
         "GITHUB_TOKEN",
         "OUROBOROS_NETWORK_PASSWORD",
     }

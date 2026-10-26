@@ -16,6 +16,20 @@ import { documentReaderKind } from './document_reader.js';
 
 // At most this many `[Attached file: …]` lines ride the message text.
 export const ATTACHMENT_PREVIEW_COUNT = 25;
+
+// Long-form audio goes to the audio endpoint (own size limit, duration/codec probe).
+const TRANSCRIPTION_AUDIO_EXTENSIONS = new Set(['m4a', 'mp3', 'wav', 'flac', 'ogg', 'opus']);
+const TRANSCRIPTION_AUDIO_MIMES = new Set(['audio/mp4', 'audio/x-m4a', 'application/mp4', 'audio/mpeg', 'audio/wav', 'audio/x-wav',
+    'audio/flac', 'audio/x-flac', 'audio/ogg', 'audio/opus']);
+
+export function isTranscriptionAudioFile(file) {
+    const name = String(file?.name || '').toLowerCase();
+    const extension = name.includes('.') ? name.split('.').pop() : '';
+    const mime = String(file?.type || '').toLowerCase().split(';')[0];
+    if (TRANSCRIPTION_AUDIO_EXTENSIONS.has(extension)) return true;
+    if (extension === 'mp4') return ['audio/mp4', 'application/mp4'].includes(mime);
+    return TRANSCRIPTION_AUDIO_MIMES.has(mime);
+}
 const KINDS = new Set(['image', 'video', 'audio', 'file']);
 const UPLOAD_URL_RE = /^\/api\/files\/download\?upload=[0-9a-f]{32}_[^&#\s]+$/;
 const FILE_GLYPH = '<span class="chat-file-glyph" aria-hidden="true">▤</span>';
@@ -313,7 +327,9 @@ export function createComposerAttachments({ preview, attachBtn, fileInput, input
         try {
             for (const item of [...pending]) {
                 if (!connected()) throw new Error('Connection closed during upload. Reconnect and try again.');
-                const data = await apiClient.uploadChatAttachment(item.file);
+                const data = await (isTranscriptionAudioFile(item.file)
+                    ? apiClient.uploadAudioAttachment(item.file)
+                    : apiClient.uploadChatAttachment(item.file));
                 uploaded.push({
                     filename: data.filename || '',
                     display_name: data.display_name || item.display_name,

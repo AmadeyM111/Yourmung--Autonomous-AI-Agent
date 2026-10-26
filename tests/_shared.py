@@ -146,7 +146,6 @@ SETTINGS_WRITERS = (
     ("ouroboros/gateway/owner_settings.py", "_owner_update_settings"),
     ("ouroboros/packaged_cli.py", "_save_settings"),
     ("ouroboros/context_mode_compat.py", "normalize_and_persist_context_mode_compat"),
-    ("ouroboros/colab_bootstrap.py", "write_colab_settings"),
 )
 
 _SETTINGS_WRITE_SHAPES = re.compile(

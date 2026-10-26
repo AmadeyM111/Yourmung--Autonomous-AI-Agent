@@ -949,3 +949,15 @@ def test_owner_acceptance_rows_land_whole_beside_a_torn_legacy_tail(monkeypatch,
         bridge, skill, chat_id=7, user_id=7, client_message_id="skill-torn", text="relayed", ts="ignored",
     ) == skill["accepted_source_ref"]
     assert web["client_message_id"] == "web-torn"
+
+
+def test_response_subscription_ignores_other_task_ids(monkeypatch):
+    bridge = _make_bridge(monkeypatch)
+    responses = []
+    monkeypatch.setattr(message_bus, "publish_event", lambda *_args, **_kwargs: None)
+    bridge.subscribe_response(42, responses.append, task_id="tg_99")
+
+    bridge.send_message(42, "background", task_id="scheduled_1")
+    bridge.send_message(42, "expected", task_id="tg_99")
+
+    assert responses == ["expected"]

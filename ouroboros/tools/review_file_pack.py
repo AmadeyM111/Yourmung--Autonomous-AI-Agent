@@ -43,7 +43,7 @@ BINARY_EXTENSIONS = frozenset({
     ".woff", ".woff2", ".ttf", ".otf", ".eot",
     # Other binary blobs
     ".pdf", ".db", ".sqlite", ".sqlite3",
-    ".mp3", ".mp4", ".wav", ".ogg", ".flac",
+    ".m4a", ".mp3", ".mp4", ".wav", ".ogg", ".flac",
     ".exe", ".pyo",
 })
 
@@ -81,7 +81,7 @@ _FULL_REPO_BINARY_EXTENSIONS = frozenset({
     ".svg", ".woff", ".woff2", ".ttf", ".otf", ".eot",
     ".pdf", ".zip", ".tar", ".gz", ".bz2",
     ".pyc", ".pyo", ".so", ".dylib", ".dll", ".exe",
-    ".mp3", ".mp4", ".wav", ".ogg", ".flac",
+    ".m4a", ".mp3", ".mp4", ".wav", ".ogg", ".flac",
     ".db", ".sqlite", ".sqlite3",
 })
 

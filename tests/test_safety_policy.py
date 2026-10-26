@@ -387,14 +387,18 @@ def test_remote_safety_failure_uses_configured_fallback(monkeypatch):
         def __init__(self):
             self.calls = []
 
-        def chat(self, *, messages, model, use_local):
+        def chat(self, *, messages, model, use_local, **_kwargs):
             self.calls.append({"messages": messages, "model": model, "use_local": use_local})
             if model.startswith("gigachat::"):
                 raise RuntimeError("No such model")
             return {"content": '{"status":"SAFE","reason":"ok"}'}, {}
 
     stub = _FallbackClient()
-    monkeypatch.setattr(safety, "LLMClient", lambda: stub)
+    from ouroboros.llm import LLMClient
+
+    factory = lambda: stub
+    factory.supports_response_format = LLMClient.supports_response_format
+    monkeypatch.setattr(safety, "LLMClient", factory)
 
     ok, msg = check_safety("create_github_issue", {"title": "x"})
 

@@ -1480,45 +1480,6 @@ def _other_root(tmp_path, name):
     return root
 
 
-def test_a_document_migrated_and_saved_by_another_process_still_gets_its_receipts_at_boot(boot, monkeypatch):
-    """VD3-01: the Colab kernel reads the N-1 Drive document (the lanes become the pool in ITS
-    process) and writes the Drive document back — the pre-image is gone before any server ran.
-    The kernel's writer gives the migration its snapshot under the Drive root (its supervisor
-    state is not bound there, so no state record); the server that later boots on that root
-    computes NO migration (the document is a pool now), yet reconciles the record from the
-    snapshot and tells the owner ONCE — and a second boot stays quiet."""
-    from ouroboros.colab_bootstrap import build_colab_settings, write_colab_settings
-
-    root, sent = boot  # the kernel's own process state is bound to ``root``, not to the Drive root
-    drive = _other_root(root, "drive")
-    kernel_view = build_colab_settings({"OPENROUTER_API_KEY": "present"}, existing=dict(N1_DOC))
-    kernel_document = {**N1_DOC, "OPENROUTER_API_KEY": "present"}  # the Drive document plus the fresh secret
-    assert [o.trigger for o in cfg.review_pool_migrations_seen()] == [m.TRIGGER_LANES_KEY]
-    write_colab_settings(drive, kernel_view)
-    (snapshot_file,) = _snapshots(drive)
-    assert _snapshots(root) == [] and server_maintenance.review_pool_migration_records() == {}
-    snapshot = json.loads(snapshot_file.read_text(encoding="utf-8"))
-    assert snapshot["input_sha256"] == m.input_sha256(kernel_document) and snapshot["before"][SLOTS] == ""
-    assert SLOTS not in json.loads((drive / "settings.json").read_text(encoding="utf-8"))
-
-    # The server: a fresh process on the Drive root.
-    m._MIGRATIONS_SEEN.clear()
-    state.init(drive)
-    state.save_state({"owner_chat_id": 7})
-    monkeypatch.setattr(server_maintenance, "DATA_DIR", drive)
-    monkeypatch.setattr(cfg, "SETTINGS_PATH", drive / "settings.json")
-    served = cfg.load_settings_lock_held(_settings_lock_held=False)
-    assert cfg.review_pool_migrations_seen() == ()
-    server_maintenance._startup_review_pool_notice(served)
-    server_maintenance._startup_review_pool_notice(served)
-
-    assert _snapshots(drive) == [snapshot_file]
-    (record,) = server_maintenance.review_pool_migration_records().values()
-    assert record["snapshot"] == f"state/review_migrations/{snapshot_file.name}" and record["ts"] == snapshot["ts"]
-    assert (record["trigger"], record["outcome"], record["error"]) == (m.TRIGGER_LANES_KEY, "factory", "")
-    assert record["reported"]
-    assert len(sent) == 1 and sent[0][0] == 7
-    assert sent[0][1] == m.owner_message(m.migrate_review_lanes(kernel_document), record["snapshot"])
 
 
 def test_the_saving_process_writes_the_receipts_before_its_write_and_the_boot_adds_nothing(boot, monkeypatch):

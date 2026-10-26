@@ -6,6 +6,7 @@ import json
 import subprocess as subprocess
 import os
 import pathlib
+import re
 import sys
 import threading
 import time
@@ -272,6 +273,108 @@ def _preserve_unprocessed_updates(bridge, updates, consumed: int) -> int:
     return kept
 
 
+_CAT_MEME_TOPIC_RE = re.compile(
+    r"(?:кото\s*мем\w*|кошачь\w*\s+мем\w*|мем\w*\s+(?:с|про)\s+кот\w*)",
+    flags=re.IGNORECASE,
+)
+_CAT_MEME_UNSUBSCRIBE_RE = re.compile(
+    r"(?:не\s+хочу|больше\s+не\s+хочу|не\s+присылай|перестань\s+присылать|"
+    r"отпиши(?:те)?(?:\s+меня)?|отписаться|отписываюсь)",
+    flags=re.IGNORECASE,
+)
+_CAT_MEME_SUBSCRIBE_RE = re.compile(
+    r"(?:хочу\s+(?:получать|смотреть|видеть)|присылай(?:те)?|отправляй(?:те)?|"
+    r"подпиши(?:те)?(?:\s+меня)?|подписаться|подписываюсь)",
+    flags=re.IGNORECASE,
+)
+_DIGEST_TOPIC_RE = re.compile(
+    r"(?:дайджест\w*|новост\w*\s+дайджест\w*|ai\s*дайджест\w*|ии\s*дайджест\w*)",
+    flags=re.IGNORECASE,
+)
+
+
+def _is_subscription_menu_request(text: str) -> bool:
+    normalized = " ".join(str(text or "").lower().replace("ё", "е").split())
+    return normalized in {
+        "/subscriptions",
+        "/subscription",
+        "подписки",
+        "управление подписками",
+    }
+
+
+def _cat_meme_subscription_action(text: str) -> Optional[str]:
+    """Recognize narrow Telegram self-service subscribe/unsubscribe intents."""
+    normalized = " ".join(str(text or "").lower().replace("ё", "е").split())
+    if normalized in {"/cats_unsubscribe", "/catmemes_unsubscribe"}:
+        return "unsubscribe"
+    if normalized in {"/cats_subscribe", "/catmemes_subscribe"}:
+        return "subscribe"
+    if not _CAT_MEME_TOPIC_RE.search(normalized):
+        return None
+    if _CAT_MEME_UNSUBSCRIBE_RE.search(normalized):
+        return "unsubscribe"
+    if _CAT_MEME_SUBSCRIBE_RE.search(normalized):
+        return "subscribe"
+    return None
+
+
+def _digest_subscription_action(text: str) -> Optional[str]:
+    """Recognize Telegram self-service subscribe/unsubscribe intents for research_digest."""
+    normalized = " ".join(str(text or "").lower().replace("ё", "е").split())
+    if normalized in {"/digest_unsubscribe", "/research_digest_unsubscribe"}:
+        return "unsubscribe"
+    if normalized in {"/digest_subscribe", "/research_digest_subscribe"}:
+        return "subscribe"
+    if not _DIGEST_TOPIC_RE.search(normalized):
+        return None
+    if _CAT_MEME_UNSUBSCRIBE_RE.search(normalized):
+        return "unsubscribe"
+    if _CAT_MEME_SUBSCRIBE_RE.search(normalized):
+        return "subscribe"
+    return None
+
+
+def _apply_extension_subscription(ctx: Any, chat_id: int, action: str, skill_name: str, log_label: str) -> tuple[bool, str]:
+    """Invoke a reviewed extension subscription tool for the sender chat."""
+    from ouroboros.extension_loader import snapshot
+
+    operation = "subscribe" if action == "subscribe" else "unsubscribe"
+    suffix = f"_{skill_name}_{operation}"
+    tool_name = next(
+        (name for name in snapshot().get("tools", []) if str(name).endswith(suffix)),
+        "",
+    )
+    if not tool_name:
+        return False, "сервис рассылки сейчас недоступен"
+
+    try:
+        from ouroboros.direct_routes import _execute_trusted_extension
+        from ouroboros.tools.registry import ToolRegistry
+
+        tools = ToolRegistry(REPO_DIR, DATA_DIR)
+        raw = _execute_trusted_extension(tools, tool_name, {"chat_id": str(chat_id)})
+    except Exception:
+        log.warning("Telegram %s subscription tool failed", log_label, exc_info=True)
+        return False, "внутренняя ошибка сервиса"
+
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return False, str(payload.get("error") or raw[:300] or "неизвестная ошибка")
+    return True, ""
+
+
+def _apply_post_broadcast_subscription(ctx: Any, chat_id: int, action: str) -> tuple[bool, str]:
+    return _apply_extension_subscription(ctx, chat_id, action, "post_broadcast", "cat-meme")
+
+
+def _apply_research_digest_subscription(ctx: Any, chat_id: int, action: str) -> tuple[bool, str]:
+    return _apply_extension_subscription(ctx, chat_id, action, "research_digest", "research-digest")
+
+
 def _process_bridge_updates(bridge, offset: int, ctx: Any, *, timeout: float = 1) -> int:
     updates = bridge.get_updates(offset=offset, timeout=timeout)
     cursor = [0]  # updates taken up so far, the one in flight included
@@ -342,6 +445,14 @@ def _handle_bridge_update_batch(bridge, updates, offset: int, ctx: Any, cursor: 
         is_slash_command = lowered.startswith("/")
         is_external_transport = source != "web"
         external_identity_present = (not is_external_transport) or (chat_id > 0 and user_id > 0)
+        _self_service = is_external_transport and external_identity_present
+        cat_subscription_action = _cat_meme_subscription_action(text) if _self_service else None
+        digest_subscription_action = _digest_subscription_action(text) if _self_service else None
+        subscription_menu = _is_subscription_menu_request(text) if _self_service else False
+        # A subscriber's self-service request must never bind them as the owner.
+        subscription_request = bool(
+            cat_subscription_action is not None or digest_subscription_action is not None or subscription_menu
+        )
         # Emergency Stop Invariant (#1307): the local door stops before any state read,
         # chat record, state update or reply; an external transport needs a POSITIVELY
         # bound owner (one lock-free read) and never registers a stranger from an unknown slot.
@@ -380,7 +491,8 @@ def _handle_bridge_update_batch(bridge, updates, offset: int, ctx: Any, cursor: 
         def _stamp_owner_activity(live: dict) -> None:
             # Global owner = primary chat for outbound notices (web on desktop, the first
             # transport on headless Colab), bound once — only into a slot KNOWN to be empty.
-            if control_value(live, "owner_id") == (True, None) and external_identity_present:
+            if (control_value(live, "owner_id") == (True, None) and external_identity_present
+                    and not subscription_request):
                 live["owner_id"] = user_id
                 live["owner_chat_id"] = _owner_binding_chat_id(ctx, chat_id, is_external_transport)
             live["last_owner_message_at"] = now_iso
@@ -391,6 +503,34 @@ def _handle_bridge_update_batch(bridge, updates, offset: int, ctx: Any, cursor: 
             log.warning("Owner activity not stamped: %s", exc)  # the message itself still proceeds
 
         if not text and not image_base64 and not (task_metadata or {}).get("chat_attachment_uploads"):
+            continue
+
+        if subscription_menu:
+            reply("Управление подписками доступно через кнопку Menu в Telegram.")
+            continue
+
+        if cat_subscription_action is not None:
+            ok, detail = _apply_post_broadcast_subscription(ctx, chat_id, cat_subscription_action)
+            if ok and cat_subscription_action == "subscribe":
+                reply("✅ Вы подписаны на рассылку котомемов. Чтобы отписаться, напишите: "
+                      "«не хочу получать котомемы».")
+            elif ok:
+                reply("✅ Вы отписаны от рассылки котомемов. Подписаться снова можно сообщением: "
+                      "«хочу получать котомемы».")
+            else:
+                reply(f"⚠️ Не удалось изменить подписку на котомемы: {detail}", "failed")
+            continue
+
+        if digest_subscription_action is not None:
+            ok, detail = _apply_research_digest_subscription(ctx, chat_id, digest_subscription_action)
+            if ok and digest_subscription_action == "subscribe":
+                reply("✅ Вы подписаны на AI-дайджест. Чтобы отписаться, напишите: "
+                      "«не хочу получать дайджест».")
+            elif ok:
+                reply("✅ Вы отписаны от AI-дайджеста. Подписаться снова можно сообщением: "
+                      "«хочу получать дайджест».")
+            else:
+                reply(f"⚠️ Не удалось изменить подписку на дайджест: {detail}", "failed")
             continue
 
         if is_external_transport and is_slash_command:
@@ -1448,6 +1588,9 @@ def main() -> int:
             return 2
     # Sole server.log writer; tests on the real default data root retain only the stream handler.
     configure_process_logging(drive_logs=None if _pytest_default_real_data_dir else DATA_DIR / "logs")
+    from ouroboros.phoenix_tracing import setup_phoenix_tracing
+
+    setup_phoenix_tracing()  # opt-in via PHOENIX_ENABLED; no-op otherwise
     if not _pytest_default_real_data_dir:  # a pending Panic sweep ends and the installation marker is planted before any child (§9)
         process_scope.initialize_installation_scope(DATA_DIR)
     if not automatic_launch_allowed(os.environ.get("OUROBOROS_LAUNCH_INTENT", "owner"), DATA_DIR, log):

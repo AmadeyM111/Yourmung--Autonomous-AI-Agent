@@ -80,7 +80,6 @@ _POPEN_ALLOWLIST = {
     # group, whole-tree kill on timeout); kept self-contained so the standalone
     # operator rebase helper can import the module without the runtime stack.
     "supervisor/update_carriers.py",
-    "ouroboros/colab_bootstrap.py",      # bounded Colab clone/fetch helper
     # Stdlib-only switch helper that runs BEFORE any body import (no custody module is
     # importable there): its one Popen is the Windows handover, where this process
     # waits as the parent of the next generation and exits with its code — a

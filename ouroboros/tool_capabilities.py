@@ -71,6 +71,7 @@ CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "ocr_pdf", "youtube_transcript", "extract_video_frames",
     "generate_image", "list_image_models", "recover_image",
     *OWNER_DELIVERY_TOOL_NAMES,
+    "transcribe_audio", "read_spreadsheet",
     "escalate",
     "switch_model",
     "request_restart", "promote_to_stable", "prepare_self_change",
@@ -213,7 +214,7 @@ def acting_tool_names_for_context(ctx: object, registered_names: Iterable[str]) 
 READ_ONLY_PARALLEL_TOOLS: frozenset[str] = frozenset({
     "inspect_harness",
     "inspect_subagent",
-    "read_file", "list_files",
+    "read_file", "list_files", "read_spreadsheet",
     "search_code", "query_code", "query_data", "recent_tasks",
     "web_search", "chat_history",
     "vcs_status", "vcs_diff", "service_status", "service_logs",
@@ -291,6 +292,7 @@ TOOL_RESULT_LIMITS: dict[str, int] = {
     "run_command": 80_000,
     "run_script": 80_000,
     "search_code": 80_000,
+    "read_spreadsheet": 80_000,
     "query_code": 80_000,
     "query_data": 80_000,
     "service_logs": 80_000,
@@ -406,6 +408,7 @@ REVIEWED_MUTATIVE_TOOLS: frozenset[str] = frozenset({
 FOREGROUND_MUTATIVE_TOOLS: frozenset[str] = frozenset({
     "submit_skill_to_hub",
     "write_file", "edit_text", "edit_batch", "apply_patch",
+    "transcribe_audio",
 })
 
 

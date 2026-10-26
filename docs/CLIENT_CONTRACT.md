@@ -471,6 +471,7 @@ Every settings writer (Settings, setup, owner controls, language, desktop backgr
 
 **Chat attachments.**
 - **Uploading:** `POST /api/chat/upload` (multipart `file`) returns `UploadResponse`. `filename` is the stored id; `view.url` is the download link.
+- **Long-form audio:** `POST /api/audio/upload` (multipart `file`, up to `OUROBOROS_AUDIO_UPLOAD_MAX_BYTES`, default 1 GiB) returns `AudioUploadResponse`; list it in `attachments` like any other upload.
 - **Lifetime:** an upload stays pending until a message accepts it.
 - **Deleting:** `DELETE /api/chat/upload` with `{filename}` deletes only pending uploads (otherwise 409); a repeat answers 404.
 - **Downloading:** `GET /api/files/download?upload=<id>`.

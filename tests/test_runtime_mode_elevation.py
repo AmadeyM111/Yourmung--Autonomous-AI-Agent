@@ -902,10 +902,6 @@ def test_every_settings_writer_routes_through_the_shared_prologue():
             "(contributor-review-isolation.json), never a settings document.",
         ("ouroboros/tools/core.py", "_data_write"):
             "names SETTINGS_PATH only to REFUSE agent writes to it.",
-        ("ouroboros/colab_bootstrap.py", "write_colab_settings"):
-            "writes the generated document for ANOTHER root (the Colab Drive data dir) in "
-            "serialize_settings bytes. The prologue proves its ratchets against the value on "
-            "THIS process's disk, so routing a foreign path through it would answer the wrong file.",
     }
     # Keys are POSIX-normalised: `str(WindowsPath(...))` is backslash-separated, so on Windows
     # every `exempt` lookup below would miss and every hardcoded assertion at the end would

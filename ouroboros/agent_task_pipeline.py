@@ -866,6 +866,11 @@ def emit_task_results(
     if notice:
         set_terminal_host_notice(usage, str(usage.get("terminal_host_notice") or ""), notice)
     quiet, published = usage.get("wake_silent") is True and not notice, notice or text
+    # Direct-route tasks (e.g. research_digest) mark their own delivery silent: the extension
+    # delivers the result itself, so the task publishes no chat row of its own.
+    _task_meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    if str(_task_meta.get("delivery_mode") or "").strip().lower() == "silent":
+        quiet = True
     receipt_root = pathlib.Path(str(getattr(env, "drive_root", None) or "."))
     verification_receipts = task_verification_receipts(ctx, receipt_root, task)
     # Apply FR3 once so events and the durable result share the same flagged outcome.

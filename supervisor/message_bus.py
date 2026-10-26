@@ -184,7 +184,7 @@ class LocalChatBridge:
         self._replay_lock = threading.Lock()
         self._update_counter = 0
         self._broadcast_fn = None  # set by server.py for WebSocket streaming
-        # A2A response subscriptions: {subscription_id: (chat_id, callback)}
+        # Response subscriptions: {subscription_id: (chat_id, task_id, callback)}
         self._response_subs: Dict[str, tuple] = {}
         self._response_subs_lock = threading.Lock()
         self._chat_transports: Dict[int, Dict[str, Any]] = {}
@@ -303,12 +303,12 @@ class LocalChatBridge:
         """Compatibility no-op; chat bridges are skills now."""
         return None
 
-    def subscribe_response(self, chat_id: int, callback) -> str:
-        """Subscribe to responses for a chat_id."""
+    def subscribe_response(self, chat_id: int, callback, *, task_id: str = "") -> str:
+        """Subscribe to final responses for a chat and optional task."""
         import uuid as _uuid
         sub_id = _uuid.uuid4().hex
         with self._response_subs_lock:
-            self._response_subs[sub_id] = (chat_id, callback)
+            self._response_subs[sub_id] = (chat_id, str(task_id or ""), callback)
         return sub_id
 
     def unsubscribe_response(self, subscription_id: str) -> None:
@@ -442,8 +442,15 @@ class LocalChatBridge:
         if meta:
             msg.update(meta)
         with self._response_subs_lock:
-            subs = [(sid, cb) for sid, (cid, cb) in self._response_subs.items()
-                    if cid == chat_id and not is_progress]
+            subs = [
+                (sid, cb)
+                for sid, (cid, expected_task_id, cb) in self._response_subs.items()
+                if (
+                    cid == chat_id
+                    and not is_progress
+                    and (not expected_task_id or expected_task_id == str(task_id or ""))
+                )
+            ]
         for sid, cb in subs:
             try:
                 cb(text)

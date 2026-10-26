@@ -239,55 +239,8 @@ COLAB_LAUNCHES = {
 }
 
 
-def test_a_colab_rerun_over_an_nminus1_document_pins_no_pool_its_saved_main_cannot_run(tmp_path, caplog):
-    """The lane-era Drive document saved the then-shipped router Main; the relaunch brings only an
-    OpenAI key. The saved Main stays the owner's value, honestly unavailable (owner 2A), and no panel
-    is derived from OpenAI's own default (4A): nothing is migrated yet — no catalog is pinned, every
-    lane key stays and the read names ``OUROBOROS_MODEL`` — and once the owner names a Main the
-    document migrates whole: that Main's panel plus the legacy deep row, never a provider it lacks."""
-    from ouroboros.colab_bootstrap import build_colab_settings, write_colab_settings
-
-    seed = {**N1_DOC, "OUROBOROS_UPDATE_CHANNEL": "stable"}
-    with caplog.at_level("WARNING"):
-        settings = build_colab_settings({"TELEGRAM_BOT_TOKEN": "present", "OPENAI_API_KEY": "present"},
-                                        runtime_mode="pro", existing=seed, drive_document_present=True)
-    document = json.loads(write_colab_settings(tmp_path / "colab_drive", settings).read_text(encoding="utf-8"))
-    assert document["OUROBOROS_MODEL"] == N1_DOC["OUROBOROS_MODEL"]
-    assert not str(document.get(SUBAGENTS) or "").strip(), "no catalog is pinned"
-    assert {key: document.get(key) for key in m.REVIEW_POOL_MIGRATED_SETTING_KEYS if key in N1_DOC} == {
-        key: N1_DOC[key] for key in m.REVIEW_POOL_MIGRATED_SETTING_KEYS if key in N1_DOC}, "the lane keys wait"
-    assert "OUROBOROS_MODEL" in caplog.text
-    outcome = m.migrate_review_lanes({**document, "OUROBOROS_MODEL": "openai::gpt-5.6-sol"})
-    rows = json.loads(outcome.catalog_after)["items"]
-    assert [row["route"]["target_id"] for row in rows if row.get("review_eligible")] == ["openai::gpt-5.6-sol"]
-    assert [row["route"]["target_id"] for row in rows if not row.get("review_eligible")] == [
-        N1_DOC["OUROBOROS_MODEL_DEEP_SELF_REVIEW"]]
 
 
-@pytest.mark.parametrize("launch", sorted(COLAB_LAUNCHES))
-def test_a_colab_launch_pins_the_pool_its_own_provider_can_run(launch, staged_body, tmp_path, monkeypatch):
-    from ouroboros.colab_bootstrap import build_colab_settings, write_colab_settings
-    from ouroboros.provider_models import model_has_credentials_in_settings
-    from ouroboros.subscription_install_presets import factory_review_rows
-
-    secret, drive_document = COLAB_LAUNCHES[launch]
-    seed = {**drive_document, "OUROBOROS_UPDATE_CHANNEL": "stable"}  # the notebook's seed
-    settings = build_colab_settings({"TELEGRAM_BOT_TOKEN": "present", **secret}, runtime_mode="pro",
-                                    existing=seed, drive_document_present=bool(drive_document))
-    path = write_colab_settings(tmp_path / "colab_drive", settings)
-    document = json.loads(path.read_text(encoding="utf-8"))
-    assert SLOTS not in document and SUBAGENTS in document, "the Drive document is a pool document"
-    loaded = _install(monkeypatch, document)  # the server's read of the Drive document
-    pool = review_pool_slots()
-    assert pool and adaptive_quorum(len(pool)) == _lane_era_quorum({SLOTS: "", **secret}), launch
-    # The rows are the shipped panel of the provider whose key the document holds — every
-    # one runnable with the install's own credentials, none pinned for a provider it lacks.
-    assert [slot.model for slot in pool] == [row["route"]["target_id"] for row in factory_review_rows(secret)], launch
-    assert all(model_has_credentials_in_settings(slot.model, loaded) for slot in pool), [s.model for s in pool]
-    result, record, _served = _one_wave(tmp_path, monkeypatch, Path(staged_body["repo"]))
-    assert (result["aggregate"], result["state"]) == ("PASS", "settled"), (launch, result)
-    assert [row["seat_id"] for row in record["rows"]] == [slot.slot_id for slot in pool]
-    assert record["verdict"]["per_question"] == {PART_CHANGE: "PASS", PART_COUPLING: "PASS"}, launch
 
 
 # --- the controls: the assertions above bite -------------------------------------------

@@ -10,7 +10,7 @@ import sys
 import time
 from typing import Any, Dict, Optional
 
-from ouroboros.colab_bootstrap import (
+from ouroboros.telegram_bridge_setup import (
     ensure_post_broadcast_live,
     ensure_research_digest_live,
     ensure_telegram_bridge_live,

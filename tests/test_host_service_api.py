@@ -19,14 +19,16 @@ class FakeBridge:
     def __init__(self) -> None:
         self.messages = []
         self._subs = {}
+        self.response_task_id = ""
 
     def enqueue_local_message(self, text, **kwargs):
         self.messages.append({"text": text, **kwargs})
         for callback in list(self._subs.values()):
             callback("reply from host")
 
-    def subscribe_response(self, chat_id, callback):
+    def subscribe_response(self, chat_id, callback, *, task_id=""):
         self._subs["sub"] = callback
+        self.response_task_id = task_id
         return "sub"
 
     def unsubscribe_response(self, subscription_id):
@@ -955,3 +957,26 @@ def test_chat_inject_allows_slash_command_caption_even_with_text(tmp_path: pathl
 def _focus_authority_available(monkeypatch):
     monkeypatch.setattr("ouroboros.presence_admission.focus_enabled", lambda _root: True)
     monkeypatch.setattr("ouroboros.presence_admission.focus_allowance", lambda _root: {"status": "available", "remaining_usd": 10})
+
+
+def test_chat_inject_forwards_delivery_correlation_metadata(tmp_path: pathlib.Path) -> None:
+    _seed_token(tmp_path, permissions=["inject_chat"])
+    bridge = FakeBridge()
+    app = create_host_service_app(tmp_path, bridge_getter=lambda: bridge)
+    client = TestClient(app)
+
+    response = client.post(
+        "/chat/inject",
+        headers={"X-Skill-Token": "token"},
+        json={
+            "text": "recover me",
+            "chat_id": 42,
+            "user_id": 7,
+            "client_message_id": "telegram:99",
+            "task_metadata": {"transport_task_id": "tg_99"},
+        },
+    )
+
+    assert response.status_code == 202
+    assert bridge.messages[0]["client_message_id"] == "telegram:99"
+    assert bridge.messages[0]["task_metadata"]["transport_task_id"] == "tg_99"

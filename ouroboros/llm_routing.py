@@ -57,6 +57,32 @@ def _resolve_or_provider() -> Dict[str, Any]:
     return dict(parsed) if isinstance(parsed, dict) else {}
 
 
+# Model-scoped OpenRouter keys: free-tier models may carry their own key.
+_MODEL_SCOPED_OPENROUTER_KEYS = (
+    ("poolside/", ("LAGUNA_API_KEY",)),
+    ("google/gemma-4-31b", ("GEMA_API_KEY", "GEMMA_API_KEY")),
+    ("google/gemma-", ("GEMMA_API_KEY", "GEMA_API_KEY")),
+    ("nvidia/nemotron", ("NEMOTRON_API_KEY",)),
+)
+
+
+def model_scoped_openrouter_key_names(resolved_model: str) -> tuple:
+    """Env names of the model-scoped keys that may serve ``resolved_model``."""
+    for prefix, names in _MODEL_SCOPED_OPENROUTER_KEYS:
+        if str(resolved_model or "").startswith(prefix):
+            return names
+    return ()
+
+
+def openrouter_key_for_model(resolved_model: str, configured: Any) -> Any:
+    """The model-scoped key when set, else the shared OpenRouter key."""
+    for name in model_scoped_openrouter_key_names(resolved_model):
+        value = configured(name, "")
+        if value:
+            return value
+    return configured("OPENROUTER_API_KEY", "")
+
+
 class _ProviderRoutingMixin:
     """Provider targets, client factories, affinity keys and the window probe."""
 
@@ -488,9 +514,11 @@ class _ProviderRoutingMixin:
                 "supports_generation_cost": False,
             }
 
-        current_api_key = configured("OPENROUTER_API_KEY", "") if explicit_settings else self._api_key_override
+        current_api_key = (
+            openrouter_key_for_model(resolved_model, configured) if explicit_settings else self._api_key_override
+        )
         if current_api_key is None:
-            current_api_key = runtime_setting("OPENROUTER_API_KEY", "")
+            current_api_key = openrouter_key_for_model(resolved_model, configured)
         return {
             "provider": "openrouter",
             "resolved_model": resolved_model,

@@ -59,7 +59,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git netbase tzdata \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg git netbase tzdata \
     && uvx --from "playwright==${PLAYWRIGHT_VERSION}" playwright install-deps chromium webkit \
     && uvx --from "playwright==${PLAYWRIGHT_VERSION}" playwright install chromium webkit
 
@@ -78,6 +78,29 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --python /opt/python-standalone/bin/python3 --no-dev --extra browser --no-editable
+
+# Jormung fork: optional transcription stack, off by default (build args).
+#   --build-arg OUROBOROS_INSTALL_TRANSCRIPTION=1  faster-whisper (local STT)
+#   --build-arg OUROBOROS_INSTALL_DIARIZATION=1    pyannote speaker diarization (large: PyTorch)
+#   --build-arg OUROBOROS_INSTALL_WHISPERX=1       WhisperX forced alignment (large: PyTorch)
+#   --build-arg OUROBOROS_INSTALL_TRACING=1        Phoenix/OpenInference tracing
+ARG OUROBOROS_INSTALL_TRANSCRIPTION=0
+ARG OUROBOROS_INSTALL_DIARIZATION=0
+ARG OUROBOROS_INSTALL_WHISPERX=0
+ARG OUROBOROS_INSTALL_TRACING=0
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ "$OUROBOROS_INSTALL_TRANSCRIPTION" = "1" ]; then \
+         uv pip install --python /app/.venv/bin/python "faster-whisper==1.2.1"; \
+       fi \
+    && if [ "$OUROBOROS_INSTALL_DIARIZATION" = "1" ]; then \
+         uv pip install --python /app/.venv/bin/python -r requirements-diarization.txt; \
+       fi \
+    && if [ "$OUROBOROS_INSTALL_WHISPERX" = "1" ]; then \
+         uv pip install --python /app/.venv/bin/python -r requirements-whisperx.txt; \
+       fi \
+    && if [ "$OUROBOROS_INSTALL_TRACING" = "1" ]; then \
+         uv pip install --python /app/.venv/bin/python "arize-phoenix-otel>=0.16.1,<0.17.0" "openinference-instrumentation-openai>=0.1.52,<0.2.0"; \
+       fi
 
 # Default environment
 ENV OUROBOROS_SERVER_HOST=0.0.0.0 \

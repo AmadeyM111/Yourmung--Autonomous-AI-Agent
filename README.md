@@ -1,5 +1,21 @@
 # Ouroboros
 
+> ## Jormung fork
+>
+> This repository ("yourmung" / the **Jormung** agent persona) is a fork of
+> [razzant/ouroboros](https://github.com/razzant/ouroboros) rebased onto upstream **v7.8.0**,
+> aimed at a universal executive-assistant agent (Telegram + local/Docker).
+>
+> **Additions:** Telegram bridge patches (inbound audio, delivery, local STT, subscription menu);
+> audio transcription (local faster-whisper / WhisperX / Gemini / Deepgram, optional pyannote
+> diarization); xlsx ingestion; the `research_digest` and `post_broadcast` skills; optional
+> Phoenix tracing.
+> **Removed:** Google Colab, Groq, Ollama, minimal-context mode.
+>
+> Docker: `docker compose up -d --build` (Telegram launcher, port published on `127.0.0.1` only;
+> set `OUROBOROS_NETWORK_PASSWORD` before binding anything wider). Optional transcription stack via
+> build args `OUROBOROS_INSTALL_TRANSCRIPTION|DIARIZATION|WHISPERX|TRACING=1`. See `CHANGELOG.md`.
+
 <a href="https://github.com/oslook/github-trending/blob/1d61d20a46f66a9590286bf23a8ce8db99be3acf/2026-08-04/python_weekly_trending.json"><img src="assets/github-trending.svg" width="250" height="55" alt="GitHub Trending: #9 Python weekly, August 2026"></a>
 
 [![GitHub stars](https://img.shields.io/github/stars/razzant/ouroboros?style=flat&logo=github)](https://github.com/razzant/ouroboros/stargazers)

@@ -577,6 +577,10 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
                         **({"chat_attachments": refs} if refs else {})}
         if payload.get("reply_to"):  # no reference adds nothing to a plain inject's kwargs
             metadata["reply_to"] = payload["reply_to"]
+        extra_metadata = payload.get("task_metadata") if isinstance(payload.get("task_metadata"), dict) else {}
+        for key, value in extra_metadata.items():  # delivery-correlation hints never override host-stamped keys
+            metadata.setdefault(str(key), value)
+        response_task_id = str(extra_metadata.get("transport_task_id") or "")
         bridge = ctx.bridge_getter()
         response_event: asyncio.Event = asyncio.Event()
         response_holder: dict[str, str] = {}
@@ -587,7 +591,10 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
                 response_holder["text"] = response_text
                 loop.call_soon_threadsafe(response_event.set)
 
-            subscription_id = bridge.subscribe_response(chat_id, on_response)
+            subscription_id = (
+                bridge.subscribe_response(chat_id, on_response, task_id=response_task_id)
+                if response_task_id else bridge.subscribe_response(chat_id, on_response)
+            )
         if not rejoined:
             message = dict(
                 chat_id=chat_id,

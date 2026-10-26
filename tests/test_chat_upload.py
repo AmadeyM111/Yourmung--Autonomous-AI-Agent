@@ -103,6 +103,17 @@ def test_valid_long_upload_names_keep_exact_bytes_on_both_ingresses(client, tmp_
     assert not list((tmp_path / "uploads").glob(".*.tmp"))
 
 
+def test_upload_rejects_invalid_xlsx_and_removes_it(client, tmp_path):
+    resp = client.post(
+        "/api/chat/upload",
+        files={"file": ("broken.xlsx", io.BytesIO(b"not a workbook"), "application/octet-stream")},
+    )
+
+    assert resp.status_code == 400
+    assert "Invalid XLSX workbook" in resp.json()["error"]
+    assert list((tmp_path / "uploads").iterdir()) == []
+
+
 def test_upload_invalid_content_length(client):
     """Non-numeric Content-Length should not cause a 500; treated as 0 (unknown)."""
     import io

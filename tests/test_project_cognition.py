@@ -218,7 +218,6 @@ def test_legacy_effort_migration_follows_authored_disk_and_environment_precedenc
 
 @pytest.mark.parametrize("primary", ["none", "minimal", "xhigh", "max", "ultra"])
 def test_upgrade_keeps_effective_bounds_after_old_writers_filled_defaults(room_settings, monkeypatch, primary):
-    from ouroboros.colab_bootstrap import build_colab_settings
     from ouroboros.gateway.owner_settings import _owner_read_settings_raw
     from ouroboros.settings_scales import effort_rank
 
@@ -233,7 +232,7 @@ def test_upgrade_keeps_effective_bounds_after_old_writers_filled_defaults(room_s
     raw = {}
     owner = _owner_read_settings_raw(document_out=raw)
     assert raw == old and EFFORT_FORMAT_KEY not in raw
-    for values in (config.load_settings(), owner, build_colab_settings({}, existing=old)):
+    for values in (config.load_settings(), owner):
         assert effort_range(values) == expected and values[EFFORT_FORMAT_KEY] == 1
     _legacy_rows(root, "old-project")
     independent = {"min": "low", "recommended": primary, "max": "high"}
@@ -243,7 +242,6 @@ def test_upgrade_keeps_effective_bounds_after_old_writers_filled_defaults(room_s
     assert read_cognition(root)["effort_range"] == independent
     saved = json.loads(config.SETTINGS_PATH.read_text(encoding="utf-8"))
     assert saved[EFFORT_FORMAT_KEY] == 1
-    assert effort_range(build_colab_settings({}, existing=saved)) == independent
     assert EFFORT_FORMAT_KEY not in os.environ and EFFORT_FORMAT_KEY not in config.SETTINGS_DEFAULTS
 
 

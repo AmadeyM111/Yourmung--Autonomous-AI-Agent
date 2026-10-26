@@ -56,7 +56,6 @@ Tier 2 means build, packaging, or developer feedback loops break.
 | 0 | Safety policy | `ouroboros/safety.py`, `ouroboros/runtime_mode_policy.py`, `ouroboros/tool_policy.py` | Prevents unsafe operations and protected-path mutation. |
 | 0 | Memory/context | `ouroboros/context.py`, `ouroboros/memory.py`, `ouroboros/context_budget.py` | Builds model messages and controls context size. |
 | 1 | Skills/extensions | `ouroboros/skill_loader.py`, `ouroboros/extension_loader.py`, `skills/*` | External capability loading and reviewed tool surfaces. |
-| 1 | Telegram/Colab bootstrap | `ouroboros/colab_bootstrap.py`, `notebooks/colab_quickstart.py` | Source-mode Colab runtime, Telegram bridge setup, Groq profile. |
 | 1 | Research digest skill | `skills/research_digest/*` | Digest user flow and direct tool route for Telegram/Groq. |
 | 1 | MCP client | `ouroboros/mcp_client.py`, `ouroboros/gateway/mcp.py` | Optional external MCP tools. Disabled by default. |
 | 1 | Local model lifecycle | `ouroboros/local_model.py`, `ouroboros/local_model_autostart.py` | Local llama-cpp runtime path. Separate from Ollama-compatible route. |
@@ -91,9 +90,7 @@ Tier 2 means build, packaging, or developer feedback loops break.
 
 | Entrypoint | Owner | Notes |
 | --- | --- | --- |
-| `notebooks/colab_quickstart.py` | notebook script | Colab cell script; mounts Drive, installs repo, starts no-UI server. |
-| `notebooks/colab_quickstart.ipynb` | notebook | Notebook wrapper around the script. |
-| `ouroboros/colab_bootstrap.py` | bootstrap helpers | Applies Groq profile, Telegram bridge setup, Drive-persisted settings. |
+| `ouroboros/telegram_bridge_setup.py` | bootstrap helpers | Applies Groq profile, Telegram bridge setup, Drive-persisted settings. |
 
 ## 4. Core Runtime Nodes
 
@@ -505,8 +502,7 @@ Risk:
 
 Primary files:
 
-- `ouroboros/colab_bootstrap.py`
-- `notebooks/colab_quickstart.py`
+- `ouroboros/telegram_bridge_setup.py`
 - `skills/research_digest/plugin.py`
 - `skills/research_digest/skill.json`
 - `skills/research_digest/README.md`

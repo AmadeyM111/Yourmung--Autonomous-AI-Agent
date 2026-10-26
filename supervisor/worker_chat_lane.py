@@ -266,8 +266,11 @@ def _admit_chat_task(
         if not client_msg_id:
             client_msg_id = str(task_metadata.get("client_message_id") or "")
     kind = "direct_chat"
+    # A transport (Telegram) may pin the task id so its final-response
+    # subscription correlates with this exact turn.
+    transport_task_id = str((task_metadata or {}).get("transport_task_id") or "").strip()
     task: Dict[str, Any] = {
-        "id": uuid.uuid4().hex[:8],
+        "id": transport_task_id or uuid.uuid4().hex[:8],
         "type": "task",
         "chat_id": chat_id,
         "text": text,

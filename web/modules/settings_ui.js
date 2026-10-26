@@ -208,6 +208,9 @@ export const SECRET_KEYS = [
     ['MINIMAX_API_KEY', 'MiniMax API Key', 'MiniMax key'],
     ['DEEPSEEK_API_KEY', 'DeepSeek API Key', 'sk-...'],
     ['ZAI_API_KEY', 'Z.ai API Key (GLM)', 'Z.ai key'],
+    ['GEMINI_API_KEY', 'Gemini API Key', 'Google AI Studio key'],
+    ['DEEPGRAM_API_KEY', 'Deepgram API Key', 'Deepgram console key'],
+    ['HF_TOKEN', 'Hugging Face Token', 'hf_...'],
     ['GITHUB_TOKEN', 'GitHub Token', 'ghp_...'],
     ['OUROBOROS_NETWORK_PASSWORD', 'Network Password', 'Required for LAN/Docker binds'],
 ];

@@ -44,7 +44,7 @@ _SPAWN_GRACE_SEC: float = WORKER_SPAWN_GRACE_SEC  # config SSOT; leaves read it 
 # multi-threaded supervisor is unsafe on every OS: a child forked while another
 # server thread holds a per-module import lock keeps that lock with no thread
 # left to release it and wedges on its first import of that module (the
-# deadlock colab_bootstrap.py names; macOS adds dead Mach ports and a _scproxy
+# deadlock names; macOS adds dead Mach ports and a _scproxy
 # SIGSEGV pre-exec). forkserver forks every worker from ONE bare single-threaded
 # server process, so no lock is inherited, and a warm child still confirms in
 # seconds (mock lane, fork -> forkserver: startup 2.4-3.3 -> 3.5-4.9s, respawn

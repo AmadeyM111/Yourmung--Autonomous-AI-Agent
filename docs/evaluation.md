@@ -26,7 +26,6 @@ python -m py_compile ouroboros/context.py ouroboros/llm.py ouroboros/loop.py
 | --- | --- |
 | LLM/provider routing | `tests/test_llm_provider_routing.py`, `tests/test_groq_api_smoke.py` |
 | Context/memory | `tests/test_doc_context.py`, context-related tests |
-| Colab/Groq | `tests/test_colab_bootstrap.py`, `python -m ouroboros.groq_api_smoke` |
 | Gateway/API | `tests/test_gateway_parity.py`, contract tests |
 | Skills/extensions | skill preflight/review tests, extension health tests |
 | Packaging | build/portable tests, platform build script tests |

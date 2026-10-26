@@ -610,16 +610,6 @@ def test_the_wizard_proposes_no_router_ids_for_several_direct_providers():
     assert defaults["direct-multi"]["main"] == "" and not any(defaults["direct-multi"].values())
 
 
-def test_the_colab_document_proposes_for_unauthored_slots_and_keeps_saved_blanks():
-    from ouroboros.colab_bootstrap import build_colab_settings
-
-    settings = build_colab_settings({"OPENAI_API_KEY": "k"}, drive_document_present=False)
-    assert tuple(settings[key] for key in SLOTS) == OPENAI
-    assert [row["subagent_id"] for row in _items(settings) if not row.get("review_eligible")] == [
-        "primary-builder", "fast-scout"]
-    assert _pool_targets(settings) == [OPENAI[0]]
-    kept = build_colab_settings({"OPENAI_API_KEY": "k"}, existing={"OUROBOROS_MODEL_LIGHT": ""})
-    assert kept["OUROBOROS_MODEL_LIGHT"] == ""
 
 
 # --- continuation: the contract gaps the first candidate left open -------------------------
@@ -840,26 +830,6 @@ LOCAL_ALL = {"LOCAL_MODEL_SOURCE": "/models/m.gguf", "USE_LOCAL_MAIN": True, "US
              "USE_LOCAL_CONSCIOUSNESS": True, "USE_LOCAL_FALLBACK": True}
 
 
-def test_a_local_only_setup_proposes_blank_light_and_fallbacks_at_boot_wizard_and_colab(install, monkeypatch):
-    from ouroboros.colab_bootstrap import build_colab_settings
-    from ouroboros.settings_setup_contract import build_setup_bootstrap, derive_provider_profile
-
-    _write(install, LOCAL_ALL)
-    boot = _slots(_task_start())
-    assert derive_provider_profile(LOCAL_ALL) == "local"
-    wizard = build_setup_bootstrap(LOCAL_ALL, fresh_install=True)["modelDefaults"]["local"]
-    colab = build_colab_settings({}, existing=dict(LOCAL_ALL))
-    assert boot == (SETTINGS_DEFAULTS["OUROBOROS_MODEL"], "", "")
-    assert (wizard["main"], wizard["light"], wizard["fallback"]) == boot
-    assert tuple(colab[key] for key in SLOTS) == boot
-    # A saved choice stays; a router key makes the shipped Light reachable again (mixed setup).
-    _write(install, {**LOCAL_ALL, "OUROBOROS_MODEL_LIGHT": "my-light (local)"})
-    assert _task_start().settings["OUROBOROS_MODEL_LIGHT"] == "my-light (local)"
-    _write(install, LOCAL_ALL)
-    for key in SLOTS:  # a new process: the last read's projection is not this document's (conftest restores)
-        os.environ.pop(key, None)
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-present-key")
-    assert _slots(_task_start()) == SHIPPED
 
 
 # Parent relay: the second read of a running process — load → project → change → reload.

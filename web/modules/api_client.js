@@ -432,6 +432,12 @@ export const apiClient = {
         body.append('file', file);
         return fetchJson('/api/chat/upload', { method: 'POST', body }, { rejectOkFalse: true });
     },
+    /** One long-form audio file (transcription source) into the upload store. @returns {Promise<import('./api_types.js').AudioUploadResponse>} */
+    uploadAudioAttachment: (file) => {
+        const body = new FormData();
+        body.append('file', file);
+        return fetchJson('/api/audio/upload', { method: 'POST', body }, { rejectOkFalse: true });
+    },
     settings: () => fetchJson('/api/settings', { cache: 'no-store' }),
     /** @returns {Promise<import('./model_route_types.js').WebSearchRoute>} */
     webSearchPreview: (selection = {}) => fetchJson(

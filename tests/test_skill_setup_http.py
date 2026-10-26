@@ -354,33 +354,6 @@ def test_author_finish_reads_the_payload_after_lane_admission(tmp_path, monkeypa
         assert current.author_disposition['subject_hash'] == new_hash
 
 
-@pytest.mark.parametrize('stage', ['grants', 'toggle', 'grant_setup_failure'])
-def test_colab_does_not_claim_pending_or_failed_setup_enabled(stage):
-    from ouroboros.colab_bootstrap import ensure_native_telegram_live
-    from tests.test_colab_bootstrap import _native_telegram_index
-    calls = []
-
-    def request(method, path, body=None, timeout=None):
-        calls.append(path)
-        if path == '/api/health':
-            return 200, {'ok': True}
-        if path == '/api/extensions':
-            return 200, _native_telegram_index(missing=['TELEGRAM_BOT_TOKEN'] if stage != 'toggle' else [])
-        if path.endswith('/grants') and stage == 'grant_setup_failure':
-            return 200, {'ok': True, 'granted_keys': ['TELEGRAM_BOT_TOKEN'], 'setup_error': 'Its packages did not install.'}
-        if path.endswith('/' + stage):
-            return 200, {'ok': True, 'pending': True, 'job_id': 'actual-job', 'message': 'Installing packages…'}
-        raise AssertionError('Unexpected continuation after incomplete setup: ' + path)
-
-    status = ensure_native_telegram_live(settings={'TELEGRAM_BOT_TOKEN': 'synthetic-not-real',
-        'OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS': True}, request=request, timeout=5)
-    assert not status['ok'] and 'enabled' not in status['steps']
-    assert not any(path.endswith('/settings/save') for path in calls)
-    if stage == 'grant_setup_failure':
-        assert status['error'] == 'Its packages did not install.'
-        assert not any(path.endswith('/toggle') for path in calls)
-    else:
-        assert status['pending'] and status['job_id'] == 'actual-job'
 
 
 def _launcher_grant_skill(tmp_path, monkeypatch, *, name="demo", skill_type="script", permissions=(), keys=("OPENROUTER_API_KEY",)):

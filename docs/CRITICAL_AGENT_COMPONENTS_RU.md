@@ -54,7 +54,6 @@ server.py
 | 0 | Tool loop | `ouroboros/loop.py`, `ouroboros/loop_tool_execution.py` | Модель не вызывает tools или получает плохие tool results. |
 | 0 | Safety | `ouroboros/safety.py`, `ouroboros/runtime_mode_policy.py` | Риск опасных операций и повреждения защищенных файлов. |
 | 1 | Skills/extensions | `ouroboros/skill_loader.py`, `ouroboros/extension_loader.py`, `skills/*` | Внешние возможности и reviewed tools недоступны. |
-| 1 | Telegram/Colab | `ouroboros/colab_bootstrap.py`, `notebooks/colab_quickstart.py` | Colab runtime, Groq profile и Telegram bridge не поднимаются. |
 | 1 | Research digest | `skills/research_digest/*` | Дайджест не формируется корректным tool route. |
 | 1 | Observability/results | `ouroboros/observability.py`, `ouroboros/task_results.py` | Нельзя понять, что произошло, и восстановить результат. |
 
@@ -80,8 +79,7 @@ ouroboros tasks watch <task_id>
 Colab/Telegram:
 
 ```text
-notebooks/colab_quickstart.py
-ouroboros/colab_bootstrap.py
+ouroboros/telegram_bridge_setup.py
 ```
 
 Значимые runtime-пути:
@@ -285,8 +283,7 @@ data/state/skills/<skill>/
 
 Значимые файлы:
 
-- `ouroboros/colab_bootstrap.py`
-- `notebooks/colab_quickstart.py`
+- `ouroboros/telegram_bridge_setup.py`
 - `skills/research_digest/plugin.py`
 - `skills/research_digest/skill.json`
 

@@ -768,3 +768,14 @@ def test_a_fresh_local_first_install_still_authors_safety_light(tmp_path, monkey
     server_src = (repo / "server.py").read_text(encoding="utf-8")
     assert "save_settings(" not in launcher_host
     assert "save_settings(" not in server_src
+
+
+def test_telegram_subscription_intents_are_recognized():
+    import server
+
+    assert server._cat_meme_subscription_action("хочу получать котомемы") == "subscribe"
+    assert server._cat_meme_subscription_action("не хочу получать котомемы") == "unsubscribe"
+    assert server._digest_subscription_action("/digest_unsubscribe") == "unsubscribe"
+    assert server._digest_subscription_action("хочу получать дайджест") == "subscribe"
+    assert server._cat_meme_subscription_action("привет") is None
+    assert server._is_subscription_menu_request("Подписки")

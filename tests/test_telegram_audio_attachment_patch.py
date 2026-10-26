@@ -183,14 +183,3 @@ def test_patch_upgrades_split_helper_without_core_runtime_import(tmp_path):
     assert patch_plugin(plugin)["changed"] is False
 
 
-def test_colab_bootstrap_wrapper_targets_official_bridge(tmp_path):
-    from ouroboros.colab_bootstrap import patch_telegram_bridge_audio_attachments
-
-    plugin = tmp_path / "skills" / "ouroboroshub" / "telegram-bridge" / "plugin.py"
-    plugin.parent.mkdir(parents=True)
-    plugin.write_text(_plugin_fixture(), encoding="utf-8")
-
-    result = patch_telegram_bridge_audio_attachments(tmp_path)
-
-    assert result["ok"] is True
-    assert MARKER in plugin.read_text(encoding="utf-8")

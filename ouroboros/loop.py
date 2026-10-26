@@ -542,6 +542,15 @@ def run_llm_loop(
     tool_schemas = continuation["tool_schemas"] if continuation else initial_tool_schemas(tools, context_mode=active_context_mode)
     tool_schemas, _enabled_extra_tools = _setup_dynamic_tools(tools, tool_schemas, messages, context_mode=active_context_mode)
     ctx.event_queue, ctx.task_id, ctx.messages = event_queue, task_id, messages
+    if not continuation:
+        from ouroboros.direct_routes import run_direct_routes
+
+        direct_text = run_direct_routes(
+            messages=messages, tools_registry=tools, tool_schemas=tool_schemas, active_model=active_model,
+            llm_trace=llm_trace, emit_progress=emit_progress)
+        if direct_text:
+            return _handle_text_response(direct_text, llm_trace, accumulated_usage)
+    _attempted_article_urls: set = set()
     stateful_executor = StatefulToolExecutor()
     exit_ctx = _LoopExitContext(
         tools, drive_root, task_id, event_queue, drive_logs, accumulated_usage, llm_trace,
@@ -621,6 +630,13 @@ def run_llm_loop(
                 text, accumulated_usage, forced_trace = _early_final
                 _merge_finalization_trace(llm_trace, forced_trace)
                 return text, accumulated_usage, llm_trace
+
+            if not pending_tool_budget and not pending_no_tool_budget:
+                from ouroboros.direct_routes import maybe_enrich_article_summary_request
+
+                maybe_enrich_article_summary_request(
+                    messages=messages, tools_registry=tools, llm_trace=llm_trace,
+                    emit_progress=emit_progress, attempted_urls=_attempted_article_urls)
 
             if pending_tool_budget:
                 pending_tool_budget = False
@@ -772,6 +788,12 @@ def run_llm_loop(
                 fit_candidate=functools.partial(_measure_tool_result_batch, ctx,
                     round_id=f"{accumulated_usage.setdefault('execution_id', new_execution_id())}:round:{round_idx}"))
             working_checkpoint.save_or_log(limit_ctx, "post_batch")  # BEFORE any owner-wait park
+            direct_final = str(llm_trace.pop("_direct_final_response", "") or "").strip()
+            if direct_final:
+                emit_progress(direct_final)
+                final_result = _finalize_loop_candidate(direct_final, limit_ctx, tools, emit_progress, after_tools=True)
+                if final_result is not None:
+                    return final_result
             from ouroboros.loop_delivery import finish_completed_stop
             stopped = finish_completed_stop(tools, limit_ctx, emit_progress, budget_remaining_usd, cost_ceiling)
             if stopped is not None:

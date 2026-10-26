@@ -55,12 +55,6 @@ def test_outdated_notice_is_prepended_once_and_keeps_the_notes():
     assert mirrors.mark_outdated(None).startswith(mirrors.OUTDATED_MARK)
 
 
-def test_colab_stub_is_a_notebook_that_points_at_the_official_quickstart():
-    notebook = json.loads(mirrors.colab_stub())
-    assert notebook["nbformat"] == 4
-    text = json.dumps(notebook)
-    assert "razzant/ouroboros/main/notebooks/colab_quickstart.py" in text
-    assert "joi-lab" not in text
 
 
 def test_main_commit_keeps_both_histories_and_is_idempotent(tmp_path, monkeypatch):
