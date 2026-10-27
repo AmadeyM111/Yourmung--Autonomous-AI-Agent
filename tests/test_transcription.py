@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import pathlib
 import queue
@@ -495,13 +496,16 @@ def test_agent_tool_registers_artifacts_without_returning_transcript_text(tmp_pa
     payload = json.loads(tool_module._transcribe_audio_tool(ctx, str(source)))
     assert payload["artifacts"] == [{"name": "recording.transcript.txt"}]
     assert "secret transcript body" not in json.dumps(payload)
-    assert ctx.pending_events == [{
+    (document,) = ctx.pending_events
+    assert {k: v for k, v in document.items() if k != "file_base64"} == {
         "type": "send_document",
         "chat_id": 42,
-        "file_path": str(drive / "task_results" / "artifacts" / "task-1" / "recording.transcript.txt"),
         "filename": "recording.transcript.txt",
+        "mime": "text/plain",
         "caption": "Стенограмма аудиозаписи",
-    }]
+    }
+    assert base64.b64decode(document["file_base64"]) == (
+        drive / "task_results" / "artifacts" / "task-1" / "recording.transcript.txt").read_bytes()
     manifest = drive / "task_results" / "artifacts" / "task-1" / ".artifact_manifest.json"
     assert manifest.exists()
 
@@ -533,7 +537,9 @@ def test_transcript_document_prefers_live_event_queue(tmp_path):
         repo_dir=tmp_path, drive_root=tmp_path, current_chat_id=42,
         event_queue=event_queue,
     )
-    _queue_transcript_document(ctx, {"path": "/tmp/recording.txt", "name": "recording.txt"})
+    transcript = tmp_path / "recording.txt"
+    transcript.write_bytes(b"transcript")
+    _queue_transcript_document(ctx, {"path": str(transcript), "name": "recording.txt"})
 
     assert ctx.pending_events == []
     assert event_queue.get_nowait()["type"] == "send_document"
