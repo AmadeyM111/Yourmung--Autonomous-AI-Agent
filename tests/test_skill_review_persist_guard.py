@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 
 from ouroboros.skill_loader import (
     SkillReviewState,
@@ -13,6 +14,8 @@ from ouroboros.skill_loader import (
 from ouroboros.skill_review import review_skill
 from ouroboros.tools.registry import ToolContext
 from ouroboros.utils import atomic_write_json, utc_now_iso
+
+from tests._shared import reconcile_receipt
 
 
 def _build_script_skill(root, name: str = "alpha"):
@@ -37,34 +40,23 @@ def _build_script_skill(root, name: str = "alpha"):
     return skill_dir
 
 
-def _pass_actor(model: str):
-    findings = [
-        {"item": "manifest_schema", "verdict": "PASS", "severity": "critical", "reason": "ok"},
-        {"item": "permissions_honesty", "verdict": "PASS", "severity": "critical", "reason": "ok"},
-        {"item": "no_repo_mutation", "verdict": "PASS", "severity": "critical", "reason": "ok"},
-        {"item": "path_confinement", "verdict": "PASS", "severity": "critical", "reason": "ok"},
-        {"item": "env_allowlist", "verdict": "PASS", "severity": "critical", "reason": "ok"},
-        {"item": "timeout_and_output_discipline", "verdict": "PASS", "severity": "advisory", "reason": "ok"},
-        {"item": "extension_namespace_discipline", "verdict": "PASS", "severity": "critical", "reason": "n/a"},
-        {"item": "widget_module_safety", "verdict": "PASS", "severity": "critical", "reason": "n/a"},
-        {"item": "inject_chat_minimization", "verdict": "PASS", "severity": "critical", "reason": "n/a"},
-        {"item": "event_subscription_minimization", "verdict": "PASS", "severity": "critical", "reason": "n/a"},
-        {"item": "companion_process_safety", "verdict": "PASS", "severity": "critical", "reason": "n/a"},
-        {"item": "host_token_handling", "verdict": "PASS", "severity": "critical", "reason": "n/a"},
-        {"item": "error_handling", "verdict": "PASS", "severity": "advisory", "reason": "ok"},
-        {"item": "integration_preflight", "verdict": "PASS", "severity": "advisory", "reason": "ok"},
-        {"item": "bug_hunting", "verdict": "PASS", "severity": "advisory", "reason": "ok"},
-        {"item": "completion_notification", "verdict": "PASS", "severity": "advisory", "reason": "n/a"},
-    ]
-    return {
-        "model": model,
-        "request_model": model,
-        "provider": "openrouter",
-        "verdict": "REVIEW",
-        "text": json.dumps(findings),
-        "tokens_in": 1,
-        "tokens_out": 1,
-    }
+def _clean_wave(monkeypatch, sends=None) -> list:
+    """The fold's physical seam under the REAL custody layer: the golden pool's seats, each answering the skill
+    question clean (``[]`` + NO_FINDINGS) through ``ReviewCoordinator._run_slot``. A fake above custody (the
+    dispatcher, ``tools.review._handle_multi_model_review``) produces no seat operation, so custody reads every
+    seat as unanswered and the wave forms no verdict — the shape the pre-fold private parser accepted is gone."""
+    import ouroboros.review_substrate as substrate
+    from tests import _contributor_packet_shared as shared
+    from tests.review_pool_rosters import set_review_pool
+
+    def answer(request, slot, actor, *, retry_state, pending_invocation_checkpoint):
+        actor.raw_text = "[]\nNO_FINDINGS"
+        return actor
+
+    sends = [] if sends is None else sends
+    set_review_pool(monkeypatch, shared.golden_pool())
+    monkeypatch.setattr(substrate.ReviewCoordinator, "_run_slot", shared.golden_physical_seam(sends, answer=answer))
+    return sends
 
 
 def test_interrupted_review_job_cannot_late_write_pass(tmp_path, monkeypatch):
@@ -98,12 +90,7 @@ def test_interrupted_review_job_cannot_late_write_pass(tmp_path, monkeypatch):
         },
         trailing_newline=True,
     )
-    monkeypatch.setattr(
-        "ouroboros.tools.review._handle_multi_model_review",
-        lambda *_a, **_kw: json.dumps(
-            {"results": [_pass_actor("fake/a"), _pass_actor("fake/b")]}
-        ),
-    )
+    _clean_wave(monkeypatch)  # a real clean verdict per seat, which the guard then refuses
 
     outcome = review_skill(ctx, "alpha")
 
@@ -128,7 +115,7 @@ def test_mismatched_review_job_hash_cannot_late_write_pass(tmp_path, monkeypatch
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
     ctx = ToolContext(repo_dir=repo_dir, drive_root=drive_root)
     ctx._skill_review_lifecycle_guard = True
-    content_hash = compute_content_hash(skill_dir)
+    compute_content_hash(skill_dir)
 
     save_review_state(
         drive_root,
@@ -147,12 +134,7 @@ def test_mismatched_review_job_hash_cannot_late_write_pass(tmp_path, monkeypatch
         },
         trailing_newline=True,
     )
-    monkeypatch.setattr(
-        "ouroboros.tools.review._handle_multi_model_review",
-        lambda *_a, **_kw: json.dumps(
-            {"results": [_pass_actor("fake/a"), _pass_actor("fake/b")]}
-        ),
-    )
+    _clean_wave(monkeypatch)  # a real clean verdict per seat, which the guard then refuses
 
     outcome = review_skill(ctx, "alpha")
 
@@ -193,12 +175,7 @@ def test_mismatched_lifecycle_job_id_cannot_late_write_pass(tmp_path, monkeypatc
         },
         trailing_newline=True,
     )
-    monkeypatch.setattr(
-        "ouroboros.tools.review._handle_multi_model_review",
-        lambda *_a, **_kw: json.dumps(
-            {"results": [_pass_actor("fake/a"), _pass_actor("fake/b")]}
-        ),
-    )
+    _clean_wave(monkeypatch)  # a real clean verdict per seat, which the guard then refuses
 
     outcome = review_skill(ctx, "alpha")
 
@@ -325,17 +302,31 @@ def test_direct_review_ignores_historical_completed_job_hash(tmp_path, monkeypat
         },
         trailing_newline=True,
     )
-    monkeypatch.setattr(
-        "ouroboros.tools.review._handle_multi_model_review",
-        lambda *_a, **_kw: json.dumps(
-            {"results": [_pass_actor("fake/a"), _pass_actor("fake/b")]}
-        ),
-    )
+    # The one wave over the golden pool with an offline seam: every seat answers the skill question clean.
+    import ouroboros.review_substrate as substrate
+    from tests import _contributor_packet_shared as shared
+    from tests.review_pool_rosters import set_review_pool
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
+    set_review_pool(monkeypatch, shared.golden_pool())
+    sends: list = []
+    monkeypatch.setattr(substrate.ReviewCoordinator, "_run_slot", shared.golden_physical_seam(sends))
 
     outcome = review_skill(ctx, "alpha")
 
-    assert outcome.status == "clean"
+    assert outcome.status == "clean", outcome.error
+    assert sorted(send["slot_id"] for send in sends) == ["s1", "t1", "t2"]
     assert load_review_state(drive_root, "alpha").content_hash == content_hash
+
+
+async def _wait_for_reconcile(task, started):
+    # Preparation includes filesystem work and imports, not a two-second contract.
+    # Still surface early lifecycle completion instead of waiting for a phase it skipped.
+    while not started.is_set():
+        if task.done():
+            result = await task
+            raise AssertionError(f"lifecycle finished before extension reconcile: {result!r}")
+        await asyncio.sleep(0.01)
 
 
 def test_cancellation_during_extension_reconcile_keeps_lifecycle_lane(tmp_path, monkeypatch):
@@ -373,8 +364,8 @@ def test_cancellation_during_extension_reconcile_keeps_lifecycle_lane(tmp_path, 
 
     def fake_reconcile(*_args, **_kwargs):
         reconcile_started.set()
-        release_reconcile.wait(2)
-        return "extension_loaded", "ok"
+        release_reconcile.wait()
+        return reconcile_receipt("extension_loaded", "ok")
 
     monkeypatch.setattr(runner, "_reconcile_extension_payload", fake_reconcile)
 
@@ -382,32 +373,56 @@ def test_cancellation_during_extension_reconcile_keeps_lifecycle_lane(tmp_path, 
         task = asyncio.create_task(
             run_skill_review_lifecycle(ctx, "alpha", source="test", review_impl=fake_review)
         )
-        assert await asyncio.to_thread(reconcile_started.wait, 2)
-        task.cancel()
-        await asyncio.sleep(0.05)
-        task.cancel()
-        await asyncio.sleep(0.05)
-        active = lifecycle_queue.queue_snapshot()["active"]
-        assert active is not None
-        assert active["target"] == "alpha"
-        quick = asyncio.create_task(
-            lifecycle_queue.run_lifecycle_job(
-                kind="review",
-                target="beta",
-                dedupe_key="review:beta:hash",
-                runner=lambda: asyncio.sleep(0, result={"quick": True}),
-                options=lifecycle_queue.LifecycleJobOptions(drive_root=drive_root),
+        try:
+            await _wait_for_reconcile(task, reconcile_started)
+            task.cancel()
+            await asyncio.sleep(0.05)
+            task.cancel()
+            await asyncio.sleep(0.05)
+            active = lifecycle_queue.queue_snapshot()["active"]
+            assert active is not None
+            assert active["target"] == "alpha"
+            quick = asyncio.create_task(
+                lifecycle_queue.run_lifecycle_job(
+                    kind="review",
+                    target="beta",
+                    dedupe_key="review:beta:hash",
+                    runner=lambda: asyncio.sleep(0, result={"quick": True}),
+                    options=lifecycle_queue.LifecycleJobOptions(drive_root=drive_root),
+                )
             )
-        )
-        await asyncio.sleep(0.05)
-        assert not quick.done()
-        release_reconcile.set()
-        result = await asyncio.wait_for(task, timeout=2)
-        assert result["status"] == "clean"
-        assert await asyncio.wait_for(quick, timeout=2) == {"quick": True}
-        assert lifecycle_queue.queue_snapshot()["active"] is None
+            await asyncio.sleep(0.05)
+            assert not quick.done()
+            release_reconcile.set()
+            result = await asyncio.wait_for(task, timeout=2)
+            assert result["status"] == "clean"
+            assert await asyncio.wait_for(quick, timeout=2) == {"quick": True}
+            assert lifecycle_queue.queue_snapshot()["active"] is None
+        finally:
+            release_reconcile.set()
 
     asyncio.run(main())
+
+
+def _read_heartbeat(job_path) -> str:
+    """Read the heartbeat stamp through the same Windows race the writer tolerates.
+
+    The beat replaces ``review_job.json`` atomically and retries its own sharing
+    violations (``utils.replace_atomic``); the mirror image is this poll opening
+    the file while that replace is in flight, which windows-latest refuses with
+    ``PermissionError`` (winerror 5/32). POSIX never raises here, so this is one
+    read there and a bounded retry on Windows, never a silent skip.
+    """
+    delay = 0.01
+    for attempt in range(20):
+        try:
+            return json.loads(job_path.read_text(encoding="utf-8"))["last_heartbeat_at"]
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.1)
+    raise AssertionError("unreachable")
 
 
 def test_heartbeat_continues_during_extension_reconcile(tmp_path, monkeypatch):
@@ -449,8 +464,8 @@ def test_heartbeat_continues_during_extension_reconcile(tmp_path, monkeypatch):
 
     def fake_reconcile(*_args, **_kwargs):
         reconcile_started.set()
-        release_reconcile.wait(2)
-        return "extension_loaded", "ok"
+        release_reconcile.wait()
+        return reconcile_receipt("extension_loaded", "ok")
 
     monkeypatch.setattr(runner, "_reconcile_extension_payload", fake_reconcile)
 
@@ -458,19 +473,25 @@ def test_heartbeat_continues_during_extension_reconcile(tmp_path, monkeypatch):
         task = asyncio.create_task(
             run_skill_review_lifecycle(ctx, "alpha", source="test", review_impl=fake_review)
         )
-        assert await asyncio.to_thread(reconcile_started.wait, 2)
-        job_path = review_job_state_path(drive_root, "alpha")
-        before = json.loads(job_path.read_text(encoding="utf-8"))["last_heartbeat_at"]
-        for _ in range(20):
-            await asyncio.sleep(0.01)
-            after = json.loads(job_path.read_text(encoding="utf-8"))["last_heartbeat_at"]
-            if after != before:
-                break
-        assert after != before
-        release_reconcile.set()
-        result = await asyncio.wait_for(task, timeout=2)
-        assert result["status"] == "clean"
-        final = json.loads(job_path.read_text(encoding="utf-8"))
-        assert final["status"] == "completed"
+        try:
+            await _wait_for_reconcile(task, reconcile_started)
+            job_path = review_job_state_path(drive_root, "alpha")
+            before = _read_heartbeat(job_path)
+            # A bounded wait, not 20 x 10 ms: on windows-latest the heartbeat's atomic replace can
+            # lose a few rounds to this very poll holding the file open (sharing violation, logged
+            # and retried by the beat), and the clock ticks at ~15.6 ms — 200 ms saw no change.
+            for _ in range(60):
+                await asyncio.sleep(0.05)
+                after = _read_heartbeat(job_path)
+                if after != before:
+                    break
+            assert after != before, "no heartbeat within 3 s while the reconcile blocks"
+            release_reconcile.set()
+            result = await asyncio.wait_for(task, timeout=2)
+            assert result["status"] == "clean"
+            final = json.loads(job_path.read_text(encoding="utf-8"))
+            assert final["status"] == "completed"
+        finally:
+            release_reconcile.set()
 
     asyncio.run(main())

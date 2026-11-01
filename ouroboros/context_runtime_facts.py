@@ -1,0 +1,395 @@
+"""The runtime section's FACT builders: what the host can honestly say it knows.
+
+Extracted whole from ``context.py`` at its module ceiling (v7 leaf) so the
+facts the runtime section renders keep one home: the project room a task sits in,
+the budget rails it runs under, how the run learns the time (its capture instant
+labels the Recent/Drive snapshots), and the
+configured delegation route with its honestly-labeled historical observations.
+Each returns a plain projection and reads no context state, so nothing here can
+change what the section MEANS — only what it reports. ``context`` re-exports the
+start-of-task builders, so historical imports and monkeypatch targets keep working
+unchanged; ``round_clock_fact`` is the per-round time segment of the facts line
+(``loop_messages``), read from the same clock owners.
+"""
+
+from __future__ import annotations
+
+import logging
+import pathlib
+from typing import Any, Dict, Optional
+
+from ouroboros.task_pacing import in_task_cost_ceiling_disclosure as _in_task_cost_ceiling
+from ouroboros.config import runtime_setting
+
+log = logging.getLogger(__name__)
+
+
+def schedule_store_fact(env: Any) -> Dict[str, Any]:
+    """Observed schedule controls for context; an unreadable table is not empty."""
+    from supervisor.followup_policy import observed_store
+    from supervisor.queue import ScheduleStoreUnreadable, load_schedule_store
+
+    root = getattr(env, "drive_root", None) or pathlib.Path(env.drive_path("state/scheduled_tasks.json")).parent.parent
+    try:
+        return observed_store(root, load_schedule_store(root))
+    except ScheduleStoreUnreadable as exc:
+        return {"unavailable": str(exc), "pointer": "manage_schedules(action='list')"}
+
+
+def task_schedule_fact(task: Dict[str, Any]) -> Dict[str, Any]:
+    """The admitted occurrence's original clock, even after its row advances.
+
+    Lateness is for the mind to judge. A missing legacy date stays unknown;
+    the schedule's next firing point cannot supply this occurrence's due time.
+    """
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    occurrence = metadata.get("schedule_occurrence")
+    if not isinstance(occurrence, dict):
+        return {}
+    fact = {
+        key: occurrence.get(key) for key in ("schedule_id", "due_at", "claimed_at")
+    }
+    if "previous" in occurrence:
+        fact["previous"] = occurrence["previous"]
+    return {"schedule_occurrence": fact}
+
+
+def task_execution_clock_fact(task: Dict[str, Any], ctx: Any) -> Dict[str, Any]:
+    """Current finite execution-ceiling estimate, not a calendar deadline.
+
+    Quota/budget pauses can move the estimate after this context is assembled;
+    an unknown start or unlimited ceiling yields null instead of a false date.
+    """
+    import datetime
+    import math
+    import time
+    from ouroboros.config import explicit_execution_timeout_sec, resolve_task_execution_timeout_sec
+    from ouroboros.deadline_utils import parse_deadline_ts
+    from ouroboros.model_wait import current_model_wait, execution_elapsed_seconds
+
+    raw = getattr(ctx, "task_started_at", None) or task.get("started_at")
+    try:
+        start = float(raw)
+    except (TypeError, ValueError):
+        parsed = parse_deadline_ts(raw)
+        start = parsed.timestamp() if parsed is not None else 0.0
+    ceiling = resolve_task_execution_timeout_sec(task)  # the narrower of explicit budget and global ceiling
+    started = datetime.datetime.fromtimestamp(start, datetime.timezone.utc).isoformat() if start > 0 and math.isfinite(start) else None
+    projected = None
+    if started and ceiling is not None:
+        now = time.time()
+        owner = current_model_wait()
+        elapsed = (owner.executed_seconds() if owner is not None and owner.task_id == str(task.get("id") or "")
+                   else execution_elapsed_seconds({**task, "started_at": start}, now))
+        try:
+            projected = datetime.datetime.fromtimestamp(now + max(0.0, ceiling - elapsed),
+                                                        datetime.timezone.utc).isoformat()
+        except (OverflowError, ValueError, OSError):
+            pass  # a finite duration need not fit the platform's calendar range: stays not_set
+    # The same absolute_ceiling rail either way; the basis names which bound it is (#939).
+    bound = "task execution budget" if ceiling is not None and ceiling == explicit_execution_timeout_sec(task) else "global ceiling"
+    return {"started_at": started, "absolute_ceiling_at": projected,
+            "absolute_ceiling_at_basis": (f"current estimate of the {bound}; quota or budget pauses may move it"
+                                          if projected else "not_set")}
+
+
+def _start_epoch(raw: Any) -> Optional[float]:
+    import math
+    from ouroboros.deadline_utils import parse_deadline_ts
+
+    try:
+        start = float(raw)
+    except (TypeError, ValueError):
+        parsed = parse_deadline_ts(raw)
+        start = parsed.timestamp() if parsed is not None else 0.0
+    return start if start > 0 and math.isfinite(start) else None
+
+
+def round_clock_fact(ctx: Any, now: Optional[float] = None) -> str:
+    """The facts line's time segment, read from the Time clock owners (#1786) per round.
+
+    Calendar time since this task's clock origin and execution time (the carried
+    offset, quota waits, budget pauses and warm sleep excluded) are named apart; the
+    execution limit names its basis; the calendar deadline stays its own axis; the
+    host's local finalization instant exists only for an explicit deadline or
+    execution budget (``loop_round_limits._maybe_deadline_local_finalize``). A
+    missing start is unknown, never zero; every value is as of the one sample
+    instant, with the live wait owner's clock when it owns this task and otherwise
+    the same carriers ``model_wait.execution_window_remaining_for_context`` reads.
+    """
+    import datetime
+    import time
+    from ouroboros.config import explicit_execution_timeout_sec, resolve_task_execution_timeout_sec
+    from ouroboros.deadline_utils import parse_deadline_ts
+    from ouroboros.model_wait import budget_paused_seconds, current_model_wait, execution_elapsed_seconds
+    from ouroboros.task_pacing import effective_finalization_reserve_sec
+
+    def stamp(epoch: float) -> str:
+        return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    now = time.time() if now is None else float(now)
+    meta = getattr(ctx, "task_metadata", None)
+    meta = meta if isinstance(meta, dict) else {}
+    limit = resolve_task_execution_timeout_sec(meta)
+    parts, executed, left = [f"time sampled {stamp(now)}"], None, None
+    owner = getattr(ctx, "model_wait_context", None) or current_model_wait()
+    start = _start_epoch(getattr(ctx, "task_started_at", None) or meta.get("started_at"))
+    if owner is not None and owner.task_id == str(getattr(ctx, "task_id", "") or ""):
+        executed, left = owner.executed_seconds(), owner.execution_window_remaining()
+    elif start is not None:
+        paused = getattr(ctx, "_budget_paused_sec", None)
+        if paused is None:
+            paused = budget_paused_seconds(getattr(ctx, "budget_pause_resume", None) or {})
+        executed = execution_elapsed_seconds({**meta, "started_at": start, "budget_paused_sec": paused}, now)
+        left = None if limit is None else max(0.0, limit - executed)
+    if start is None:
+        parts.append("wall elapsed unknown (no recorded start)")
+    else:
+        parts.append(f"wall {max(0.0, now - start) / 60:.1f} min since start {stamp(start)}")
+    parts.append("execution elapsed unknown" if executed is None
+                 else f"execution {executed / 60:.1f} min (quota waits and pauses excluded)")
+    if limit is None:
+        parts.append("no execution limit")
+    elif left is None:
+        parts.append(f"execution limit {limit / 60:.1f} min, remaining unknown")
+    else:
+        basis = "task execution budget" if limit == explicit_execution_timeout_sec(meta) else "global execution ceiling"
+        parts.append(f"{basis} {limit / 60:.1f} min, {left / 60:.1f} min left")
+    deadline = parse_deadline_ts(meta.get("deadline_at"))
+    bounds = [left] if left is not None and explicit_execution_timeout_sec(meta) is not None else []
+    if deadline is not None:
+        bounds.append(deadline.timestamp() - now)
+        parts.append(f"deadline {stamp(deadline.timestamp())}, {(deadline.timestamp() - now) / 60:.1f} min left")
+    if bounds:
+        grace = effective_finalization_reserve_sec(ctx)
+        parts.append(f"host requests one tool-less final answer at ~{stamp(now + max(0.0, min(bounds) - grace))} "
+                     f"({grace / 60:.1f} min before the nearer explicit bound)")
+    return "; ".join(parts)
+
+
+def _context_clock_note(task: Dict[str, Any]) -> str:
+    """How this run learns the time: Main gets a clock line per request (``send_clock``)."""
+    from ouroboros.send_clock import main_clock_policy
+
+    meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    if task.get("delegation_role") and "delegation_role" not in meta:
+        meta = {**meta, "delegation_role": task.get("delegation_role")}
+    if main_clock_policy(meta, task_type=str(task.get("type") or "")) is None:
+        return ("context_captured_at is when this context was built; it does not advance "
+                "during this run.")
+    return ("context_captured_at is when this context was built, not the current time. "
+            "Each of your model requests ends with a host clock line sampled for that request.")
+
+
+def snapshot_labelled(section: str, captured_at: str) -> str:
+    """Label a captured Recent/Drive section with its capture time, below its heading.
+
+    These sections are rendered once per run and stay byte-stable in the cached
+    prefix; the label says so instead of refreshing them every round.
+    """
+    heading, sep, body = str(section or "").partition("\n")
+    if not heading.startswith(("## Recent ", "## Drive state")) or not captured_at:
+        return section
+    label = (f"_Snapshot captured at {captured_at} when this context was built; "
+             "not refreshed during this run._")
+    return heading + "\n" + label + ((sep + body) if body else "")
+
+
+def _queue_context_fact(task: Dict[str, Any]) -> Dict[str, Any]:
+    """One dated canonical-queue view, frozen with the task's ContextCore."""
+    from ouroboros.config import DATA_DIR, get_max_active_subagents_per_root, get_max_workers
+    from ouroboros.task_status import _load_queue_snapshot, queue_snapshot_observation
+
+    root = pathlib.Path(task.get("budget_drive_root") or DATA_DIR)
+    snapshot = _load_queue_snapshot(root)
+    fact = {**queue_snapshot_observation(snapshot), "source_root": str(root),
+            "max_workers": int(get_max_workers()),
+            "max_active_subagents_per_root": int(get_max_active_subagents_per_root())}
+    if snapshot.get("_snapshot_missing") or snapshot.get("_snapshot_invalid"):
+        return {**fact, "note": "Queue observation unavailable; current capacity is unknown."}
+    for key in ("running", "pending"):
+        rows = snapshot.get(key)
+        fact[key + "_count"] = sum(isinstance(row, dict) for row in rows) if isinstance(rows, list) else None
+    fact["reaping_count"] = snapshot.get("reaping_count")
+    fact["worker_total"] = snapshot.get("worker_total")
+    assignable = snapshot.get("assignable_idle_workers")
+    if assignable is not None:
+        fact["free_worker_slots"] = max(0, int(assignable))
+        fact["free_worker_slots_basis"] = "recorded_assignable_idle_workers"
+    elif fact["running_count"] is not None:
+        fact["free_worker_slots"] = max(0, fact["max_workers"] - fact["running_count"]
+                                          - int(fact["reaping_count"] or 0))
+        fact["free_worker_slots_basis"] = "legacy_estimate_from_configured_limit"
+    else:
+        fact["free_worker_slots"] = None
+        fact["free_worker_slots_basis"] = "unknown"
+    fact["note"] = (
+        "Last recorded queue counts at ts; freshness and age were measured when this context "
+        "was built and do not refresh during the task. Stale or unknown observations do not "
+        "establish current load. Legacy free-slot estimates are not measured capacity. "
+        "Scheduling owns admission; these observations reserve no slots."
+    )
+    return fact
+
+
+def _project_room_fact(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The room's active folder and ordinary tool target, or None.
+
+    Conversation keeps its own lifecycle; selecting a room changes the physical
+    target without requiring a managed workspace or Git repository. Promotion
+    continues to use its separate workspace admission contract.
+    """
+    try:
+        _room_pid = str(task.get("project_id") or "").strip()
+        if _room_pid and not str(task.get("workspace_root") or "").strip():
+            from ouroboros.config import DATA_DIR as _DATA_DIR
+            from ouroboros.projects_registry import get_project as _get_project
+            from ouroboros.workspace_admission import room_chat_lens_dir as _room_lens, room_lens_applies
+
+            _room = _get_project(_DATA_DIR, _room_pid) or {}
+            _room_wd = str(_room.get("working_dir") or "").strip()
+            if _room_wd:
+                # Same resolver the agent uses for the tool lens, so the stated rule
+                # and the actual tool surface cannot diverge (the robot incident).
+                _lens_dir, _room_note = _room_lens(_DATA_DIR, _room_pid)
+                _lens_active = room_lens_applies(task) and bool(_lens_dir)
+                fact = {
+                    "project_id": _room_pid,
+                    "working_dir": _room_wd,
+                    "rule": (
+                        (
+                            "This room's active_workspace is working_dir for file reads, "
+                            "writes and edits, the default shell cwd, VCS and selected "
+                            "delegation. The tools retain their own requirements and "
+                            "explicit task constraints. Ouroboros governance remains at "
+                            "system_repo; select that root explicitly to work on the body. "
+                            "Direct work and promotion are both available."
+                        )
+                        if _lens_active
+                        else (
+                            "This project has a working folder. Tasks promoted from this room "
+                            "run with it as their active workspace by default; pass "
+                            "workspace='none' to promote a folder-less task."
+                        )
+                    ),
+                }
+                if _room_note:
+                    fact["working_dir_warning"] = _room_note
+                return fact
+    except Exception:
+        log.debug("Failed to inject project_room working_dir fact", exc_info=True)
+    return None
+
+
+def _runtime_budget_info(env: Any, task: Dict[str, Any], ctx: Any = None) -> Dict[str, Any]:
+    """Start-of-task budget block: global projection + the STATIC per-task tree cap,
+    written once at task start so the cached prefix stays byte-stable (DEVELOPMENT
+    cache_friendliness item 24); live wallet and tree spend ride the per-round facts
+    line (``loop_messages.context_facts_line``)."""
+    try:
+        from ouroboros.usage_accounting import usage_projection
+        from ouroboros.settings_setup_contract import resolve_total_budget_usd
+
+        total_usd = resolve_total_budget_usd()
+        budget_root = pathlib.Path(task.get("budget_drive_root") or env.drive_root)
+        projection = usage_projection(budget_root, global_limit_usd=total_usd)
+        # Known spend (confirmed + estimated) is what the limit decides on; open
+        # holds ride beside it, never added in (#1487).
+        spent_usd = float(projection.get("settled_usd") or 0.0)
+        budget_info = {
+            "status": "available" if total_usd is not None else "no_global_limit", "total_usd": total_usd,
+            "spent_usd": spent_usd, "spent_basis": "known_settled_incl_estimates",
+            "remaining_usd": None if total_usd is None else max(0.0, total_usd - spent_usd),
+            "reserved_usd": float(projection.get("reserved_usd") or 0.0),
+            "unresolved_upper_bound_usd": float(projection.get("unresolved_upper_bound_usd") or 0.0),
+            "unknown_unmetered": int(projection.get("unknown_unmetered") or 0),
+        }
+    except Exception:
+        log.error("Budget authority unavailable for runtime context", exc_info=True)
+        budget_info = {"status": "unavailable"}
+    try:
+        root_cap = float(runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
+    except (TypeError, ValueError):
+        root_cap = 0.0
+    if root_cap > 0:
+        budget_info["per_task_tree_cap_usd"] = root_cap
+        budget_info["per_task_tree_cap_rule"] = (
+            "Hard cap for THIS task's WHOLE tree (own model calls + all subagents), enforced "
+            "by the physical-attempt ledger: new dispatches are refused once the tree's KNOWN "
+            "spend (confirmed and estimated) reaches it. A task with an exact continuation then "
+            "pauses with its work saved; an actor without one (no continuation owner, task id or "
+            "durable root) ends with a typed budget_exhausted result and no paid recap. "
+            "Open reservations and unresolved charges are not counted as spending, and calls "
+            "in flight or charged late can take the tree past the cap. The facts line of each "
+            "round reports the live tree number."
+        )
+    if ctx is not None:
+        budget_info["in_task_cost_ceiling"] = _in_task_cost_ceiling(ctx, budget_info.get("remaining_usd"))
+    return budget_info
+
+
+def storage_fact(data_root: Any) -> Optional[Dict[str, Any]]:
+    """The last finished storage count as one compact fact for the mind: when it was counted,
+    what Ouroboros owns and how many items it could not read, the growth since the count before
+    (flagged when either count had unreadable items), free and total space of the data folder's
+    disk. None when nothing was counted yet or the file is unreadable (never zero, never an
+    exception). No threshold, tier or warning stands in for judgment here: the mind reads the
+    numbers (``query_data(kind="storage")`` holds the per-place detail). The saved file is read
+    through the storage owner's identity cache; free space is read fresh."""
+    import shutil
+
+    from ouroboros import storage
+
+    try:
+        saved = storage.count.saved(data_root)
+        if not saved:
+            return None
+        count = storage.with_growth(saved["latest"], saved["previous"])
+    except Exception:  # an unreadable or malformed file is no fact, never a broken Runtime section
+        log.debug("storage count unreadable for the runtime fact", exc_info=True)
+        return None
+    try:
+        usage = shutil.disk_usage(str(data_root))
+        free, total = usage.free, usage.total
+    except OSError:
+        free = total = None
+    fact = {
+        "counted_at": count["finished_at"],
+        "bytes": count["bytes"],
+        "unreadable": count["unreadable"],  # items the count could not read: the headline excludes them
+        "basis": count.get("basis"),
+        "previous_at": count.get("growth_since"),
+        "growth_bytes": count.get("growth_bytes"),
+        "free_bytes": free,
+        "volume_total_bytes": total,
+    }
+    if count.get("growth_flag"):
+        fact["growth_flag"] = count["growth_flag"]  # either count had unreadable items: the growth is qualified
+    return fact
+
+
+def _delegation_capability_fact() -> Optional[Dict[str, Any]]:
+    """Historical identities and readers; execution bodies are chosen reads."""
+    try:
+        from ouroboros.reviewer_slot_config import reviewer_slot_last_executions, LAST_EXECUTION_FILENAME
+        from ouroboros.subagent_history import recorded_handle, LAST_DELEGATION_FILENAME
+        from ouroboros.subagents import subagent_last_delegation
+
+        slots = reviewer_slot_last_executions()
+        last = subagent_last_delegation() or {}
+        if not slots and not last:
+            return None
+        records = last.get("latest_by_subagent")
+        records = list(records.values()) if isinstance(records, dict) and records else ([last] if last else [])
+        return {"note": "Historical observations, not live health; read the records for details.",
+                "reviewer_slots_last": [{"slot": str(slot), "outcome": row.get("status", "unknown"),
+                    "observed": row.get("ts")} for slot, row in sorted(slots.items()) if isinstance(row, dict)],
+                "subagents_last_executions": [{"selected_subagent_id": recorded_handle(row),
+                    "outcome": row.get("outcome", "unknown"), "observed": row.get("observed_at") or row.get("ts"),
+                    **{key: row[key] for key in ("task_id", "run_id", "attempt_id") if row.get(key)}}
+                    for row in records if isinstance(row, dict)],
+                "readers": [{"tool": "read_file", "arguments": {"root": "runtime_data", "path": "state/" + name}}
+                            for name in (LAST_EXECUTION_FILENAME, LAST_DELEGATION_FILENAME)]}
+    except Exception:
+        log.debug("Failed to build delegation capability fact", exc_info=True)
+        return None

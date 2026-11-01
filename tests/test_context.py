@@ -1,28 +1,31 @@
-"""Tests for ouroboros.context health invariants."""
+"""The health invariants ouroboros.context builds, and where they must appear.
+
+This module owns the sent-history changes fact (no provider cache verdict), the remote context overflow,
+the rest of the invariant coverage, and the rule that
+the invariants come first in both the dynamic and the background-consciousness context.
+
+The runtime section, the advisory review status, the memory/consolidation sections and
+the drive-state projection were split verbatim into
+``tests/test_context_runtime_section.py``, ``tests/test_context_advisory_review.py``,
+``tests/test_context_memory.py`` and ``tests/test_context_drive_state.py``; the health
+environment builder they share lives in ``tests/_context_shared.py``.
+"""
 
 from __future__ import annotations
 
 import json
-import pathlib
-import tempfile
 
-from ouroboros.context import build_health_invariants, build_runtime_section, build_user_content
+import pytest
 
+from ouroboros import dialogue_store
+from ouroboros.context import build_health_invariants, build_runtime_section
 
-def test_force_plan_metadata_adds_structured_notice_without_rewriting_user_text():
-    content = build_user_content(
-        {
-            "text": "Fix the marketplace retry flow.",
-            "metadata": {"force_plan": True, "force_plan_source": "consilium"},
-        }
-    )
-
-    assert content.startswith("[CONSILIUM_FORCE_PLAN]")
-    assert "Source: consilium." in content
-    assert content.rstrip().endswith("Fix the marketplace retry flow.")
+from tests import _dialogue as dialogue_test
+from tests._context_shared import _make_health_env
 
 
-class TestCacheHitRateInvariant:
+
+class TestSentHistoryHealth:
     def _make_env(self, tmp_path, events_lines):
         class FakeEnv:
             def drive_path(self, p):
@@ -53,158 +56,117 @@ class TestCacheHitRateInvariant:
         (tmp_path / "logs" / "events.jsonl").write_text("\n".join(events_lines) + "\n", encoding="utf-8")
         return FakeEnv()
 
-    def test_cache_hit_rate_good(self, tmp_path):
-        lines = [json.dumps({"type": "llm_round", "prompt_tokens": 1000, "cached_tokens": 600}) for _ in range(15)]
-        env = self._make_env(tmp_path, lines)
+    def test_health_names_who_changed_sent_history_under_the_running_code(self, tmp_path):
+        from ouroboros import transcript_prefix
+
+        env = self._make_env(tmp_path, [])
+        assert "SENT HISTORY CHANGES" not in build_health_invariants(env)
+        for task_id, origin in (("t1", "superseded_skill_snapshot"), ("t2", "superseded_skill_snapshot"),
+                                ("t2", "compaction")):
+            transcript_prefix.count_history_change(
+                {}, {"round": 3, "kind": "rewritten", "sanctioned_by": origin}, drive_root=tmp_path, task_id=task_id)
+        line = next(row for row in build_health_invariants(env).splitlines() if "SENT HISTORY CHANGES" in row)
+        assert line.startswith("- INFO: SENT HISTORY CHANGES under the running code ("), line
+        assert ", first at " in line and "the round facts name each change" in line
+        first = line.split(", first at ", 1)[1].split(")", 1)[0]
+        assert len(first) == 17 and first.endswith("Z"), first  # minutes, labelled UTC
+        assert "superseded_skill_snapshot 2 in 2 tasks; compaction 1 in 1 task" in line
+
+    def test_another_codes_record_is_not_this_codes_history(self, tmp_path):
+        from ouroboros import transcript_prefix
+        from ouroboros.utils import atomic_write_json
+
+        env = self._make_env(tmp_path, [])
+        path = transcript_prefix.history_changes_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(path, {"code": "an-older-commit", "first": "2026-10-20T17:00:00Z", "origins": {
+            "superseded_skill_snapshot": {"count": 193, "tasks": ["t1"]}}})
+        assert "SENT HISTORY CHANGES" not in build_health_invariants(env)
+        transcript_prefix.count_history_change(
+            {}, {"round": 2, "kind": "shrunk", "sanctioned_by": "compaction"}, drive_root=tmp_path, task_id="t9")
         result = build_health_invariants(env)
-        assert "cache hit rate" in result.lower()
-        assert "60%" in result or "60.0%" in result
+        assert "compaction 1 in 1 task" in result and "superseded_skill_snapshot" not in result
 
-    def test_cache_hit_rate_warning_below_30(self, tmp_path):
-        lines = [json.dumps({"type": "llm_round", "prompt_tokens": 1000, "cached_tokens": 200}) for _ in range(15)]
-        env = self._make_env(tmp_path, lines)
-        result = build_health_invariants(env)
-        assert "LOW CACHE HIT RATE" in result
+    def test_a_tree_without_git_names_its_version(self, tmp_path, monkeypatch):
+        from ouroboros import transcript_prefix, utils
+
+        monkeypatch.setattr(utils, "get_git_info", lambda _root: ("", ""))
+        transcript_prefix._running_code.cache_clear()
+        try:
+            env = self._make_env(tmp_path, [])
+            transcript_prefix.count_history_change(
+                {}, {"round": 1, "kind": "rewritten", "sanctioned_by": "compaction"}, drive_root=tmp_path, task_id="t1")
+            assert "under the running code (version " in build_health_invariants(env)
+        finally:
+            transcript_prefix._running_code.cache_clear()
+
+    def test_the_task_list_is_capped_and_says_so(self, tmp_path):
+        from ouroboros import transcript_prefix
+
+        env = self._make_env(tmp_path, [])
+        for index in range(40):
+            transcript_prefix.count_history_change(
+                {}, {"round": 1, "kind": "rewritten", "sanctioned_by": None}, drive_root=tmp_path, task_id=f"t{index}")
+        assert "origin not recorded 40 in 32+ tasks" in build_health_invariants(env)
+
+    @pytest.mark.parametrize("reports", [
+        [None] * 6, [0] * 6, [600] * 6, [None] * 10 + [600] * 5,
+    ], ids=["unknown", "measured_zero", "measured_hit", "mixed"])
+    def test_nullable_adapter_cache_reaches_durable_and_live_rounds(self, tmp_path, reports):
+        """The real adapter uses a present null key for an unreported cache.
+
+        Omitted-key fixtures alone missed the producer turning that null into
+        zero. Both round events preserve the measurement; health draws no share
+        or verdict from them.
+        """
+        from queue import Queue
+        from ouroboros.llm_claudexor import _usage
+        from ouroboros.loop_llm_call import call_llm_with_retry
+
+        env = self._make_env(tmp_path, [])
+        events = Queue()
+        accumulated = {}
+
+        class LLM:
+            def chat(self, **_kwargs):
+                counters = {"input_tokens": 1000, "output_tokens": 10}
+                if reported is not None:
+                    counters["cached_input_tokens"] = reported
+                usage, cost, final = _usage({"usage": counters})
+                usage.update(provider="claudexor", resolved_model="claudexor/probe",
+                             cost=cost, cost_final=final)
+                return {"content": "Completed synthetic round."}, usage
+
+        for index, reported in enumerate(reports, 1):
+            message, _cost = call_llm_with_retry(
+                LLM(), [{"role": "user", "content": "Check the report."}],
+                "claudexor/probe", None, "medium", 1, tmp_path / "logs",
+                "nullable-cache", index, events, accumulated,
+            )
+            assert message["content"] == "Completed synthetic round."
+        rows = [json.loads(line) for line in (tmp_path / "logs/events.jsonl").read_text().splitlines()
+                if line.strip()]
+        durable = [row["cached_tokens"] for row in rows if row.get("type") == "llm_round"]
+        live = []
+        while not events.empty():
+            event = events.get_nowait()
+            if event.get("type") == "log_event" and event["data"].get("type") == "llm_round_finished":
+                live.append(event["data"]["cached_tokens"])
+        assert durable == reports
+        assert live == reports
+        assert "cache hit rate" not in build_health_invariants(env).lower()
 
 
-def _make_health_env(tmp_path, events_lines=None):
-    class FakeEnv:
-        def drive_path(self, p):
-            return tmp_path / p
-
-        def repo_path(self, p):
-            return tmp_path / "repo" / p
-
-        @property
-        def repo_dir(self):
-            return tmp_path / "repo"
-
-        @property
-        def drive_root(self):
-            return tmp_path
-
-    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "memory").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "repo" / "docs").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "repo" / "prompts").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "archive" / "rescue").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "repo" / "VERSION").write_text("1.2.3", encoding="utf-8")
-    (tmp_path / "repo" / "pyproject.toml").write_text('version = "1.2.3"', encoding="utf-8")
-    (tmp_path / "repo" / "web").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "repo" / "web" / "package.json").write_text('{"version": "1.2.3"}', encoding="utf-8")
-    (tmp_path / "repo" / "README.md").write_text('version-1.2.3', encoding="utf-8")
-    (tmp_path / "repo" / "docs" / "ARCHITECTURE.md").write_text('# Ouroboros v1.2.3', encoding="utf-8")
-    (tmp_path / "repo" / "docs" / "DEVELOPMENT.md").write_text('# Dev', encoding="utf-8")
-    (tmp_path / "repo" / "prompts" / "CONSCIOUSNESS.md").write_text('Prompt text', encoding="utf-8")
-    (tmp_path / "state" / "state.json").write_text('{"spent_usd": 0, "budget_drift_alert": false}', encoding="utf-8")
-    (tmp_path / "memory" / "identity.md").write_text('x' * 300, encoding="utf-8")
-    (tmp_path / "memory" / "scratchpad.md").write_text('x' * 300, encoding="utf-8")
-    event_lines = events_lines or []
-    (tmp_path / "logs" / "events.jsonl").write_text("\n".join(event_lines) + ("\n" if event_lines else ""), encoding="utf-8")
-    return FakeEnv()
-
-
-def test_runtime_section_includes_light_runtime_mode_rule(tmp_path, monkeypatch):
-    env = _make_health_env(tmp_path)
-    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "light")
-    section = build_runtime_section(env, {"id": "task-1", "type": "task"})
-    payload = json.loads(section.split("\n\n", 1)[1])
-
-    assert payload["runtime_mode"] == "light"
-    assert "forbids Ouroboros repo mutation" in payload["runtime_mode_rule"]
-    assert "user_files" in payload["runtime_mode_rule"]
-    assert "artifact_store" in payload["runtime_mode_rule"]
-    assert "explicit scoped skill-payload work/repair" in payload["runtime_mode_rule"]
-    assert "runtime_data/uploads" in payload["runtime_mode_rule"]
-
-
-def test_runtime_section_omits_light_rule_for_advanced(tmp_path, monkeypatch):
-    env = _make_health_env(tmp_path)
-    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "advanced")
-    section = build_runtime_section(env, {"id": "task-1", "type": "task"})
-    payload = json.loads(section.split("\n\n", 1)[1])
-
-    assert payload["runtime_mode"] == "advanced"
-    assert "runtime_mode_rule" not in payload
-
-
-def test_runtime_section_includes_non_workspace_memory_boundary(tmp_path, monkeypatch):
-    env = _make_health_env(tmp_path)
-    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "advanced")
-    section = build_runtime_section(
-        env,
-        {
-            "id": "task-1",
-            "type": "task",
-            "memory_mode": "forked",
-            "drive_root": str(tmp_path / "child"),
-            "child_drive_root": str(tmp_path / "child"),
-            "budget_drive_root": str(tmp_path / "data"),
-        },
+def test_health_invariants_reports_remote_context_overflow(tmp_path):
+    env = _make_health_env(
+        tmp_path,
+        [json.dumps({"type": "remote_context_overflow", "model": "provider/model"})],
     )
-    payload = json.loads(section.split("\n\n", 1)[1])
-    assert payload["task"]["memory_mode"] == "forked"
-    assert payload["task"]["child_drive_root"].endswith("child")
-    assert payload["task"]["budget_drive_root"].endswith("data")
 
+    result = build_health_invariants(env)
 
-class TestFileSizeBudgetHealthInvariant:
-    def _make_env(self, tmp_path, development_text: str):
-        class FakeEnv:
-            def drive_path(self, p):
-                return tmp_path / p
-            def repo_path(self, p):
-                return tmp_path / "repo" / p
-            @property
-            def repo_dir(self):
-                return tmp_path / "repo"
-            @property
-            def drive_root(self):
-                return tmp_path
-
-        (tmp_path / "repo" / "docs").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "repo" / "docs" / "DEVELOPMENT.md").write_text(development_text, encoding="utf-8")
-        (tmp_path / "repo" / "VERSION").write_text("1.2.3", encoding="utf-8")
-        (tmp_path / "repo" / "pyproject.toml").write_text('version = "1.2.3"', encoding="utf-8")
-        (tmp_path / "repo" / "README.md").write_text('version-1.2.3', encoding="utf-8")
-        (tmp_path / "repo" / "docs" / "ARCHITECTURE.md").write_text('# Ouroboros v1.2.3', encoding="utf-8")
-        (tmp_path / "memory").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "state").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "state" / "state.json").write_text('{"spent_usd": 0, "budget_drift_alert": false}', encoding="utf-8")
-        (tmp_path / "memory" / "identity.md").write_text('x' * 300, encoding="utf-8")
-        (tmp_path / "memory" / "scratchpad.md").write_text('x' * 300, encoding="utf-8")
-        return FakeEnv()
-
-    def test_warns_when_memory_file_nears_budget(self, tmp_path):
-        dev = """
-### File Size Budgets
-| Path | Budget chars |
-|------|--------------|
-| memory/identity.md | 1000 |
-### Next Section
-"""
-        env = self._make_env(tmp_path, dev)
-        (tmp_path / "memory" / "identity.md").write_text("x" * 950, encoding="utf-8")
-        result = build_health_invariants(env)
-        assert "FILE SIZE NEAR BUDGET" in result
-        assert "memory/identity.md" in result
-
-    def test_warns_when_prompt_file_exceeds_budget(self, tmp_path):
-        dev = """
-### File Size Budgets
-| Path | Budget chars |
-|------|--------------|
-| prompts/SYSTEM.md | 1000 |
-### Next Section
-"""
-        env = self._make_env(tmp_path, dev)
-        (tmp_path / "repo" / "prompts").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "repo" / "prompts" / "SYSTEM.md").write_text("y" * 1200, encoding="utf-8")
-        result = build_health_invariants(env)
-        assert "FILE SIZE BUDGET EXCEEDED" in result
-        assert "prompts/SYSTEM.md" in result
+    assert "REMOTE CONTEXT OVERFLOW" in result
+    assert "provider/model x1" in result
 
 
 class TestAdditionalHealthInvariantCoverage:
@@ -310,746 +272,6 @@ class TestAdditionalHealthInvariantCoverage:
         assert "2026-04-14-test" in result
 
 
-class TestAdvisoryReviewStatusInContext:
-    """Tests that advisory review status appears in LLM context when runs exist."""
-
-    def _make_env(self, tmp_path):
-        class FakeEnv:
-            def drive_path(self, p):
-                return tmp_path / p
-            def repo_path(self, p):
-                return tmp_path / "repo" / p
-            @property
-            def repo_dir(self):
-                return tmp_path / "repo"
-            @property
-            def drive_root(self):
-                return tmp_path
-
-        (tmp_path / "state").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "memory").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "repo" / "docs").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "repo" / "VERSION").write_text("1.2.3", encoding="utf-8")
-        (tmp_path / "repo" / "pyproject.toml").write_text('version = "1.2.3"', encoding="utf-8")
-        (tmp_path / "repo" / "README.md").write_text('version-1.2.3', encoding="utf-8")
-        (tmp_path / "repo" / "docs" / "ARCHITECTURE.md").write_text('# Ouroboros v1.2.3', encoding="utf-8")
-        (tmp_path / "repo" / "docs" / "DEVELOPMENT.md").write_text('# Dev', encoding="utf-8")
-        (tmp_path / "state" / "state.json").write_text('{"spent_usd": 0, "budget_drift_alert": false}', encoding="utf-8")
-        (tmp_path / "memory" / "identity.md").write_text('x' * 300, encoding="utf-8")
-        (tmp_path / "memory" / "scratchpad.md").write_text('x' * 300, encoding="utf-8")
-        return FakeEnv()
-
-    def test_advisory_status_in_build_llm_messages(self, tmp_path):
-        """format_status_section returns non-empty string when runs exist."""
-        from ouroboros.review_state import (
-            AdvisoryReviewState, AdvisoryRunRecord, save_state, format_status_section
-        )
-        state = AdvisoryReviewState()
-        state.add_run(AdvisoryRunRecord(
-            snapshot_hash="abc123",
-            commit_message="test commit",
-            status="fresh",
-            ts="2026-01-01T00:00:00",
-            items=[{"item": "bible_compliance", "verdict": "PASS", "severity": "critical", "reason": "ok"}],
-        ))
-        save_state(tmp_path, state)
-
-        loaded = __import__("ouroboros.review_state", fromlist=["load_state"]).load_state(tmp_path)
-        section = format_status_section(loaded)
-        assert "Advisory Pre-Review Status" in section
-        assert "FRESH" in section
-        assert "abc123" in section
-
-    def test_advisory_status_empty_when_no_runs(self, tmp_path):
-        """format_status_section returns 'No advisory runs' when state is empty."""
-        from ouroboros.review_state import AdvisoryReviewState, format_status_section
-        state = AdvisoryReviewState()
-        section = format_status_section(state)
-        assert "No advisory runs" in section
-
-    def test_review_continuity_context_surfaces_live_gate_and_continuation(self, tmp_path):
-        from ouroboros.agent_task_pipeline import build_review_context
-        from ouroboros.context import build_llm_messages
-        from ouroboros.memory import Memory
-        from ouroboros.review_state import (
-            AdvisoryReviewState,
-            AdvisoryRunRecord,
-            CommitAttemptRecord,
-            compute_snapshot_hash,
-            make_repo_key,
-            save_state,
-        )
-        from ouroboros.task_continuation import ReviewContinuation, save_review_continuation
-        from ouroboros.task_results import STATUS_COMPLETED, write_task_result
-
-        env = self._make_env(tmp_path)
-        (tmp_path / "repo" / ".git").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "repo" / "prompts").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "repo" / "prompts" / "SYSTEM.md").write_text("System", encoding="utf-8")
-        (tmp_path / "repo" / "BIBLE.md").write_text("Bible", encoding="utf-8")
-        (tmp_path / "repo" / "docs" / "CHECKLISTS.md").write_text("Checklist", encoding="utf-8")
-        (tmp_path / "repo" / "tracked.py").write_text("print('hi')\n", encoding="utf-8")
-
-        repo_key = make_repo_key(tmp_path / "repo")
-        snapshot_hash = compute_snapshot_hash(tmp_path / "repo")
-        state = AdvisoryReviewState()
-        state.add_run(AdvisoryRunRecord(
-            snapshot_hash=snapshot_hash,
-            commit_message="test commit",
-            status="bypassed",
-            ts="2026-04-07T09:59:00+00:00",
-            repo_key=repo_key,
-            bypass_reason="manual audit override",
-        ))
-        state.advisory_runs[-1].status = "stale"
-        state.last_stale_from_edit_ts = "2026-04-07T10:00:00+00:00"
-        state.last_stale_reason = "claude_code_edit mutated tracked.py"
-        state.last_stale_repo_key = repo_key
-        state.record_attempt(CommitAttemptRecord(
-            ts="2026-04-07T10:01:00+00:00",
-            commit_message="blocked commit",
-            status="blocked",
-            repo_key=repo_key,
-            tool_name="commit_reviewed",
-            task_id="task-old",
-            attempt=1,
-            critical_findings=[{
-                "item": "tests_affected",
-                "reason": "Fix the failing test before commit",
-                "severity": "critical",
-                "verdict": "FAIL",
-            }],
-            readiness_warnings=["Review was blocked and needs follow-up."],
-        ))
-        save_state(tmp_path, state)
-
-        save_review_continuation(
-            tmp_path,
-            ReviewContinuation(
-                task_id="task-old",
-                source="blocked_review",
-                stage="blocking_review",
-                repo_key=repo_key,
-                tool_name="commit_reviewed",
-                attempt=1,
-                block_reason="critical_findings",
-                critical_findings=[{
-                    "item": "tests_affected",
-                    "reason": "Fix the failing test before commit",
-                    "severity": "critical",
-                    "verdict": "FAIL",
-                }],
-                readiness_warnings=["Review was blocked and needs follow-up."],
-            ),
-            expect_task_id="task-old",
-        )
-        write_task_result(
-            tmp_path,
-            "task-old",
-            STATUS_COMPLETED,
-            result="Commit blocked by review.",
-        )
-
-        messages, _ = build_llm_messages(
-            env=env,
-            memory=Memory(drive_root=tmp_path),
-            task={"id": "task-new", "type": "task", "text": "continue"},
-            review_context_builder=lambda: build_review_context(env),
-        )
-        dynamic_text = messages[0]["content"][2]["text"]
-
-        assert "## Review Continuity" in dynamic_text
-        assert "repo_commit_ready=no" in dynamic_text
-        assert "retry_anchor=commit_readiness_debt" in dynamic_text
-        assert "Commit-readiness debt" in dynamic_text
-        assert "bypass_reason=manual audit override" in dynamic_text
-        assert "stale_marker=2026-04-07T10:00:00" in dynamic_text
-        assert "### Open review continuations" in dynamic_text
-        assert "critical_finding=tests_affected: Fix the failing test before commit" in dynamic_text
-        assert "### Historical review ledger" in dynamic_text
-        assert "## Scratchpad" in dynamic_text
-        assert dynamic_text.index("## Scratchpad") < dynamic_text.index("## Drive state")
-        assert dynamic_text.index("## Runtime context") < dynamic_text.index("## Review Continuity")
-
-    def test_review_continuity_context_ignores_foreign_repo_obligations(self, tmp_path):
-        from ouroboros.agent_task_pipeline import build_review_context
-        from ouroboros.review_state import (
-            AdvisoryReviewState,
-            AdvisoryRunRecord,
-            CommitAttemptRecord,
-            compute_snapshot_hash,
-            make_repo_key,
-            save_state,
-        )
-
-        env = self._make_env(tmp_path)
-        repo_a = tmp_path / "repo"
-        repo_b = tmp_path / "repo-other"
-        (repo_a / ".git").mkdir(parents=True, exist_ok=True)
-        (repo_b / ".git").mkdir(parents=True, exist_ok=True)
-        (repo_a / "tracked.py").write_text("print('repo a')\n", encoding="utf-8")
-        (repo_b / "tracked.py").write_text("print('repo b')\n", encoding="utf-8")
-
-        repo_a_key = make_repo_key(repo_a)
-        repo_b_key = make_repo_key(repo_b)
-        state = AdvisoryReviewState()
-        state.add_run(AdvisoryRunRecord(
-            snapshot_hash=compute_snapshot_hash(repo_a),
-            commit_message="repo a ready",
-            status="fresh",
-            ts="2026-04-07T10:00:00+00:00",
-            repo_key=repo_a_key,
-        ))
-        state.record_attempt(CommitAttemptRecord(
-            ts="2026-04-07T10:01:00+00:00",
-            commit_message="repo b blocked",
-            status="blocked",
-            repo_key=repo_b_key,
-            tool_name="commit_reviewed",
-            task_id="task-b",
-            attempt=1,
-            block_reason="critical_findings",
-            critical_findings=[{
-                "item": "foreign_issue",
-                "reason": "other repo only",
-                "severity": "critical",
-                "verdict": "FAIL",
-            }],
-        ))
-        save_state(tmp_path, state)
-
-        dynamic_text = build_review_context(env)
-        assert "repo_commit_ready=yes" in dynamic_text
-        assert "foreign_issue" not in dynamic_text
-        assert "repo b blocked" not in dynamic_text
-
-    def test_review_continuity_context_keeps_open_obligations_without_runs(self, tmp_path):
-        from ouroboros.agent_task_pipeline import build_review_context
-        from ouroboros.review_state import (
-            AdvisoryReviewState,
-            ObligationItem,
-            make_repo_key,
-            save_state,
-        )
-
-        env = self._make_env(tmp_path)
-        (tmp_path / "repo" / ".git").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "repo" / "tracked.py").write_text("print('hi')\n", encoding="utf-8")
-
-        repo_key = make_repo_key(tmp_path / "repo")
-        state = AdvisoryReviewState(
-            open_obligations=[
-                ObligationItem(
-                    obligation_id="obl-0001",
-                    item="tests_affected",
-                    severity="critical",
-                    reason="Coverage still missing",
-                    source_attempt_ts="2026-04-07T10:00:00+00:00",
-                    source_attempt_msg="blocked commit",
-                    repo_key=repo_key,
-                    fingerprint="finding:tests_affected:abc123",
-                )
-            ]
-        )
-        save_state(tmp_path, state)
-
-        dynamic_text = build_review_context(env)
-        assert "## Review Continuity" in dynamic_text
-        assert "open_obligations=1" in dynamic_text
-        assert "[obl-0001] tests_affected: Coverage still missing" in dynamic_text
-
-    def test_review_continuity_context_keeps_all_debt_evidence(self, tmp_path):
-        from ouroboros.agent_task_pipeline import build_review_context
-        from ouroboros.review_state import (
-            AdvisoryReviewState,
-            CommitReadinessDebtItem,
-            make_repo_key,
-            save_state,
-        )
-
-        env = self._make_env(tmp_path)
-        (tmp_path / "repo" / ".git").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "repo" / "tracked.py").write_text("print('hi')\n", encoding="utf-8")
-
-        repo_key = make_repo_key(tmp_path / "repo")
-        state = AdvisoryReviewState(
-            commit_readiness_debts=[
-                CommitReadinessDebtItem(
-                    debt_id="debt-0001",
-                    category="repeated_obligation",
-                    title="Commit readiness debt",
-                    summary="Repeated tests blocker",
-                    repo_key=repo_key,
-                    source_obligation_ids=["obl-0001"],
-                    evidence=[
-                        "first evidence",
-                        "second evidence",
-                        "third evidence",
-                    ],
-                )
-            ]
-        )
-        save_state(tmp_path, state)
-
-        dynamic_text = build_review_context(env)
-        assert "first evidence" in dynamic_text
-        assert "second evidence" in dynamic_text
-        assert "third evidence" in dynamic_text
-
-
-def test_runtime_section_includes_improvement_backlog_digest(tmp_path):
-    from ouroboros.context import build_llm_messages
-    from ouroboros.memory import Memory
-
-    class FakeEnv:
-        def drive_path(self, p):
-            return tmp_path / p
-
-        def repo_path(self, p):
-            return tmp_path / "repo" / p
-
-        @property
-        def repo_dir(self):
-            return tmp_path / "repo"
-
-        @property
-        def drive_root(self):
-            return tmp_path
-
-    (tmp_path / "repo" / "prompts").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "repo" / "docs").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "memory" / "knowledge").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
-
-    (tmp_path / "repo" / "prompts" / "SYSTEM.md").write_text("System prompt", encoding="utf-8")
-    (tmp_path / "repo" / "BIBLE.md").write_text("Bible", encoding="utf-8")
-    (tmp_path / "repo" / "README.md").write_text("README", encoding="utf-8")
-    (tmp_path / "repo" / "docs" / "ARCHITECTURE.md").write_text('# Ouroboros v1.2.3', encoding="utf-8")
-    (tmp_path / "repo" / "docs" / "DEVELOPMENT.md").write_text('# Dev', encoding="utf-8")
-    (tmp_path / "repo" / "docs" / "CHECKLISTS.md").write_text('Checklist', encoding="utf-8")
-    (tmp_path / "repo" / "VERSION").write_text("1.2.3", encoding="utf-8")
-    (tmp_path / "repo" / "pyproject.toml").write_text('version = "1.2.3"', encoding="utf-8")
-    (tmp_path / "state" / "state.json").write_text('{"spent_usd": 0}', encoding="utf-8")
-    (tmp_path / "memory" / "identity.md").write_text("I am Ouroboros", encoding="utf-8")
-    (tmp_path / "memory" / "scratchpad.md").write_text("scratchpad", encoding="utf-8")
-    (tmp_path / "memory" / "knowledge" / "improvement-backlog.md").write_text(
-        "# Improvement Backlog\n\n### ibl-1\n- status: open\n- created_at: 2026-04-14T09:00:00+00:00\n- source: execution_reflection\n- category: process\n- task_id: task-1\n- requires_plan_review: yes\n- fingerprint: fp-1\n- summary: Reduce recurring task friction around REVIEW_BLOCKED\n",
-        encoding="utf-8",
-    )
-
-    messages, _ = build_llm_messages(
-        env=FakeEnv(),
-        memory=Memory(drive_root=tmp_path),
-        task={"id": "task-a", "type": "task", "text": "hello"},
-    )
-    dynamic_text = messages[0]["content"][2]["text"]
-    assert "## Improvement Backlog" in dynamic_text
-    assert "Reduce recurring task friction around REVIEW_BLOCKED" in dynamic_text
-
-
-class TestRuntimeEnvSection:
-    """build_runtime_section includes runtime_env with platform and is_desktop."""
-
-    def _make_env(self, tmp_path):
-        class FakeEnv:
-            repo_dir = tmp_path / "repo"
-            drive_root = tmp_path
-
-            def drive_path(self, p):
-                return tmp_path / p
-
-        (tmp_path / "state").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "state" / "state.json").write_text(
-            '{"spent_usd": 0}', encoding="utf-8"
-        )
-        return FakeEnv()
-
-    def test_runtime_env_present(self, tmp_path, monkeypatch):
-        from ouroboros.context import build_runtime_section
-
-        monkeypatch.delenv("OUROBOROS_DESKTOP_MODE", raising=False)
-        env = self._make_env(tmp_path)
-        section = build_runtime_section(env, {"id": "t1", "type": "task"})
-        data = json.loads(section.split("## Runtime context\n\n", 1)[1])
-        assert "runtime_env" in data
-        assert "platform" in data["runtime_env"]
-        assert isinstance(data["runtime_env"]["platform"], str)
-        assert data["runtime_env"]["is_desktop"] is False
-
-    def test_runtime_env_desktop_flag(self, tmp_path, monkeypatch):
-        from ouroboros.context import build_runtime_section
-
-        monkeypatch.setenv("OUROBOROS_DESKTOP_MODE", "1")
-        env = self._make_env(tmp_path)
-        section = build_runtime_section(env, {"id": "t2", "type": "task"})
-        data = json.loads(section.split("## Runtime context\n\n", 1)[1])
-        assert data["runtime_env"]["is_desktop"] is True
-
-
-# ===========================================================================
-# Memory / consolidation offset behavior (merged from former
-# test_context_memory_overhaul.py).  Inspect-only `limit=50` / `limit=1000`
-# source-string pins were dropped — behavioral coverage below already
-# exercises the offset path.  test_no_identity_truncation_in_consolidator_
-# prompts was also dropped (inspect-only); identity-truncation is covered
-# behaviorally by consolidator tests.
-# ===========================================================================
-
-
-def test_recent_chat_starts_after_consolidated_offset(tmp_path):
-    from ouroboros.context import build_recent_sections
-    from ouroboros.memory import Memory
-
-    logs_dir = tmp_path / "logs"
-    memory_dir = tmp_path / "memory"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    entries = [
-        {"ts": f"2026-03-19T16:{i:02d}:00Z", "direction": "in", "username": "User", "text": f"msg-{i}"}
-        for i in range(5)
-    ]
-    (logs_dir / "chat.jsonl").write_text(
-        "\n".join(json.dumps(entry) for entry in entries) + "\n",
-        encoding="utf-8",
-    )
-    memory = Memory(drive_root=tmp_path)
-    (memory_dir / "dialogue_meta.json").write_text(
-        json.dumps({
-            "last_consolidated_offset": 3,
-            "chat_log_signature": memory.jsonl_generation_signature("chat.jsonl"),
-        }),
-        encoding="utf-8",
-    )
-
-    sections = build_recent_sections(memory, env=None)
-    combined = "\n\n".join(sections)
-
-    assert "msg-0" not in combined
-    assert "msg-1" not in combined
-    assert "msg-2" not in combined
-    assert "msg-3" in combined
-    assert "msg-4" in combined
-
-
-def test_low_mode_preserves_full_unconsolidated_dialogue_suffix(tmp_path, monkeypatch):
-    from ouroboros.context import build_recent_sections
-    from ouroboros.memory import Memory
-
-    logs_dir = tmp_path / "logs"
-    memory_dir = tmp_path / "memory"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    fresh_count = 305
-    entries = [
-        {"chat_id": 1, "direction": "in", "username": "User", "text": f"consolidated-{i}"}
-        for i in range(3)
-    ] + [
-        {"chat_id": 1, "direction": "in", "username": "User", "text": f"fresh-{i}"}
-        for i in range(fresh_count)
-    ]
-    (logs_dir / "chat.jsonl").write_text(
-        "\n".join(json.dumps(entry) for entry in entries) + "\n",
-        encoding="utf-8",
-    )
-    memory = Memory(drive_root=tmp_path)
-    (memory_dir / "dialogue_meta.json").write_text(
-        json.dumps({
-            "last_consolidated_offset": 3,
-            "chat_log_signature": memory.jsonl_generation_signature("chat.jsonl"),
-        }),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", "low")
-
-    combined = "\n\n".join(build_recent_sections(memory, env=None))
-
-    assert "consolidated-0" not in combined
-    assert "fresh-0" in combined
-    assert f"fresh-{fresh_count - 1}" in combined
-
-
-def test_low_mode_without_consolidation_keeps_max_raw_dialogue_tail(tmp_path, monkeypatch):
-    from ouroboros.context import build_recent_sections
-    from ouroboros.context_budget import MAX_RECENT_CHAT_TAIL
-    from ouroboros.memory import Memory
-
-    logs_dir = tmp_path / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    fresh_count = 305
-    entries = [
-        {"chat_id": 1, "direction": "in", "username": "User", "text": f"fresh-{i}"}
-        for i in range(fresh_count)
-    ]
-    (logs_dir / "chat.jsonl").write_text(
-        "\n".join(json.dumps(entry) for entry in entries) + "\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", "low")
-
-    combined = "\n\n".join(build_recent_sections(Memory(drive_root=tmp_path), env=None))
-
-    assert fresh_count < MAX_RECENT_CHAT_TAIL
-    assert "fresh-0" in combined
-    assert f"fresh-{fresh_count - 1}" in combined
-
-
-def test_recent_chat_offset_uses_filtered_dialogue_entries(tmp_path):
-    from ouroboros.context import build_recent_sections
-    from ouroboros.memory import Memory
-
-    logs_dir = tmp_path / "logs"
-    memory_dir = tmp_path / "memory"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    entries = [
-        {"chat_id": 1, "direction": "in", "username": "User", "text": "consolidated-0"},
-        {"chat_id": -1, "direction": "in", "username": "Agent", "text": "a2a-noise"},
-        {"chat_id": 1, "direction": "in", "username": "User", "text": "consolidated-1"},
-        {"chat_id": 1, "direction": "in", "username": "User", "text": "fresh"},
-    ]
-    (logs_dir / "chat.jsonl").write_text(
-        "\n".join(json.dumps(entry) for entry in entries) + "\n",
-        encoding="utf-8",
-    )
-    memory = Memory(drive_root=tmp_path)
-    (memory_dir / "dialogue_meta.json").write_text(
-        json.dumps({
-            "last_consolidated_offset": 2,
-            "chat_log_signature": memory.jsonl_generation_signature("chat.jsonl"),
-        }),
-        encoding="utf-8",
-    )
-
-    combined = "\n\n".join(build_recent_sections(memory, env=None))
-
-    assert "consolidated-0" not in combined
-    assert "consolidated-1" not in combined
-    assert "a2a-noise" not in combined
-    assert "fresh" in combined
-
-
-def test_recent_chat_ignores_stale_consolidation_offset_after_rotation(tmp_path):
-    from ouroboros.context import build_recent_sections
-    from ouroboros.memory import Memory
-
-    logs_dir = tmp_path / "logs"
-    memory_dir = tmp_path / "memory"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    initial = [
-        {"chat_id": 1, "direction": "in", "username": "User", "text": f"early-{i}"}
-        for i in range(3)
-    ]
-    (logs_dir / "chat.jsonl").write_text(
-        "\n".join(json.dumps(entry) for entry in initial) + "\n",
-        encoding="utf-8",
-    )
-    memory = Memory(drive_root=tmp_path)
-    stale_signature = memory.jsonl_generation_signature("chat.jsonl")
-    (memory_dir / "dialogue_meta.json").write_text(
-        json.dumps({
-            "last_consolidated_offset": 3,
-            "chat_log_signature": stale_signature,
-        }),
-        encoding="utf-8",
-    )
-
-    rotated = [
-        {"chat_id": 1, "direction": "in", "username": "User", "text": f"post-rotate-{i}"}
-        for i in range(2)
-    ]
-    (logs_dir / "chat.jsonl").write_text(
-        "\n".join(json.dumps(entry) for entry in rotated) + "\n",
-        encoding="utf-8",
-    )
-
-    combined = "\n\n".join(build_recent_sections(memory, env=None))
-
-    # Rotation invalidates the stale offset; rotated entries appear.
-    assert "post-rotate-0" in combined
-    assert "post-rotate-1" in combined
-
-
-def test_recent_chat_keeps_offset_when_same_log_gets_appended(tmp_path):
-    from ouroboros.context import build_recent_sections
-    from ouroboros.memory import Memory
-
-    logs_dir = tmp_path / "logs"
-    memory_dir = tmp_path / "memory"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    initial = [
-        {"chat_id": 1, "direction": "in", "username": "User", "text": f"old-{i}"}
-        for i in range(3)
-    ]
-    (logs_dir / "chat.jsonl").write_text(
-        "\n".join(json.dumps(entry) for entry in initial) + "\n",
-        encoding="utf-8",
-    )
-    memory = Memory(drive_root=tmp_path)
-    (memory_dir / "dialogue_meta.json").write_text(
-        json.dumps({
-            "last_consolidated_offset": 3,
-            "chat_log_signature": memory.jsonl_generation_signature("chat.jsonl"),
-        }),
-        encoding="utf-8",
-    )
-
-    with open(logs_dir / "chat.jsonl", "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"chat_id": 1, "direction": "in", "username": "User", "text": "new"}) + "\n")
-
-    combined = "\n\n".join(build_recent_sections(memory, env=None))
-
-    assert "old-0" not in combined
-    assert "new" in combined
-
-
-def test_world_profile_is_loaded_with_stable_memory(tmp_path):
-    from ouroboros.context import build_memory_sections
-    from ouroboros.memory import Memory
-
-    (tmp_path / "memory").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "memory" / "WORLD.md").write_text("world-profile-data", encoding="utf-8")
-    memory = Memory(drive_root=tmp_path)
-
-    sections = build_memory_sections(memory)
-    combined = "\n\n".join(sections)
-
-    assert "world-profile-data" in combined
-
-
-def test_retired_dialogue_summary_remains_visible_when_blocks_exist(tmp_path):
-    from ouroboros.context import build_memory_sections
-    from ouroboros.memory import Memory
-
-    memory_dir = tmp_path / "memory"
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    (memory_dir / "dialogue_summary.md").write_text("legacy dialogue", encoding="utf-8")
-    (memory_dir / "dialogue_blocks.json").write_text(
-        json.dumps([{"content": "new dialogue block"}]),
-        encoding="utf-8",
-    )
-    memory = Memory(drive_root=tmp_path)
-
-    combined = "\n\n".join(build_memory_sections(memory, partition="volatile"))
-
-    assert "## Dialogue History" in combined
-    assert "new dialogue block" in combined
-    assert "## Legacy Dialogue Summary (retired flat format, read-only fallback)" in combined
-    assert "legacy dialogue" in combined
-
-
-def test_retired_dialogue_summary_fallback_preserves_continuity_without_blocks(tmp_path):
-    from ouroboros.context import build_memory_sections
-    from ouroboros.memory import Memory
-
-    memory_dir = tmp_path / "memory"
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    (memory_dir / "dialogue_summary.md").write_text("legacy dialogue only", encoding="utf-8")
-    memory = Memory(drive_root=tmp_path)
-
-    combined = "\n\n".join(build_memory_sections(memory, partition="volatile"))
-
-    assert "## Legacy Dialogue Summary (retired flat format, read-only fallback)" in combined
-    assert "legacy dialogue only" in combined
-
-
-def test_recent_sections_filter_process_logs_by_task_id(tmp_path):
-    from ouroboros.context import build_recent_sections
-    from ouroboros.memory import Memory
-
-    logs_dir = tmp_path / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    (logs_dir / "progress.jsonl").write_text(
-        "\n".join([
-            json.dumps({"task_id": "task-a", "text": "in-scope"}),
-            json.dumps({"task_id": "task-b", "text": "out-of-scope"}),
-        ]) + "\n",
-        encoding="utf-8",
-    )
-    (logs_dir / "tools.jsonl").write_text(
-        "\n".join([
-            json.dumps({"task_id": "task-a", "tool": "shell"}),
-            json.dumps({"task_id": "task-b", "tool": "shell"}),
-        ]) + "\n",
-        encoding="utf-8",
-    )
-
-    memory = Memory(drive_root=tmp_path)
-    sections = build_recent_sections(memory, env=None, task_id="task-a")
-    combined = "\n\n".join(sections)
-    assert "in-scope" in combined
-    assert "out-of-scope" not in combined
-
-
-def test_should_consolidate_chat_blocks(tmp_path):
-    from ouroboros.consolidator import should_consolidate, BLOCK_SIZE
-    chat_path = tmp_path / 'chat.jsonl'
-    meta_path = tmp_path / 'dialogue_meta.json'
-    entries = [
-        json.dumps({"ts": f"2026-03-09T10:{i % 60:02d}:00Z", "direction": "in", "text": "msg"})
-        for i in range(BLOCK_SIZE + 5)
-    ]
-    chat_path.write_text("\n".join(entries) + "\n", encoding='utf-8')
-    assert should_consolidate(meta_path, chat_path) is True
-
-
-def test_consolidate_chat_creates_block(tmp_path):
-    from unittest.mock import MagicMock
-    from ouroboros.consolidator import consolidate, _load_meta, _load_blocks, BLOCK_SIZE
-    chat_path = tmp_path / 'chat.jsonl'
-    blocks_path = tmp_path / 'dialogue_blocks.json'
-    meta_path = tmp_path / 'dialogue_meta.json'
-    entries = [
-        json.dumps({"ts": f"2026-03-09T10:{i % 60:02d}:00Z", "direction": "in", "text": f"msg {i}"})
-        for i in range(BLOCK_SIZE + 5)
-    ]
-    chat_path.write_text("\n".join(entries) + "\n", encoding='utf-8')
-    mock_llm = MagicMock()
-    mock_llm.chat.return_value = (
-        {"content": "### Block: test\n\nSummary."},
-        {"prompt_tokens": 100, "completion_tokens": 50, "cost": 0.001},
-    )
-    usage = consolidate(chat_path, blocks_path, meta_path, mock_llm)
-    assert usage is not None
-    meta = _load_meta(meta_path)
-    assert meta["last_consolidated_offset"] == BLOCK_SIZE
-    blocks = _load_blocks(blocks_path)
-    assert len(blocks) == 1
-
-
-def test_installed_skills_section_includes_warnings_verdict(tmp_path, monkeypatch):
-    from ouroboros.context import _build_installed_skills_section
-
-    class FakeEnv:
-        drive_root = tmp_path
-
-    monkeypatch.setattr(
-        "ouroboros.skill_loader.summarize_skills",
-        lambda _root: {
-            "skills": [
-                {
-                    "name": "weather",
-                    "type": "script",
-                    "enabled": True,
-                    "review_status": "warnings",
-                    "executable_review": True,
-                    "review_stale": False,
-                    "description": "Weather helper",
-                }
-            ]
-        },
-    )
-
-    section = _build_installed_skills_section(FakeEnv())
-
-    assert "## Installed Skills" in section
-    assert "weather" in section
-    assert "warnings" in section
-
-
 def test_health_invariants_come_first_in_dynamic_context(tmp_path):
     from ouroboros.context import build_llm_messages
     from ouroboros.memory import Memory
@@ -1096,13 +318,22 @@ def test_health_invariants_come_first_in_dynamic_context(tmp_path):
         task={"id": "task-a", "type": "task", "text": "hello"},
     )
 
-    dynamic_text = messages[0]["content"][2]["text"]
-    assert dynamic_text.startswith("## Health Invariants")
+    dynamic_text = messages[0]["content"][-1]["text"]
+    # Knowledge and my rooms lead the changing block; the runtime sections follow, health first.
+    assert dynamic_text.startswith("## Shared understanding")
+    assert dynamic_text.index("## This room (Main)") < dynamic_text.index("## Health Invariants")
+    assert dynamic_text.index("## Health Invariants") < dynamic_text.index("## Scratchpad")
     assert dynamic_text.index("## Health Invariants") < dynamic_text.index("## Drive state")
+    # #1731: the root keeps its contract discipline, and no root context orders a result review
+    # before finalizing: under Auto the review is the author's own typed nomination.
+    assert "## Task Contract Discipline" in dynamic_text and "state your success criteria early" in dynamic_text
+    assert "task_acceptance_review" not in dynamic_text.split("## Task Contract Discipline", 1)[1].split("\n## ", 1)[0]
 
 
-def test_health_invariants_come_first_in_background_consciousness_context(tmp_path):
-    from ouroboros.consciousness import BackgroundConsciousness
+def test_health_invariants_come_first_in_a_consciousness_wake_context(tmp_path):
+    """A wake-up is an ordinary Main turn: the same builder, the same section order."""
+    from ouroboros.context import build_llm_messages
+    from ouroboros.memory import Memory
 
     repo_dir = tmp_path / "repo"
     drive_root = tmp_path / "drive"
@@ -1112,7 +343,7 @@ def test_health_invariants_come_first_in_background_consciousness_context(tmp_pa
     (drive_root / "logs").mkdir(parents=True, exist_ok=True)
     (drive_root / "state").mkdir(parents=True, exist_ok=True)
 
-    (repo_dir / "prompts" / "CONSCIOUSNESS.md").write_text("Consciousness prompt", encoding="utf-8")
+    (repo_dir / "prompts" / "SYSTEM.md").write_text("System prompt", encoding="utf-8")
     (repo_dir / "BIBLE.md").write_text("Bible", encoding="utf-8")
     (repo_dir / "VERSION").write_text("1.2.3", encoding="utf-8")
     (repo_dir / "pyproject.toml").write_text('version = "1.2.3"', encoding="utf-8")
@@ -1132,12 +363,138 @@ def test_health_invariants_come_first_in_background_consciousness_context(tmp_pa
     (drive_root / "logs" / "supervisor.jsonl").write_text("", encoding="utf-8")
     (drive_root / "logs" / "task_reflections.jsonl").write_text("", encoding="utf-8")
 
-    bg = BackgroundConsciousness(
-        drive_root=drive_root,
-        repo_dir=repo_dir,
-        event_queue=None,
-        owner_chat_id_fn=lambda: None,
+    class FakeEnv:
+        def drive_path(self, p):
+            return drive_root / p
+
+        def repo_path(self, p):
+            return repo_dir / p
+
+        @property
+        def repo_dir(self):
+            return repo_dir
+
+        @property
+        def drive_root(self):
+            return drive_root
+
+    messages, _cap_info = build_llm_messages(
+        env=FakeEnv(),
+        memory=Memory(drive_root=drive_root, repo_dir=repo_dir),
+        task={"id": "wake1", "type": "task", "text": "[Wake-up · heartbeat]", "_is_direct_chat": True,
+              "metadata": {"initiator": "consciousness", "usage_category": "consciousness"}},
     )
 
-    text = bg._build_context()
-    assert text.index("## Health Invariants") < text.index("## Drive state")
+    dynamic_text = messages[0]["content"][-1]["text"]
+    assert dynamic_text.startswith("## Shared understanding")
+    assert "\n## This room (Main) — head " in dynamic_text  # a wake reads Main as its room, as the Main turn does
+    assert dynamic_text.index("## Health Invariants") < dynamic_text.index("## Scratchpad")
+    assert dynamic_text.index("## Health Invariants") < dynamic_text.index("## Drive state")
+
+
+def test_project_room_keeps_an_older_own_directive_beside_sibling_traffic(tmp_path, monkeypatch):
+    """Sibling traffic cannot hide an older own-room directive: the room's open rows are its own."""
+    from ouroboros.projects_registry import create_project
+    from tests._memory_view_context import blocks, section
+    from tests.test_cache_optimization import _make_env_and_memory
+
+    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", "max")
+    env, memory = _make_env_and_memory(tmp_path)
+    root = memory.drive_root
+    own = create_project(root, "own", name="Own")
+    sibling = create_project(root, "sibling", name="Sibling")
+    own_chat, sibling_chat = int(own["chat_id"]), int(sibling["chat_id"])
+    decisive = "CLAUDEXOR_ONLY_AND_THREE_LEVEL_NESTING"
+    # The directive is old history (an archived chain segment); the sibling noise is the newer live chain.
+    dialogue_test.seed(root, archives={"chat_20260820T010000.jsonl": [
+        {"chat_id": own_chat, "direction": "in", "ts": "2026-08-20T01:00:00+00:00", "text": decisive}]},
+        live={"chat": [{"chat_id": sibling_chat, "direction": "in", "ts": "2026-08-21T00:00:00+00:00",
+                        "text": f"noise-{i}"} for i in range(4500)]})
+    dialogue_test.import_all(root)
+
+    _a, _b, changing, _cap = blocks(env, memory, {"id": "own-task", "chat_id": own_chat})
+    room = section(changing, f"## This room (Project Own [chat_id={own_chat}])")
+    assert decisive in room
+    assert "noise-" not in changing  # the sibling room is one line in ## Live rooms
+    assert f"Project Sibling [chat_id={sibling_chat}]" in section(changing, "## Live rooms")
+    assert str(root) not in room
+
+
+def test_project_room_keeps_the_retention_proof_cross_room_directive_once(tmp_path):
+    """The owner's words that started a Project stay visible once: in the open conversation of the
+    room they were written in, else under ``Words that started this work``."""
+    from ouroboros.project_dialogue import build_owner_message_ref
+    from ouroboros.projects_registry import bind_task_to_project, create_project
+    from tests._memory_view_context import blocks, section
+    from tests.test_cache_optimization import _make_env_and_memory
+
+    env, memory = _make_env_and_memory(tmp_path)
+    root = memory.drive_root
+    project = create_project(root, "cat-tower", name="Cat tower")
+    project_chat = int(project["chat_id"])
+    directive = "d" * 500 + " CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3"
+    ref = build_owner_message_ref(chat_id=1, client_message_id="cat-origin", ts="2026-08-21T00:00:00Z", text=directive)
+    bind_task_to_project(root, "cat-root", "cat-tower", project_chat, origin={"ref": ref, "text": directive})
+    source_row = {**ref, "direction": "in", "text": directive}
+    follow = {"chat_id": project_chat, "direction": "in", "ts": "2026-08-21T00:01:00Z", "text": "continue"}
+    # The chain does not hold the owner's row (an older install never stored it): the binding kept the words.
+    dialogue_store.append(root, "chat", follow)
+    label = f"## This room (Project Cat tower [chat_id={project_chat}])"
+    _a, _b, absent, _cap = blocks(env, memory, {"id": "cat-root", "chat_id": project_chat})
+    room = section(absent, label)
+    assert room.count("CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3") == 1  # retention-proof: the binding kept it
+    assert "### Words that started this work (retention-proof)" in room
+
+    origin = root / "memory" / "chronicle"
+    assert origin.is_dir()  # the first capture activated the chronicle
+    # Once the owner's row itself is an open row of this room, it is read there, once, and not under the heading.
+    dialogue_store.append(root, "chat", source_row)
+    _a, _b, present, _cap = blocks(env, memory, {"id": "cat-root", "chat_id": project_chat})
+    room = section(present, label)
+    assert room.count("CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3") == 1  # an open row of this room
+    assert "### Words that started this work" not in room
+
+
+def test_chat_history_surfaces_malformed_gap_even_when_search_matches_nothing(tmp_path):
+    from ouroboros.memory import Memory
+
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True)
+    (logs / "chat.jsonl").write_bytes(
+        b'{"direction":"in","text":"valid"}\n{"direction":"in","text":"decisive-tail"\n'
+    )
+
+    result = Memory(tmp_path).chat_history(count=20, search="absent-query")
+
+    assert "no observed messages matching query" in result
+    assert "completeness unknown" in result
+    assert "jsonl_malformed" in result
+
+
+def test_archive_only_chat_chain_is_complete_while_live_file_is_absent(tmp_path):
+    from ouroboros.memory import Memory
+
+    dialogue_test.seed(tmp_path, archives={"chat_20260820T010000.jsonl": [{"direction": "in", "text": "archive-only"}]})
+    dialogue_test.import_all(tmp_path)
+
+    entries, coverage = Memory(drive_root=tmp_path).read_chat_generations()
+
+    assert [entry["text"] for entry in entries] == ["archive-only"]
+    assert coverage["gaps"] == []
+
+
+def test_runtime_section_carries_official_update_fact(tmp_path, monkeypatch):
+    env = _make_health_env(tmp_path)
+    # Patched WHERE IT IS USED: context.py binds the name at import, so patching the
+    # defining module would leave this test asserting the real projection's own answer
+    # and proving nothing about the injection.
+    monkeypatch.setattr(
+        "ouroboros.context.official_update_projection",
+        lambda head: {"status": "update_available", "running": {"sha": head}, "letter": {"state": "ready"}},
+    )
+    section = build_runtime_section(env, {"id": "task-1", "type": "task"})
+    payload = json.loads(section.split("\n\n", 1)[1])
+
+    assert payload["official_update"]["status"] == "update_available"
+    assert payload["official_update"]["letter"] == {"state": "ready"}
+    assert payload["official_update"]["running"]["sha"] == payload["git_head"], "the fact reads THIS repo's HEAD"

@@ -1,43 +1,35 @@
-"""Single source of truth for the LLM context LAYOUT of reference docs.
+"""Reference-book views for Main, children and background cognition.
 
-This module decides, in ONE place, which governance / reference docs enter the
-always-on agent context and in what form, per context mode (low / max) and task
-kind. Centralizing it here keeps the low/max split from drifting across the
-surfaces that consume it (main task context, background consciousness, deep
-self-review).
+Main Max keeps the full Architecture capability/WHY map for every task class;
+its Development handbook remains tied to the active self-body binding. Low and
+Nano carry both books' authored chapter introductions and physical pointers.
+Children use that compact orientation; their memory view (``memory_view.ROLE_DEFAULTS``)
+decides what of my story and room they carry, and parent-selected details arrive
+through ordinary source reads and working views.
 
-Doc matrix (agent cognition surfaces):
-
-  | doc            | max            | low                                   |
-  |----------------|----------------|---------------------------------------|
-  | SYSTEM / BIBLE | full (tier-0; caller-owned, never varied here)              |
-  | ARCHITECTURE   | full           | navigation map (full sections on demand) |
-  | DEVELOPMENT    | full           | full when caller marks/keeps dev context; else pointer |
-  | README         | on-demand pointer (removed from always-on for all modes)     |
-  | CHECKLISTS     | on-demand pointer (reviewers load their own copy)            |
-
-The TIER-0 protected core (SYSTEM, BIBLE, identity, scratchpad, knowledge index,
-recent dialogue) is ALWAYS full in every mode (BIBLE P1 cognitive-horizon / P4)
-and is declared here as a data invariant. Memory-section SIZE (not inclusion) is
-governed separately by consolidation granularity, not by this layout.
-
-No imports from ``ouroboros.context`` (avoids a circular import); docs are read
-directly via ``env.repo_path``.
+Source bytes belong to ReferenceBook; this module only renders the selected
+view. Stable full prefixes contain no cwd, task identity or revision counters.
+SYSTEM, BIBLE and the common identity/narrative core remain caller-owned.
 """
 
 from __future__ import annotations
 
-from typing import Any, List
+import pathlib
+from typing import Any, List, Mapping
+
+from ouroboros.reference_books import ReferenceBook, compose_book, load_reference_book, overview_book
 
 # Protected core: always rendered in full, in every context mode. Encoded as
-# data so a drift-guard test can assert no future change demotes it.
+# data so a drift-guard test can assert no future change demotes it. The marks I
+# keep in view never become addresses (``memory_floor`` has no step for them);
+# conversations are the memory view's, whose physical floor alone degrades them.
 TIER0_ALWAYS_FULL = frozenset({
     "system",
     "bible",
     "identity",
     "scratchpad",
     "knowledge_index",
-    "recent_dialogue",
+    "memory_marks",
 })
 
 
@@ -48,13 +40,14 @@ def _read_doc(env: Any, rel_path: str) -> str:
         return ""
 
 
-def generate_doc_nav_map(text: str, *, title: str, rel_path: str) -> str:
+def generate_doc_nav_map(text: str, *, title: str, rel_path: str, instructions: bool = True) -> str:
     """Build a compact, fence-aware navigation map of a markdown doc.
 
-    Lists every ``##`` / ``###`` heading with its line range so the agent knows
-    what exists and where, and can pull the full section on demand via
+    Lists every ``##`` through ``####`` heading with its inclusive line range
+    so the agent knows what exists and where, and can pull the full section on demand via
     ``read_file(root="system_repo", path=rel_path, start_line=A, max_lines=N)``.
-    This is a lossless index
+    A parent's range includes its complete descendant group, so parent and child
+    ranges intentionally overlap. This is a lossless index
     (P1: no silent truncation) — the single canonical file on disk is unchanged.
     """
     lines = text.splitlines()
@@ -71,30 +64,162 @@ def generate_doc_nav_map(text: str, *, title: str, rel_path: str) -> str:
             headings.append((2, line[3:].strip(), i))
         elif line.startswith("### "):
             headings.append((3, line[4:].strip(), i))
+        elif line.startswith("#### "):
+            headings.append((4, line[5:].strip(), i))
 
-    out = [
-        f"## {title} (navigation map — low context mode)",
-        "",
-        f"Full text is NOT inlined to fit a small context window. Read any section "
-        f"on demand with `read_file(root=\"system_repo\", path=\"{rel_path}\", "
-        f"start_line=A, max_lines=N)` (untruncated). Sections:",
-        "",
-    ]
+    out = [f"## {title} (navigation map)", ""]
+    if instructions:
+        out += [
+            f"Full text is NOT inlined to keep the working context window fit. Read any "
+            f"section on demand with `read_file(root=\"system_repo\", path=\"{rel_path}\", "
+            f"start_line=A, max_lines=N)` (untruncated). Ranges are inclusive; a "
+            f"parent includes its complete descendant group, and `max_lines=B-A+1` "
+            f"for `lines A-B`. Sections:",
+            "",
+        ]
     if not headings:
-        out.append(f"- (no `##`/`###` headings; read `{rel_path}` directly)")
+        out.append("- (no `##`/`###`/`####` headings; "
+                   + (f"read `{rel_path}` directly)" if instructions else f"source: `{rel_path}`)"))
     for idx, (level, htitle, lineno) in enumerate(headings):
-        end = headings[idx + 1][2] - 1 if idx + 1 < len(headings) else total
-        indent = "  " if level == 3 else ""
+        end = total
+        for later_level, _later_title, later_lineno in headings[idx + 1:]:
+            if later_level <= level:
+                end = later_lineno - 1
+                break
+        indent = "  " * (level - 2)
         out.append(f"{indent}- {htitle} — lines {lineno}-{end}")
     return "\n".join(out)
 
 
-def architecture_context_section(env: Any, *, context_mode: str) -> str:
+def design_navigation(text: str | None, *, source: str) -> str:
+    """Index canonical DESIGN bytes, without representing headings as rules read."""
+    locator = f"Source: {source}."
+    if text is None:
+        return f"## DESIGN.md source unavailable\n\n{locator} No DESIGN content or navigation delivered."
+    return (
+        generate_doc_nav_map(text, title="DESIGN.md", rel_path="docs/DESIGN.md", instructions=False)
+        + f"\n\n{locator} Use this exact source path when reading; relative paths may address a candidate. "
+        "Ranges are inclusive. Navigation only: DESIGN content is not inlined; "
+        "availability is not evidence of reading or application. Select relevant original sections; "
+        "a participant without source-reading tools needs those excerpts in its packet."
+    )
+
+
+def task_design_source(ctx: Any, task: Mapping[str, Any]) -> pathlib.Path | None:
+    """Select the author's body source by the same identity as workspace/review tools.
+
+    A default false self-body flag cannot hide a recognized body. Conversely an
+    explicit true flag never turns a known foreign workspace into Ouroboros.
+    Folderless self-body work can address system_repo without reclassifying scratch.
+    """
+    from ouroboros import body_candidate
+    from ouroboros.context_input_selection import _explicit_self_body_docs_flag
+    from ouroboros.review_body_fact import BODY_FALSE, BODY_TRUE, body_fact
+    from ouroboros.tool_access_roots import folderless_scratch_dir
+    from ouroboros.tools.tool_resolution import active_repo_dir_for, system_repo_dir_for
+    from ouroboros.workspace_copies import copy_binding, same_directory
+
+    active, system = active_repo_dir_for(ctx), system_repo_dir_for(ctx)
+    binding = copy_binding(task) or copy_binding(ctx)
+    if binding and binding.get("source_is_system_repo") is not False and any(
+            same_directory(parent, binding.get("execution_root")) for parent in (active, *active.parents)):
+        return pathlib.Path(binding["execution_root"])
+    # A false copy flag means a separate Git directory, not necessarily a foreign
+    # project: body_fact also recognizes the configured upstream/fork chain.
+    if body_candidate.is_bound(ctx) and folderless_scratch_dir(ctx) is not None:
+        # Explicit preparation/restoration selects the body while scratch stays
+        # the default cwd. A foreign workspace/room still follows its own identity.
+        return pathlib.Path(body_candidate.descriptor(ctx)["path"])
+    fact = body_fact(active, system_repo=system,
+                     data_dir=getattr(ctx, "budget_drive_root", None) or getattr(ctx, "drive_root", None))
+    if fact.body == BODY_TRUE:
+        if fact.how == "dir":
+            return system
+        # Read-only investigators may start below a body's Git worktree root.
+        # Identity is already established; Git metadata locates its document.
+        return next((parent for parent in (active, *active.parents)
+                     if (parent / ".git").exists()), active)
+    if fact.body == BODY_FALSE:
+        return None
+    if _explicit_self_body_docs_flag(dict(task)) is True and folderless_scratch_dir(ctx) is not None:
+        return system
+    return None
+
+
+def task_design_navigation(ctx: Any, task: Mapping[str, Any]) -> str:
+    """Capture once before context fitting; the task-specific root stays out of A'."""
+    root = task_design_source(ctx, task)
+    if root is None:
+        return ""
+    path = root / "docs/DESIGN.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        text = None
+    return design_navigation(text, source=f"`{path}`")
+
+
+def book_navigation(book: ReferenceBook, *, instructions: bool = True) -> str:
+    """The compact, CHAPTER-ADDRESSED view of one reference book.
+
+    The authored introductions are the overview (there is no second editable
+    summary corpus), and beside each one sits that chapter's own heading index
+    with line ranges into the PHYSICAL chapter file. A composed-book line
+    number is never a `read_file` locator: the composition exists only in the
+    prompt, so an offset taken from it would address the wrong bytes of the
+    entrypoint. The read instruction is stated once, by `overview_book`, rather
+    than repeated under every chapter.
+
+    The one place a source's SHAPE still decides anything: an exact historical
+    revision is one physical file, and the single-source mapper is the right
+    map for it. That is a fact about the revision, not a migration switch —
+    callers declare the VIEW they want and both shapes answer.
+    """
+    if book.legacy:
+        return generate_doc_nav_map(
+            book.entrypoint.text,
+            title=pathlib.PurePosixPath(book.entrypoint.source_path).name,
+            rel_path=book.entrypoint.source_path,
+            instructions=instructions,
+        )
+    return overview_book(
+        book,
+        lambda chapter: generate_doc_nav_map(
+            chapter.text,
+            title=chapter.headings[0].title if chapter.headings else chapter.source_path,
+            rel_path=chapter.source_path,
+            instructions=False,
+        ),
+        instructions=instructions,
+    ).text
+
+
+def architecture_context_section(
+    env: Any,
+    *,
+    context_mode: str,
+    text: str | None = None,
+    book: ReferenceBook | None = None,
+) -> str:
     """ARCHITECTURE.md: full in max, navigation map in low. Empty if unreadable."""
-    text = _read_doc(env, "docs/ARCHITECTURE.md")
+    if book is None and text is None:
+        try:
+            book = load_reference_book(env.repo_dir, "architecture", lambda path: env.repo_path(path).read_bytes())
+        except (OSError, ValueError) as exc:
+            return f"Reference book source unavailable: docs/ARCHITECTURE.md. {exc}. Full context is not established."
+    if book is not None:
+        # View intent, not a migration flag: a compact mode asks for the
+        # navigable overview and a full mode asks for the composition. Both
+        # answers are defined for a legacy revision too.
+        if context_mode in {"low", "nano"}:
+            return book_navigation(book)
+        if text is None:
+            text = compose_book(book)
+    if text is None:
+        text = _read_doc(env, "docs/ARCHITECTURE.md")
     if not text.strip():
         return ""
-    if context_mode == "low":
+    if context_mode in {"low", "nano"}:
         return generate_doc_nav_map(
             text, title="ARCHITECTURE.md", rel_path="docs/ARCHITECTURE.md"
         )
@@ -105,42 +230,60 @@ def reference_doc_sections(
     env: Any,
     *,
     context_mode: str,
-    is_code_task: bool,
-) -> List[str]:
-    """Return the reference-doc parts for the always-on static block.
+    include_development: bool,
+    architecture_text: str | None = None,
+    development_text: str | None = None,
+    books: tuple[ReferenceBook, ...] = (),
+) -> tuple[List[str], str]:
+    """Return common reference sections and the optional separate Max handbook.
 
-    SYSTEM.md and BIBLE.md are tier-0 and added by the caller; this owns
-    ARCHITECTURE / DEVELOPMENT / README / CHECKLISTS per the doc matrix. Anything
-    not inlined is named in a single visible on-demand pointer (P1: no silent
-    omission).
+    Max's common sections do not depend on the caller's handbook inclusion.
+    Compact modes orient the mind to both books and retain exact physical
+    pointers; they never turn a composed-book line into a file address.
     """
-    low = context_mode == "low"
     parts: List[str] = []
-    on_demand: List[str] = []
+    development = ""
+    by_id = {book.book_id: book for book in books}
 
-    arch_section = architecture_context_section(env, context_mode=context_mode)
+    arch_section = architecture_context_section(
+        env,
+        context_mode=context_mode,
+        text=architecture_text,
+        book=by_id.get("architecture"),
+    )
     if arch_section:
         parts.append(arch_section)
 
-    dev_text = _read_doc(env, "docs/DEVELOPMENT.md")
+    development_book = by_id.get("development")
+    if development_book is None and development_text is None:
+        try:
+            development_book = load_reference_book(env.repo_dir, "development", lambda path: env.repo_path(path).read_bytes())
+        except (OSError, ValueError) as exc:
+            development_text = f"Reference book source unavailable: docs/DEVELOPMENT.md. {exc}. Full context is not established."
+    dev_text = (
+        development_text
+        if development_text is not None
+        else _read_doc(env, "docs/DEVELOPMENT.md")
+    )
+    if development_book is not None and development_text is None:
+        dev_text = compose_book(development_book)
     if dev_text.strip():
-        # DEVELOPMENT is the engineering handbook — full in max; in low only
-        # when the caller marks/keeps development context, else an on-demand
-        # pointer. Direct chat is not a reliable non-code signal by itself.
-        if (not low) or is_code_task:
-            parts.append("## DEVELOPMENT.md\n\n" + dev_text)
-        else:
-            on_demand.append("docs/DEVELOPMENT.md")
+        if context_mode in {"low", "nano"}:
+            parts.append(book_navigation(development_book) if development_book is not None
+                         else generate_doc_nav_map(dev_text, title="DEVELOPMENT.md", rel_path="docs/DEVELOPMENT.md"))
+        elif include_development:
+            development = "## DEVELOPMENT.md\n\n" + dev_text
 
     # README (user-facing) and CHECKLISTS (reviewers load their own copy) are not
     # inlined in the agent context in any mode.
-    on_demand.extend(["README.md", "docs/CHECKLISTS.md"])
-
-    if on_demand:
-        listing = ", ".join(f"`{p}`" for p in on_demand)
-        parts.append(
-            "## Reference docs available on demand\n\n"
-            f"Not inlined in the working context: {listing}. "
-            "Read them in full (untruncated) with `read_file(root=\"system_repo\", path=...)` when relevant."
-        )
-    return parts
+    books_note = (
+        "Reference books: `docs/ARCHITECTURE.md`, `docs/DEVELOPMENT.md`. "
+        "If a book is not inlined, read it on demand. "
+        if context_mode not in {"low", "nano"} else ""
+    )
+    parts.append(
+        "## Reference docs available on demand\n\n" + books_note
+        + "Not inlined in the working context: `README.md`, `docs/CHECKLISTS.md`. "
+        "Read them in full (untruncated) with `read_file(root=\"system_repo\", path=...)` when relevant."
+    )
+    return parts, development

@@ -1,9 +1,13 @@
-"""HTTP surface for ClawHub/OuroborosHub marketplace routes."""
+"""ClawHub routes, the frozen hub-installed listing and the local publication receipt.
+
+Skills from connected sources (the hub among them) install through ``gateway/skill_sources.py``;
+these routes keep the ClawHub registry's own browse/install/update/uninstall surface. No route here
+queues an automatic repair: fixing a skill is the owner's explicit "Ask Ouroboros to fix".
+"""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import pathlib
 from typing import Any, Dict, Optional
@@ -20,37 +24,19 @@ from ouroboros.marketplace.clawhub import (
     search as _registry_search,
 )
 from ouroboros.marketplace.install import (
-    _run_skill_review,
-    discard_payload_snapshot,
     install_skill,
-    restore_payload_state,
-    snapshot_payload_state,
     uninstall_skill,
     update_skill,
 )
 from ouroboros.marketplace.provenance import read_provenance
-from ouroboros.marketplace import ouroboroshub
 from ouroboros.skill_lifecycle_queue import (
     JobProgressTarget,
     LifecycleJobOptions,
     run_blocking_preserving_cancellation,
     run_lifecycle_job,
 )
-from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
 
 log = logging.getLogger(__name__)
-
-
-def _reconcile_deps_after_review(drive_root: pathlib.Path, skill_name: str) -> tuple[str, str]:
-    from ouroboros.skill_review_runner import _reconcile_deps_after_pass_review
-
-    return _reconcile_deps_after_pass_review(drive_root, skill_name)
-
-
-def _review_status_allows_skill_runtime(status: str) -> bool:
-    from ouroboros.skill_loader import review_status_allows_execution
-
-    return review_status_allows_execution(status)
 
 
 from ouroboros.gateway._helpers import (
@@ -187,8 +173,7 @@ async def api_marketplace_preview(request: Request) -> JSONResponse:
     except ClawHubClientError as exc:
         return _client_error_response(exc)
     except Exception as exc:
-        log.exception("marketplace preview failed")
-        return json_exception(exc)
+        return json_exception(exc, context="marketplace preview failed")
     return JSONResponse(payload)
 
 def _serialize_install_result(result: Any) -> Dict[str, Any]:
@@ -224,176 +209,6 @@ def _serialize_install_result(result: Any) -> Dict[str, Any]:
     payload["deps_fingerprint"] = getattr(result, "deps_fingerprint", {})
     payload["provenance"] = result.provenance
     return payload
-
-
-def _serialize_hub_install_result(result: Any) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
-        "ok": result.ok,
-        "sanitized_name": result.sanitized_name,
-        "error": result.error,
-        "provenance": result.provenance,
-        "summary": result.summary.to_dict() if result.summary else None,
-    }
-    if result.target_dir is not None:
-        payload["target_dir"] = str(result.target_dir)
-    return payload
-
-
-async def _apply_hub_review_and_deps(
-    payload: Dict[str, Any],
-    *,
-    drive_root: pathlib.Path,
-    repo_dir: pathlib.Path,
-    skill_name: str,
-    progress: JobProgressTarget,
-    review_log_label: str,
-    deps_log_label: str,
-) -> tuple[str, str, str]:
-    progress.set("Running tri-model review…")
-    status, findings, error = await run_blocking_preserving_cancellation(
-        _run_skill_review,
-        drive_root,
-        repo_dir,
-        skill_name,
-        log_label=review_log_label,
-    )
-    payload.update({"review_status": status, "review_findings": findings, "review_error": error})
-    deps_status = "not_required"
-    deps_error = ""
-    if _review_status_allows_skill_runtime(status) and not error:
-        progress.set("Installing dependencies…")
-        deps_status, deps_error = await run_blocking_preserving_cancellation(
-            _reconcile_deps_after_review,
-            drive_root,
-            skill_name,
-            log_label=deps_log_label,
-        )
-        payload.update({"deps_status": deps_status, "deps_error": deps_error})
-        if deps_status == "failed":
-            payload["ok"] = False
-            payload["error"] = deps_error
-    return status, error, deps_status
-
-
-def _resync_skill_schedules_quiet(drive_root: pathlib.Path) -> None:
-    """Mirror skill manifest schedules after a marketplace lifecycle change so a
-    removed/renamed/updated scheduled skill does not fire stale before the
-    periodic scheduler tick."""
-    try:
-        from supervisor.queue import resync_skill_schedules
-
-        resync_skill_schedules(drive_root)
-    except Exception:
-        log.debug("marketplace schedule resync failed", exc_info=True)
-
-
-def _auto_repair_marker_path(drive_root: pathlib.Path, skill_name: str) -> pathlib.Path:
-    from ouroboros.skill_loader import skill_state_dir
-
-    return skill_state_dir(drive_root, skill_name) / "auto_repair.json"
-
-
-def _maybe_enqueue_marketplace_auto_repair(
-    drive_root: pathlib.Path,
-    *,
-    skill_name: str,
-    source: str,
-    reason: str,
-    review_findings: list[Dict[str, Any]] | None = None,
-) -> bool:
-    """Queue one review-mediated repair task per marketplace payload hash."""
-
-    try:
-        from ouroboros.config import get_skills_repo_path
-        from ouroboros.skill_loader import find_skill
-        from supervisor.message_bus import get_bridge
-
-        skill = find_skill(drive_root, skill_name, repo_path=get_skills_repo_path())
-        if skill is None:
-            return False
-        content_hash = str(skill.content_hash or "").strip()
-        if not content_hash:
-            return False
-        marker_path = _auto_repair_marker_path(drive_root, skill.name)
-        marker = read_json_dict(marker_path) if marker_path.is_file() else {}
-        attempted = set(str(item) for item in (marker.get("attempted_hashes") or []))
-        if content_hash in attempted:
-            return False
-        try:
-            payload_root = skill.skill_dir.resolve().relative_to(pathlib.Path(drive_root).resolve()).as_posix()
-        except Exception:
-            return False
-        findings = list(review_findings or [])[:12]
-        prompt = (
-            "Repair the marketplace-installed skill payload.\n\n"
-            f"Source: {source}\n"
-            f"Skill: {skill.name}\n"
-            f"Payload root: {payload_root}\n"
-            f"Reason: {reason}\n"
-            f"Content hash: {content_hash}\n\n"
-            "Constraints:\n"
-            "- Edit only this skill payload.\n"
-            "- Do not enable the skill or grant secrets/permissions.\n"
-            "- Preserve marketplace provenance and dependency markers.\n"
-            "- Re-run skill review after edits and stop if review still blocks execution.\n\n"
-            "Review findings:\n"
-            + json.dumps(findings, ensure_ascii=False, indent=2)
-        )
-        bridge = get_bridge()
-        bridge.ui_send(
-            prompt,
-            broadcast=False,
-            suppress_chat_log=True,
-            task_constraint={
-                "mode": "skill_repair",
-                "skill_name": skill.name,
-                "payload_root": payload_root,
-                "allow_enable": False,
-                "allow_review": True,
-            },
-        )
-        attempted.add(content_hash)
-        atomic_write_json(
-            marker_path,
-            {
-                "schema_version": 1,
-                "skill": skill.name,
-                "source": source,
-                "attempted_hashes": sorted(attempted),
-                "last_attempted_hash": content_hash,
-                "last_enqueued_at": utc_now_iso(),
-            },
-            trailing_newline=True,
-        )
-        visible_task_id = f"skill_repair_{skill.name}_{content_hash[:8]}"
-        bridge.broadcast({
-            "type": "chat",
-            "role": "system",
-            "content": f"Repair task queued for {skill.name}. Ouroboros will inspect the skill payload and re-run review.",
-            "ts": utc_now_iso(),
-            "source": "skill_repair",
-            "system_type": "skill_repair",
-            "task_id": visible_task_id,
-        })
-        return True
-    except Exception:
-        log.debug("marketplace auto-repair enqueue failed for %s", skill_name, exc_info=True)
-        return False
-
-
-def _maybe_enqueue_repair_for_payload(drive_root: pathlib.Path, payload: Dict[str, Any], *, source: str) -> None:
-    if str(payload.get("review_status") or "") != "blockers":
-        return
-    skill_name = str(payload.get("sanitized_name") or "").strip()
-    if not skill_name:
-        return
-    _maybe_enqueue_marketplace_auto_repair(
-        drive_root,
-        skill_name=skill_name,
-        source=source,
-        reason="marketplace review blockers",
-        review_findings=list(payload.get("review_findings") or []),
-    )
 
 
 def _lifecycle_options(
@@ -467,13 +282,8 @@ async def api_marketplace_install(request: Request) -> JSONResponse:
             ),
         )
     except Exception as exc:
-        log.exception("marketplace install failed")
-        return json_exception(exc)
-    # Resync regardless of ok: a deps-failure can set ok=false after the payload
-    # was already installed on disk, changing scheduled-task readiness.
-    _resync_skill_schedules_quiet(drive_root)
+        return json_exception(exc, context="marketplace install failed")
     payload = _serialize_install_result(result)
-    _maybe_enqueue_repair_for_payload(drive_root, payload, source="clawhub")
     status = 200 if result.ok else (getattr(result, "error_status", 0) or 400)
     return JSONResponse(payload, status_code=status)
 
@@ -516,13 +326,8 @@ async def api_marketplace_update(request: Request) -> JSONResponse:
             ),
         )
     except Exception as exc:
-        log.exception("marketplace update failed")
-        return json_exception(exc)
-    # Resync regardless of ok: an update can mutate the payload on disk even when
-    # a follow-up deps step reports ok=false, changing scheduled-task readiness.
-    _resync_skill_schedules_quiet(drive_root)
+        return json_exception(exc, context="marketplace update failed")
     payload = _serialize_install_result(result)
-    _maybe_enqueue_repair_for_payload(drive_root, payload, source="clawhub")
     status = 200 if result.ok else (getattr(result, "error_status", 0) or 400)
     return JSONResponse(payload, status_code=status)
 
@@ -540,7 +345,7 @@ def _validate_path_param_name(name: str) -> Optional[str]:
 
 
 def _installed_skill_payload(skill: Any, drive_root: pathlib.Path, *, provenance: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    from ouroboros.skill_loader import grant_status_for_skill, skill_review_gate
+    from ouroboros.skill_loader import grant_status_for_skill
 
     try:
         rel_skill_dir = skill.skill_dir.resolve().relative_to(drive_root.resolve())
@@ -548,7 +353,7 @@ def _installed_skill_payload(skill: Any, drive_root: pathlib.Path, *, provenance
     except Exception:
         payload_root = ""
     stale = skill.review.is_stale_for(skill.content_hash)
-    gate = skill_review_gate(skill.review.status, stale=stale)
+    gate = skill.review.gate_for(skill.content_hash)
     payload = {
         "name": skill.name,
         "type": skill.manifest.type,
@@ -570,13 +375,26 @@ def _installed_skill_payload(skill: Any, drive_root: pathlib.Path, *, provenance
 
 def _installed_skills_for_source(drive_root: pathlib.Path, source: str) -> list[Dict[str, Any]]:
     from ouroboros.config import get_skills_repo_path
+    from ouroboros.skill_install_record import read_install_record
     from ouroboros.skill_loader import discover_skills
 
     out: list[Dict[str, Any]] = []
     for skill in discover_skills(drive_root, repo_path=get_skills_repo_path()):
-        if skill.source != source:
+        hub_record = None
+        if source == "ouroboroshub" and not skill.identity_collision:
+            hub_record = read_install_record(drive_root, skill.name)
+        if source == "ouroboroshub":
+            from_hub = (((hub_record or {}).get("source") or {}).get("kind") == "hub" or
+                        (hub_record is None and skill.location == source))
+            if not from_hub:
+                continue
+        elif skill.source != source:
             continue
-        provenance = read_provenance(drive_root, skill.name) or {} if source == "clawhub" else None
+        provenance = None
+        if source == "clawhub":
+            provenance = {}
+            if not bool(getattr(skill, "identity_collision", False)):
+                provenance = read_provenance(drive_root, skill.name) or {}
         out.append(_installed_skill_payload(skill, drive_root, provenance=provenance))
     return out
 
@@ -605,12 +423,7 @@ async def api_marketplace_uninstall(request: Request) -> JSONResponse:
             options=_lifecycle_options("Uninstalled", "uninstall failed", object_result=True),
         )
     except Exception as exc:
-        log.exception("marketplace uninstall failed")
-        return json_exception(exc)
-    if result.ok:
-        # The skill is gone; drop its scheduled tasks now so the scheduler does
-        # not fire a deleted skill before the next periodic resync.
-        _resync_skill_schedules_quiet(drive_root)
+        return json_exception(exc, context="marketplace uninstall failed")
     return JSONResponse(
         {
             "ok": result.ok,
@@ -627,288 +440,32 @@ async def api_marketplace_installed(request: Request) -> JSONResponse:
     out = _installed_skills_for_source(drive_root, "clawhub")
     return JSONResponse({"count": len(out), "skills": out})
 
-async def api_ouroboroshub_catalog(request: Request) -> JSONResponse:
-    query = str(request.query_params.get("q") or request.query_params.get("query") or "").strip()
-    try:
-        results = await asyncio.to_thread(ouroboroshub.search, query)
-    except Exception as exc:
-        log.warning("OuroborosHub catalog failed: %s", exc, exc_info=True)
-        return json_exception(exc, 502)
-    return JSONResponse({"query": query, "count": len(results), "results": [item.to_dict() for item in results]})
 
-
-async def api_ouroboroshub_preview(request: Request) -> JSONResponse:
-    slug = str(request.path_params.get("slug") or "").strip()
-    if not slug:
-        return json_error("missing slug", 400)
-    try:
-        summary = await asyncio.to_thread(ouroboroshub.info, slug)
-    except Exception as exc:
-        return json_exception(exc, 404)
-    return JSONResponse({"summary": summary.to_dict(), "files": summary.files})
-
-
-async def api_ouroboroshub_install(request: Request) -> JSONResponse:
-    body = await request_json_or(request, {}, exceptions=(Exception,))
-    body = body if isinstance(body, dict) else {}
-    slug = str(body.get("slug") or "").strip()
-    if not slug:
-        return json_error("missing slug", 400)
-    overwrite = _coerce_bool(body.get("overwrite"), False)
-    auto_review = _coerce_bool(body.get("auto_review"), True)
-    drive_root = _request_drive_root(request)
-    repo_dir = _request_repo_dir(request)
-    install_progress = JobProgressTarget()
-
-    async def _run_install() -> Dict[str, Any]:
-        from ouroboros.skill_loader import _sanitize_skill_name
-
-        sanitized = _sanitize_skill_name(slug)
-        target_dir = drive_root / "skills" / "ouroboroshub" / sanitized
-        rollback_snapshot = snapshot_payload_state(drive_root, sanitized, target_dir)
-        install_progress.set("Downloading from OuroborosHub…")
-        try:
-            result = await run_blocking_preserving_cancellation(
-                ouroboroshub.install,
-                slug,
-                overwrite=overwrite,
-                log_label="OuroborosHub install lifecycle operation",
-            )
-            payload = _serialize_hub_install_result(result)
-            deps_status = ""
-            if result.ok and auto_review:
-                _status, _error, deps_status = await _apply_hub_review_and_deps(
-                    payload,
-                    drive_root=drive_root,
-                    repo_dir=repo_dir,
-                    skill_name=result.sanitized_name,
-                    progress=install_progress,
-                    review_log_label="OuroborosHub install review lifecycle operation",
-                    deps_log_label="OuroborosHub install dependency lifecycle operation",
-                )
-            if result.ok and deps_status == "failed":
-                restore_payload_state(rollback_snapshot)
-            else:
-                discard_payload_snapshot(rollback_snapshot)
-            return payload
-        except Exception:
-            restore_payload_state(rollback_snapshot)
-            raise
-
-    payload = await run_lifecycle_job(
-        kind="install",
-        target=slug,
-        source="ouroboroshub",
-        message=f"Installing {slug}",
-        runner=_run_install,
-        options=_lifecycle_options(
-            "Installed as",
-            "install failed",
-            progress_target=install_progress,
-        ),
-    )
-    # Resync regardless of ok: install + deps can leave the payload on disk with
-    # ok=false, changing scheduled-task readiness.
-    _resync_skill_schedules_quiet(drive_root)
-    _maybe_enqueue_repair_for_payload(drive_root, payload, source="ouroboroshub")
-    return JSONResponse(payload, status_code=200 if payload.get("ok") else 400)
-
-
-async def api_ouroboroshub_update(request: Request) -> JSONResponse:
-    name = str(request.path_params.get("name") or "").strip()
-    err = _validate_path_param_name(name)
-    if err:
-        return json_error(err, 400)
-    drive_root = _request_drive_root(request)
-    repo_dir = _request_repo_dir(request)
-    update_progress = JobProgressTarget()
-
-    async def _run_update() -> Dict[str, Any]:
-        target_dir = drive_root / "skills" / "ouroboroshub" / name
-        marker = target_dir / ".ouroboroshub.json"
-        if not target_dir.exists():
-            return _serialize_hub_install_result(
-                ouroboroshub.HubInstallResult(
-                    False,
-                    name,
-                    error=f"{name} is not installed",
-                )
-            )
-        if not marker.is_file():
-            return _serialize_hub_install_result(
-                ouroboroshub.HubInstallResult(
-                    False,
-                    name,
-                    error="missing OuroborosHub provenance marker",
-                    target_dir=target_dir,
-                )
-            )
-        marker_data = read_json_dict(marker) or {}
-        from ouroboros.skill_loader import _sanitize_skill_name
-
-        marker_name = str(marker_data.get("sanitized_name") or "").strip()
-        marker_slug = str(marker_data.get("slug") or "").strip()
-        if (
-            marker_data.get("schema_version") != 1
-            or str(marker_data.get("source") or "") != "ouroboroshub"
-            or marker_name != name
-            or not marker_slug
-            or _sanitize_skill_name(marker_slug) != name
-        ):
-            return _serialize_hub_install_result(
-                ouroboroshub.HubInstallResult(
-                    False,
-                    name,
-                    error="invalid OuroborosHub provenance marker",
-                    target_dir=target_dir,
-                )
-            )
-        rollback_snapshot = snapshot_payload_state(drive_root, name, target_dir)
-        was_live = False
-        async def _restore_previous_live(log_label: str) -> None:
-            if not was_live:
-                return
-            try:
-                from ouroboros.config import load_settings
-                from ouroboros.extension_loader import reconcile_extension
-                await run_blocking_preserving_cancellation(
-                    reconcile_extension,
-                    name,
-                    drive_root,
-                    load_settings,
-                    log_label=log_label,
-                )
-            except Exception:
-                log.debug("OuroborosHub failed-update re-reconcile failed for %s", name, exc_info=True)
-
-        try:
-            try:
-                from ouroboros.extension_loader import is_extension_live, unload_extension
-
-                was_live = bool(is_extension_live(name, drive_root))
-                update_progress.set("Unloading existing extension…")
-                await run_blocking_preserving_cancellation(
-                    unload_extension,
-                    name,
-                    log_label="OuroborosHub update extension unload lifecycle operation",
-                )
-            except Exception:
-                log.debug("OuroborosHub pre-update extension unload failed for %s", name, exc_info=True)
-            update_progress.set("Downloading from OuroborosHub…")
-            result = await run_blocking_preserving_cancellation(
-                ouroboroshub.install,
-                marker_slug,
-                overwrite=True,
-                log_label="OuroborosHub update lifecycle operation",
-            )
-            payload = _serialize_hub_install_result(result)
-            if result.ok:
-                status, error, deps_status = await _apply_hub_review_and_deps(
-                    payload,
-                    drive_root=drive_root,
-                    repo_dir=repo_dir,
-                    skill_name=result.sanitized_name,
-                    progress=update_progress,
-                    review_log_label="OuroborosHub update review lifecycle operation",
-                    deps_log_label="OuroborosHub update dependency lifecycle operation",
-                )
-                if was_live and _review_status_allows_skill_runtime(status) and not error and deps_status != "failed":
-                    try:
-                        from ouroboros.config import load_settings
-                        from ouroboros.extension_loader import reconcile_extension
-
-                        update_progress.set("Reloading extension…")
-                        live_state = await run_blocking_preserving_cancellation(
-                            reconcile_extension,
-                            result.sanitized_name,
-                            drive_root,
-                            load_settings,
-                            log_label="OuroborosHub update extension reload lifecycle operation",
-                        )
-                        payload.update({
-                            "extension_action": live_state.get("action"),
-                            "extension_reason": live_state.get("reason"),
-                        })
-                    except Exception:
-                        log.debug("OuroborosHub post-update reconcile failed for %s", name, exc_info=True)
-                if deps_status == "failed" or error or not _review_status_allows_skill_runtime(status):
-                    restore_payload_state(rollback_snapshot)
-                    payload["rolled_back"] = True
-                    await _restore_previous_live("OuroborosHub non-executable update restore lifecycle operation")
-                else:
-                    discard_payload_snapshot(rollback_snapshot)
-            elif was_live:
-                restore_payload_state(rollback_snapshot)
-                payload["rolled_back"] = True
-                await _restore_previous_live("OuroborosHub failed-update extension restore lifecycle operation")
-            else:
-                discard_payload_snapshot(rollback_snapshot)
-            return payload
-        except Exception as exc:
-            restore_payload_state(rollback_snapshot)
-            await _restore_previous_live("OuroborosHub exception-update extension restore lifecycle operation")
-            log.warning("OuroborosHub update failed after snapshot for %s", name, exc_info=True)
-            payload = _serialize_hub_install_result(
-                ouroboroshub.HubInstallResult(
-                    False,
-                    name,
-                    error=f"Update failed: {type(exc).__name__}: {exc}",
-                    target_dir=target_dir,
-                )
-            )
-            payload["rolled_back"] = True
-            return payload
-
-    payload = await run_lifecycle_job(
-        kind="update",
-        target=name,
-        source="ouroboroshub",
-        message=f"Updating {name}",
-        runner=_run_update,
-        options=_lifecycle_options(
-            "Updated",
-            "update failed",
-            progress_target=update_progress,
-        ),
-    )
-    # Resync regardless of ok: an update can mutate the payload on disk even when
-    # a follow-up deps step reports ok=false, changing scheduled-task readiness.
-    _resync_skill_schedules_quiet(drive_root)
-    _maybe_enqueue_repair_for_payload(drive_root, payload, source="ouroboroshub")
-    return JSONResponse(payload, status_code=200 if payload.get("ok") else 400)
-
-async def api_ouroboroshub_installed(request: Request) -> JSONResponse:
-    drive_root = _request_drive_root(request)
-    out = _installed_skills_for_source(drive_root, "ouroboroshub")
+async def api_hub_installed(request: Request) -> JSONResponse:
+    """Frozen compatibility list: hub-source installs and the legacy hub bucket, in the registry shape."""
+    out = await asyncio.to_thread(_installed_skills_for_source, _request_drive_root(request), "ouroboroshub")
     return JSONResponse({"count": len(out), "skills": out})
 
+async def api_skill_publication_clear(request: Request) -> JSONResponse:
+    """Forget the displayed publication receipt through its existing local receipt owner."""
+    from ouroboros.marketplace.provenance import PublicationRecordChanged, clear_publication_record
 
-async def api_ouroboroshub_uninstall(request: Request) -> JSONResponse:
-    sanitized = str(request.path_params.get("name") or "").strip()
-    err = _validate_path_param_name(sanitized)
-    if err:
-        return json_error(err, 400)
-    drive_root = _request_drive_root(request)
-
-    async def _run_uninstall() -> Dict[str, Any]:
-        result = await run_blocking_preserving_cancellation(
-            ouroboroshub.uninstall,
-            sanitized,
-            log_label="OuroborosHub uninstall lifecycle operation",
-        )
-        return {"ok": result.ok, "sanitized_name": result.sanitized_name, "error": result.error}
-
-    payload = await run_lifecycle_job(
-        kind="uninstall",
-        target=sanitized,
-        source="ouroboroshub",
-        message=f"Uninstalling {sanitized}",
-        runner=_run_uninstall,
-        options=_lifecycle_options("Uninstalled", "uninstall failed"),
-    )
-    if payload.get("ok"):
-        _resync_skill_schedules_quiet(drive_root)
-    return JSONResponse(payload, status_code=200 if payload.get("ok") else 400)
+    name = str(request.path_params.get("skill") or "").strip()
+    if error := _validate_path_param_name(name):
+        return json_error(error, 400)
+    body = await request_json_or(request, {}, exceptions=(Exception,))
+    expected = body.get("expected_published") if isinstance(body, dict) else None
+    if not isinstance(expected, dict):
+        return json_error("expected_published must contain the displayed publication receipt", 400)
+    try:
+        cleared = await asyncio.to_thread(clear_publication_record, _request_drive_root(request), name, expected)
+    except PublicationRecordChanged as exc:
+        return JSONResponse({"ok": False, "code": "publication_changed", "error": str(exc)}, status_code=409)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "code": "publication_invalid", "error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return json_exception(exc, context="Clearing local publication failed")
+    return JSONResponse({"ok": True, "sanitized_name": name, "publication_cleared": cleared})
 
 
 __all__ = [
@@ -919,10 +476,6 @@ __all__ = [
     "api_marketplace_update",
     "api_marketplace_uninstall",
     "api_marketplace_installed",
-    "api_ouroboroshub_catalog",
-    "api_ouroboroshub_preview",
-    "api_ouroboroshub_install",
-    "api_ouroboroshub_update",
-    "api_ouroboroshub_installed",
-    "api_ouroboroshub_uninstall",
+    "api_hub_installed",
+    "api_skill_publication_clear",
 ]

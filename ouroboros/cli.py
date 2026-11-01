@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import pathlib
 import subprocess
@@ -12,6 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 
@@ -97,8 +100,13 @@ class OuroborosHTTPClient:
         except urllib.error.URLError as exc:
             raise ConnectionCLIError(f"cannot download from Ouroboros server at {self.base_url}: {exc}") from exc
 
-    def stream_sse(self, path: str, timeout: float = 120.0) -> Iterator[Dict[str, Any]]:
-        req = urllib.request.Request(self.base_url + path, headers={"Accept": "text/event-stream"})
+    def stream_sse(self, path: str, timeout: float = 120.0, *, body: Optional[dict] = None) -> Iterator[Dict[str, Any]]:
+        headers = {"Accept": "text/event-stream"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(self.base_url + path, headers=headers,
+            data=json.dumps(body).encode("utf-8") if body is not None else None,
+            method="POST" if body is not None else "GET")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 yield from _parse_sse_lines(resp)
@@ -110,16 +118,36 @@ class OuroborosHTTPClient:
 
 
 def _server_command(args: argparse.Namespace) -> int:
+    old_argv = sys.argv[:]
+    try:
+        import json
+        import __main__
+
+        # Preserve module-mode launches. When started via `python -m
+        # ouroboros.cli server`, sys.argv[0] is the cli.py path (ends with
+        # .py), so the old check re-exec'd a BARE SCRIPT (`python cli.py
+        # server`) — which puts ouroboros/ (not the repo root) on sys.path[0]
+        # and breaks every `from ouroboros...` import, so the self-restart
+        # fails. __main__.__spec__.name carries the real `-m` module name.
+        spec_name = getattr(getattr(__main__, "__spec__", None), "name", "") or ""
+        if spec_name.startswith("ouroboros"):
+            reexec_argv = ["-m", spec_name, *old_argv[1:]]
+        elif str(old_argv[0]).endswith(".py"):
+            reexec_argv = old_argv
+        else:
+            reexec_argv = ["-m", "ouroboros.cli", *old_argv[1:]]
+        os.environ["OUROBOROS_SERVER_REEXEC_ARGV_JSON"] = json.dumps(reexec_argv)
+    except Exception:
+        pass
     if args.host:
         os.environ["OUROBOROS_SERVER_HOST"] = args.host
     if args.port:
         os.environ["OUROBOROS_SERVER_PORT"] = str(args.port)
     import server
 
-    old_argv = sys.argv[:]
     try:
         sys.argv = [old_argv[0]]
-        return int(server.main())
+        return server.executable_main()
     finally:
         sys.argv = old_argv
 
@@ -137,26 +165,88 @@ def _status_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_prompt(args: argparse.Namespace) -> str:
+    """Positional prompt XOR ``--prompt-file`` (C5 E2BIG hygiene).
+
+    A benchmark-scale prompt on argv risks the kernel's exec limits, so bulk
+    prompts travel as a file — or stdin via ``--prompt-file -`` — and the two
+    transports are exclusive so a stray positional word can never silently
+    shadow (or be shadowed by) the file.
+    """
+    positional = " ".join(args.prompt).strip()
+    prompt_file = str(getattr(args, "prompt_file", "") or "").strip()
+    if prompt_file and positional:
+        raise CLIError("pass the prompt either positionally or via --prompt-file, not both")
+    if prompt_file:
+        if prompt_file == "-":
+            return sys.stdin.read().strip()
+        try:
+            return pathlib.Path(prompt_file).expanduser().read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise CLIError(f"--prompt-file {prompt_file!r} is unreadable: {exc}")
+    return positional
+
+
+def _effort_field(args: argparse.Namespace) -> Dict[str, str]:
+    """``--reasoning-effort`` as a body field: absent = the Task default; a supplied
+    value is checked against the effort scale before any client or server contact."""
+    raw = getattr(args, "reasoning_effort", None)
+    if raw is None:
+        return {}
+    from ouroboros.settings_scales import requested_effort
+
+    try:
+        return {"reasoning_effort": requested_effort(raw)}
+    except ValueError as exc:
+        raise CLIError(f"--reasoning-effort: {exc}")
+
+
 def _run_command(args: argparse.Namespace) -> int:
-    prompt = " ".join(args.prompt).strip()
+    prompt = _resolve_prompt(args)
     if not prompt:
         raise CLIError("run requires a prompt")
     if str(args.delegation_role or "root").strip().lower() != "root":
         raise CLIError("delegation_role=subagent is only allowed through the internal schedule_subagent tool")
+    effort = _effort_field(args)
+    execution_timeout = float(getattr(args, "execution_timeout", 0) or 0)
+    if not math.isfinite(execution_timeout) or execution_timeout < 0:
+        raise CLIError("--execution-timeout must be finite and non-negative (0 adds no limit)")
+    user_metadata: Dict[str, Any] = {}
+    raw_metadata = str(getattr(args, "task_metadata_json", "") or "").strip()
+    if raw_metadata:
+        try:
+            parsed_metadata = json.loads(raw_metadata)
+        except json.JSONDecodeError as exc:
+            raise CLIError(f"--task-metadata-json is not valid JSON: {exc}")
+        if not isinstance(parsed_metadata, dict):
+            raise CLIError("--task-metadata-json must be a JSON object")
+        user_metadata = parsed_metadata
     client = _client(args, start=args.start)
     attachments = [{"path": str(pathlib.Path(p).expanduser())} for p in args.attach]
+    disabled_tools = []
+    for raw in args.disable_tools or []:
+        disabled_tools.extend(part.strip() for part in str(raw or "").split(",") if part.strip())
     body = {
         "description": prompt,
+        "title": getattr(args, "title", "") or "",
         "workspace_root": args.workspace or "",
         "workspace_mode": "external" if args.workspace else "",
+        "project_id": getattr(args, "project_id", "") or "",
         "memory_mode": args.memory_mode or ("forked" if args.workspace else "shared"),
         "attachments": attachments,
         "actor_id": args.actor_id,
-        "metadata": {"delegation_role": args.delegation_role, "source": "cli"},
+        # Host-owned service keys are spread LAST so --task-metadata-json can
+        # never forge delegation_role/source (subagent forgery stays blocked).
+        "metadata": {**user_metadata, "delegation_role": args.delegation_role, "source": "cli"},
         "source": "cli",
+        **effort,
     }
+    if disabled_tools:
+        body["disabled_tools"] = list(dict.fromkeys(disabled_tools))
     if float(args.timeout or 0) > 0:
         body["timeout_sec"] = float(args.timeout or 0)
+    if execution_timeout > 0:
+        body["execution_timeout_sec"] = execution_timeout
     created = client.request("POST", "/api/tasks", body)
     task_id = str(created.get("task_id") or "")
     if not task_id:
@@ -176,7 +266,14 @@ def _run_command(args: argparse.Namespace) -> int:
     else:
         _watch_task(client, task_id, jsonl=args.jsonl, quiet=args.quiet, timeout_sec=wait_timeout)
         result = client.request("GET", f"/api/tasks/{urllib.parse.quote(task_id)}")
+    result = _await_cost_finality(client, task_id, result)
     exit_code = 0 if _is_terminal_success(result) else 1
+    if not args.jsonl:
+        from ouroboros.task_finalization import provider_terminal_body, terminal_notice_text
+
+        notice = terminal_notice_text(result)
+        if notice:
+            print(provider_terminal_body("", notice), file=sys.stderr)
     if args.patch_out:
         patch = _patch_from_result(client, task_id, result, strict=True)
         pathlib.Path(args.patch_out).expanduser().write_text(patch, encoding="utf-8")
@@ -228,7 +325,11 @@ def _chat_send_command(args: argparse.Namespace) -> int:
 
 
 def _chat_history_command(args: argparse.Namespace) -> int:
-    _print_json(_client(args).request("GET", f"/api/chat/history?limit={int(args.limit)}"))
+    # `n_human` is the server's quota for conversation (non-progress) rows. An
+    # omitted (or non-positive) --limit sends no quota so the server's own window
+    # governs, the way the server already treats a non-positive legacy `limit`.
+    query = f"?n_human={int(args.limit)}" if (args.limit or 0) > 0 else ""
+    _print_json(_client(args).request("GET", f"/api/chat/history{query}"))
     return 0
 
 
@@ -245,6 +346,21 @@ def _logs_tail_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _log_row_identity(entry: Dict[str, Any]) -> tuple:
+    """Content-identity dedupe marker for `logs follow` (P2 review fix).
+
+    `_line` in /api/logs responses is window-relative since the bounded tail
+    read: on a >512KB log the window shifts with every append, so a positional
+    marker re-prints already-seen rows each poll (and can silently skip a new
+    row that collides with a stale marker). Identity = source root + ts + a
+    stable hash of the row with the positional fields stripped."""
+    payload = {key: value for key, value in entry.items() if key not in ("_line", "_source_root")}
+    digest = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return (str(entry.get("_source_root") or ""), str(entry.get("ts") or ""), digest)
+
+
 def _logs_follow_command(args: argparse.Namespace) -> int:
     seen = set()
     client = _client(args)
@@ -252,7 +368,7 @@ def _logs_follow_command(args: argparse.Namespace) -> int:
         data = client.request("GET", f"/api/logs/{urllib.parse.quote(args.name)}?limit={int(args.limit)}")
         entries = list(data.get("entries") or [])
         for entry in entries:
-            marker = (str(entry.get("_source_root") or ""), int(entry.get("_line") or 0), str(entry.get("ts") or ""))
+            marker = _log_row_identity(entry)
             if marker in seen:
                 continue
             seen.add(marker)
@@ -270,7 +386,7 @@ def _evolve_command(args: argparse.Namespace) -> int:
         runtime_mode = str(client.request("GET", "/api/state").get("runtime_mode", "") or "")
         if runtime_mode == "light":
             _print_json({
-                "error": "evolution requires runtime_mode 'advanced' or 'pro'; refused in 'light' mode",
+                "error": "evolution requires runtime_mode 'advanced', 'pro', or 'cyber_pro'; refused in 'light' mode",
                 "runtime_mode": runtime_mode,
             })
             return 1
@@ -287,6 +403,7 @@ def _evolve_command(args: argparse.Namespace) -> int:
 
 
 def _schedule_command(args: argparse.Namespace) -> int:
+    effort = _effort_field(args)  # only `add` has the flag; checked before the client exists
     client = _client(args)
     if args.schedule_command == "list":
         _print_json(client.request("GET", "/api/schedules"))
@@ -298,7 +415,7 @@ def _schedule_command(args: argparse.Namespace) -> int:
             "description": prompt,
             "timezone": args.timezone or "",
             "trigger": {"type": "cron", "expr": args.cron},
-            "task": {"type": "task", "text": prompt, "description": prompt},
+            "task": {"type": "task", "text": prompt, "description": prompt, **effort},
         }
         _print_json(client.request("POST", "/api/schedules", body))
         return 0
@@ -358,26 +475,39 @@ def _skills_command(args: argparse.Namespace) -> int:
 def _marketplace_command(args: argparse.Namespace) -> int:
     client = _client(args)
     hub = args.hub
+    query, slug, name = (getattr(args, key, "") or "" for key in ("query", "slug", "name"))
     if hub == "clawhub":
         paths = {
-            "search": f"/api/marketplace/clawhub/search?q={urllib.parse.quote(args.query or '')}",
+            "search": f"/api/marketplace/clawhub/search?q={urllib.parse.quote(query)}",
             "installed": "/api/marketplace/clawhub/installed",
-            "preview": f"/api/marketplace/clawhub/preview/{urllib.parse.quote(args.slug)}",
+            "preview": f"/api/marketplace/clawhub/preview/{urllib.parse.quote(slug)}",
             "install": "/api/marketplace/clawhub/install",
-            "update": f"/api/marketplace/clawhub/update/{urllib.parse.quote(args.name)}",
-            "uninstall": f"/api/marketplace/clawhub/uninstall/{urllib.parse.quote(args.name)}",
+            "update": f"/api/marketplace/clawhub/update/{urllib.parse.quote(name)}",
+            "uninstall": f"/api/marketplace/clawhub/uninstall/{urllib.parse.quote(name)}",
         }
-    else:
+    else:  # ouroboroshub is the compatibility spelling of sources
+        if args.marketplace_command in {"install", "preview"} and "/" not in slug:
+            offered = client.request("GET", f"/api/skill-catalog/search?q={urllib.parse.quote(slug)}")
+            item = next((item for item in offered.get("items", []) if item.get("name") == slug and
+                         item.get("source_id") in {"ouroboros", "ouroboros-community"}), None)
+            if item is None:
+                raise CLIError(f"The public hub does not offer {slug!r}; use a catalog id <source>/<name>.")
+            slug = item["id"]
+        item = urllib.parse.quote(slug, safe="/")
         paths = {
-            "search": f"/api/marketplace/ouroboroshub/catalog?q={urllib.parse.quote(args.query or '')}",
-            "installed": "/api/marketplace/ouroboroshub/installed",
-            "preview": f"/api/marketplace/ouroboroshub/preview/{urllib.parse.quote(args.slug)}",
-            "install": "/api/marketplace/ouroboroshub/install",
-            "update": f"/api/marketplace/ouroboroshub/update/{urllib.parse.quote(args.name)}",
-            "uninstall": f"/api/marketplace/ouroboroshub/uninstall/{urllib.parse.quote(args.name)}",
+            "search": f"/api/skill-catalog/search?q={urllib.parse.quote(query)}",
+            "installed": "/api/marketplace/ouroboroshub/installed" if hub == "ouroboroshub" else "/api/extensions",
+            "preview": f"/api/skill-catalog/item/{item}",
+            "install": "/api/skill-catalog/install",
+            "update": f"/api/skills/{urllib.parse.quote(name)}/update",
+            "uninstall": f"/api/skills/{urllib.parse.quote(name)}/uninstall",
         }
     method = "GET" if args.marketplace_command in {"search", "installed", "preview"} else "POST"
-    body = {"slug": getattr(args, "slug", "")} if args.marketplace_command == "install" else {}
+    body: dict = {}
+    if args.marketplace_command == "install":
+        body = {"slug": slug} if hub == "clawhub" else {"id": slug}
+    elif args.marketplace_command == "update" and hub != "clawhub":
+        body = {"mode": "replace"}
     _print_json(client.request(method, paths[args.marketplace_command], body if method == "POST" else None))
     return 0
 
@@ -405,6 +535,19 @@ def _mcp_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _telegram_command(args: argparse.Namespace) -> int:
+    from ouroboros.telegram_bootstrap import launch_telegram_runtime
+
+    return launch_telegram_runtime(
+        host=args.host or "0.0.0.0",
+        port=int(args.port or 8765),
+        command_mode=str(args.command_mode or "full_access"),
+        timeout=float(args.timeout or 600.0),
+        review_retries=int(args.review_retries if args.review_retries is not None else 0),
+        review_retry_delay=float(args.review_retry_delay or 75.0),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ouroboros")
     parser.add_argument("--url", default="", help="Ouroboros server URL")
@@ -423,18 +566,36 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="run a managed headless task")
     run.add_argument("--start", action="store_true", help="start a local server if attach fails")
     run.add_argument("--workspace", default="", help="external workspace root")
+    run.add_argument("--project-id", default="", help="per-project facts scope id (else derived from the workspace path)")
+    run.add_argument("--title", default="", help="owner-facing task name (else derived from the prompt's first line)")
     run.add_argument("--memory-mode", choices=["shared", "forked", "empty"], default="")
     run.add_argument("--attach", action="append", default=[])
     run.add_argument("--jsonl", action="store_true")
     run.add_argument("--quiet", action="store_true")
     run.add_argument("--no-stream", action="store_true")
     run.add_argument("--detach", action="store_true", help="create the task and print its task id without waiting")
-    run.add_argument("--timeout", type=float, default=0.0, help="maximum seconds to wait for task completion (0 = no limit)")
+    run.add_argument("--timeout", type=float, default=0.0,
+                     help="calendar seconds from submission, queue included; also bounds this wait (0 = no limit)")
+    run.add_argument("--execution-timeout", type=float, default=0.0,
+                     help="execution seconds excluding queue and confirmed quota/Pause/sleep; tools count (0 = no limit)")
     run.add_argument("--patch", action="store_true", help="print workspace patch instead of final answer")
     run.add_argument("--patch-out", default="", help="write workspace patch to this path")
     run.add_argument("--result-json-out", default="", help="write final task result JSON to this path")
+    run.add_argument("--disable-tools", action="append", default=[], help="comma-separated tool names to withhold from this task")
+    run.add_argument(
+        "--task-metadata-json", default="",
+        help="JSON object merged into the task metadata (e.g. budget_profile); "
+        "host-owned keys delegation_role/source cannot be overridden")
     run.add_argument("--actor-id", default="cli")
+    run.add_argument(
+        "--reasoning-effort", default=None,
+        help="explicit reasoning effort this root task starts on (a tier of the effort scale); "
+        "omitted = the configured Task default")
     run.add_argument("--delegation-role", default="root")
+    run.add_argument(
+        "--prompt-file", default="",
+        help="read the task prompt from this file ('-' = stdin); mutually "
+        "exclusive with the positional prompt (E2BIG hygiene for bulk prompts)")
     run.add_argument("prompt", nargs=argparse.REMAINDER)
     run.set_defaults(func=_run_command)
 
@@ -461,7 +622,10 @@ def build_parser() -> argparse.ArgumentParser:
     chat_send.add_argument("text", nargs=argparse.REMAINDER)
     chat_send.set_defaults(func=_chat_send_command)
     chat_history = chat_sub.add_parser("history")
-    chat_history.add_argument("--limit", type=int, default=100)
+    chat_history.add_argument(
+        "--limit", type=int, default=None,
+        help="conversation rows to fetch (server-capped; omitted, zero or negative = the server's default window)",
+    )
     chat_history.set_defaults(func=_chat_history_command)
 
     logs = subparsers.add_parser("logs", help="read runtime logs")
@@ -496,6 +660,8 @@ def build_parser() -> argparse.ArgumentParser:
     schedule_add.add_argument("--name", required=True)
     schedule_add.add_argument("--cron", required=True, help="5-field cron expression")
     schedule_add.add_argument("--timezone", default="", help="Optional IANA timezone")
+    schedule_add.add_argument("--reasoning-effort", default=None,
+                              help="explicit starting effort of each fired task; omitted = the Task default")
     schedule_add.add_argument("prompt", nargs="*", help="Task prompt to enqueue")
     schedule_add.set_defaults(func=_schedule_command)
     schedule_remove = schedule_sub.add_parser("remove")
@@ -507,6 +673,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_marketplace_parser(subparsers)
     _add_local_model_parser(subparsers)
     _add_mcp_parser(subparsers)
+    telegram = subparsers.add_parser("telegram", help="start the server and enable the Telegram bridge")
+    telegram.add_argument("--host", default="", help="host/interface to bind for the local server")
+    telegram.add_argument("--port", type=int, default=0, help="port to bind for the local server")
+    telegram.add_argument("--command-mode", default="full_access", help="Telegram bridge command mode")
+    telegram.add_argument("--timeout", type=float, default=600.0, help="bootstrap timeout in seconds")
+    telegram.add_argument("--review-retries", type=int, default=0, help="review retry count")
+    telegram.add_argument("--review-retry-delay", type=float, default=75.0, help="delay between review retries")
+    telegram.set_defaults(func=_telegram_command)
     return parser
 
 
@@ -521,10 +695,10 @@ def _add_settings_parser(subparsers: argparse._SubParsersAction) -> None:
     setp.add_argument("value")
     setp.set_defaults(func=_settings_set_command)
     mode = sub.add_parser("runtime-mode")
-    mode.add_argument("mode", choices=["light", "advanced", "pro"])
+    mode.add_argument("mode", choices=["light", "advanced", "pro", "cyber_pro"])
     mode.set_defaults(func=_owner_runtime_mode_command)
     context_mode = sub.add_parser("context-mode")
-    context_mode.add_argument("mode", choices=["low", "max"])
+    context_mode.add_argument("mode", choices=["nano", "low", "max"])
     context_mode.set_defaults(func=_owner_context_mode_command)
     grant = sub.add_parser("auto-grant")
     grant.add_argument("enabled", choices=["on", "off"])
@@ -548,7 +722,7 @@ def _add_skills_parser(subparsers: argparse._SubParsersAction) -> None:
 
 def _add_marketplace_parser(subparsers: argparse._SubParsersAction) -> None:
     market = subparsers.add_parser("marketplace", help="marketplace wrappers")
-    market.add_argument("hub", choices=["clawhub", "ouroboroshub"])
+    market.add_argument("hub", choices=["clawhub", "sources", "ouroboroshub"], help="ouroboroshub is an alias of sources")
     sub = market.add_subparsers(dest="marketplace_command", required=True)
     search = sub.add_parser("search")
     search.add_argument("query", nargs="?")
@@ -608,15 +782,38 @@ def _client(args: argparse.Namespace, *, start: bool = False) -> OuroborosHTTPCl
     host = (parsed.hostname or DEFAULT_HOST).lower()
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise CLIError("--start can only launch a local loopback Ouroboros server")
-    _start_local_server(client.base_url)
-    deadline = time.time() + 30
-    while time.time() < deadline:
+    proc = _start_local_server(client.base_url)
+    return _wait_for_dialogue(client, proc)
+
+
+def _wait_for_dialogue(client: OuroborosHTTPClient, proc) -> OuroborosHTTPClient:
+    """Wait until the started server accepts owner messages (``/api/health`` answers and its
+    ``boot`` says ``dialogue_ready``; an older core without ``boot`` counts at its first answer),
+    or its boot is ``ready`` without them (no model provider configured yet).
+    No clock: the wait ends with readiness, with the boot's own ``failed`` verdict, or with the
+    server process's exit."""
+    last_phase = ""
+    while proc.poll() is None:
         try:
-            client.request("GET", "/api/health")
-            return client
+            health = client.request("GET", "/api/health")
         except CLIError:
             time.sleep(0.5)
-    raise CLIError(f"server did not become ready at {client.base_url}")
+            continue
+        boot = health.get("boot") if isinstance(health, dict) else None
+        if not isinstance(boot, dict) or boot.get("dialogue_ready") is True:
+            return client
+        if boot.get("phase") == "ready":  # no model provider yet, or the dialogue's opening failed
+            print("server ready, but its chat is not accepting messages yet: configure a model provider, "
+                  "or see the failed boot step in /api/health", file=sys.stderr, flush=True)
+            return client
+        if boot.get("phase") == "failed":
+            raise CLIError(f"server start failed at {client.base_url}: {boot.get('error') or 'unknown'}")
+        phase = str(boot.get("phase") or "")
+        if phase != last_phase:
+            print(f"server boot: {phase}", file=sys.stderr, flush=True)
+            last_phase = phase
+        time.sleep(0.5)
+    raise CLIError(f"server exited with code {proc.returncode} before it became ready at {client.base_url}")
 
 
 def _default_base_url() -> str:
@@ -625,9 +822,9 @@ def _default_base_url() -> str:
         return env_url
     port = DEFAULT_PORT
     try:
-        from ouroboros.config import DATA_DIR
+        from ouroboros.config import resolve_port_file
 
-        port_text = (pathlib.Path(DATA_DIR) / "state" / "server_port").read_text(encoding="utf-8").strip()
+        port_text = resolve_port_file().read_text(encoding="utf-8").strip()
         if port_text:
             port = int(port_text)
     except Exception:
@@ -635,7 +832,7 @@ def _default_base_url() -> str:
     return f"http://{DEFAULT_HOST}:{port}"
 
 
-def _start_local_server(base_url: str) -> None:
+def _start_local_server(base_url: str) -> subprocess.Popen:
     if os.environ.get("OUROBOROS_PACKAGED_CLI") == "1":
         raise CLIError("packaged CLI must launch the desktop app for --start, not source server.py")
     parsed = urllib.parse.urlparse(base_url)
@@ -644,7 +841,7 @@ def _start_local_server(base_url: str) -> None:
     cmd = [sys.executable, "-m", "ouroboros.cli", "server", "--host", host, "--port", str(port)]
     from ouroboros.platform_layer import subprocess_new_group_kwargs
 
-    subprocess.Popen(
+    return subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -669,7 +866,19 @@ def _watch_task(
     quiet: bool,
     timeout_sec: float,
 ) -> None:
-    cursor = 0
+    """Follow a task's event stream until its terminal result.
+
+    Streams with POST v2 (resumable cursor); falls back to GET with a sequence
+    number only when the first connection, before any event, fails with HTTP 405.
+    Replays are deduplicated by log identity over the most recent 4096 identities.
+    """
+    cursor: Optional[dict] = None
+    legacy_seq = 0
+    legacy = False
+    first_connection = True
+    # Bounded overlap suppression across explicit view replays. Older repeats
+    # outside this recent window may reappear; no infinite exactly-once claim.
+    seen: OrderedDict[str, None] = OrderedDict()
     final = False
     deadline = time.time() + timeout_sec if timeout_sec and timeout_sec > 0 else None
     while not final:
@@ -681,21 +890,49 @@ def _watch_task(
             remaining = max(0.0, deadline - time.time())
             wait_param = max(0, min(30, int(remaining)))
             request_timeout = max(1.0, min(40.0, remaining + 1.0))
-        path = f"/api/tasks/{urllib.parse.quote(task_id)}/events?cursor={cursor}&wait={wait_param}"
+        path = f"/api/tasks/{urllib.parse.quote(task_id)}/events"
         saw_event = False
-        for event in client.stream_sse(path, timeout=request_timeout):
-            if deadline is not None and time.time() >= deadline:
-                raise TaskTimeoutCLIError(f"task {task_id} did not finish within {timeout_sec:g}s")
-            saw_event = True
-            cursor = max(cursor, int(event.get("seq") or cursor))
-            if jsonl:
-                print(json.dumps(event, ensure_ascii=False), flush=True)
-            elif not quiet:
-                rendered = _render_event_for_stderr(event)
-                if rendered:
-                    print(rendered, file=sys.stderr, flush=True)
-            if event.get("type") == "task_result":
-                final = _is_terminal_result((event.get("data") or {}))
+        try:
+            events = (client.stream_sse(f"{path}?cursor={legacy_seq}&wait={wait_param}", timeout=request_timeout)
+                      if legacy else client.stream_sse(path, timeout=request_timeout,
+                          body={"v": 2, "wait": wait_param, "cursor": cursor}))
+            for event in events:
+                if deadline is not None and time.time() >= deadline:
+                    raise TaskTimeoutCLIError(f"task {task_id} did not finish within {timeout_sec:g}s")
+                saw_event = True
+                if event.get("type") == "error":
+                    raise CLIError(str(event.get("error") or "task stream failed"))
+                identity = str(event.get("event_id") or "")
+                duplicate = bool(identity) and identity in seen
+                if not duplicate:
+                    if jsonl:
+                        print(json.dumps(event, ensure_ascii=False), flush=True)
+                    elif not quiet:
+                        rendered = _render_event_for_stderr(event)
+                        if rendered:
+                            print(rendered, file=sys.stderr, flush=True)
+                if event.get("type") == "task_result":
+                    final = _is_terminal_result((event.get("data") or {}))
+                if identity:
+                    seen[identity] = None
+                    seen.move_to_end(identity)
+                    if len(seen) > 4096:
+                        seen.popitem(last=False)
+                # Advance only after the complete envelope was consumed. A
+                # result snapshot has no log identity and is never deduplicated.
+                if not legacy:
+                    next_cursor = event.get("cursor")
+                    if not isinstance(next_cursor, dict):
+                        raise CLIError("v2 task event is missing its cursor")
+                    cursor = next_cursor
+                legacy_seq = max(legacy_seq, int(event.get("seq") or legacy_seq))
+        except CLIError as exc:
+            if (first_connection and not saw_event and not legacy
+                    and isinstance(exc.__cause__, urllib.error.HTTPError) and exc.__cause__.code == 405):
+                legacy, first_connection = True, False
+                continue
+            raise
+        first_connection = False
         if not saw_event:
             time.sleep(0.5)
 
@@ -752,6 +989,8 @@ def _render_event_for_stderr(event: Dict[str, Any]) -> str:
         return f"tool: {data.get('tool', '?')}"
     if etype in {"task_done", "task_metrics"}:
         return f"{etype}: {data.get('task_id', '')}"
+    if etype in {"cursor_replay", "history_gap"}:
+        return f"{etype}: {event.get('reason', '')}"
     return ""
 
 
@@ -794,13 +1033,65 @@ def _patch_from_result(
             raise PatchCLIError("workspace patch artifact is empty")
         return raw.decode("utf-8", errors="replace")
     if strict:
+        manifest_artifact = next((item for item in artifacts if item.get("kind") == "workspace_patch_manifest"), None)
+        if manifest_artifact is not None:
+            name = str(manifest_artifact.get("name") or "workspace_patch.json")
+            manifest = json.loads(client.get_bytes(
+                f"/api/tasks/{urllib.parse.quote(task_id)}/artifacts/{urllib.parse.quote(name)}"))
+            if manifest.get("capture_kind") in {"directory_direct", "engine_directory"} or manifest.get("file_outputs"):
+                raise PatchCLIError(
+                    f"This result is delivered as complete files rather than a Git patch; inspect {name} and its file references.")
         raise PatchCLIError("workspace patch artifact is missing")
     return ""
 
 
+def _await_cost_finality(
+    client: "OuroborosHTTPClient",
+    task_id: str,
+    result: Dict[str, Any],
+    *,
+    grace_sec: float = 60.0,
+) -> Dict[str, Any]:
+    """Bounded wait for the post-task cost checkpoint (v6.74.0, C5).
+
+    ``task_cost_finalized`` is emitted ONLY for ``completed``/``degraded``
+    outcomes (post_task_checkpoint), so any other terminal status reads
+    immediately — an unconditional wait would hang forever on a failed or
+    cancelled task. Within the grace window the reader polls until the result
+    reports ``cost_final`` (or ``cost_with_children_partial`` false); past it,
+    the partial-marked result is returned as-is — the partial flags stay
+    visible, disclosed rather than blocking."""
+    status = str(result.get("status") or "").lower()
+    if status not in {"completed", "degraded"}:
+        return result
+    # Wait ONLY when the result EXPLICITLY says cost is still partial. A record
+    # without the checkpoint fields (older results, minimal test fixtures) has
+    # nothing to wait for and reads immediately.
+    pending = (
+        result.get("cost_final") is False
+        or result.get("cost_with_children_partial") is True
+    )
+    if not pending:
+        return result
+    deadline = time.time() + max(0.0, float(grace_sec))
+    latest = result
+    while time.time() < deadline:
+        time.sleep(min(2.0, max(0.1, deadline - time.time())))
+        try:
+            latest = client.request(
+                "GET", f"/api/tasks/{urllib.parse.quote(task_id)}",
+            )
+        except CLIError:
+            return result
+        if latest.get("cost_final") or latest.get("cost_with_children_partial") is False:
+            return latest
+    return latest
+
+
 def _is_terminal_result(result: Dict[str, Any]) -> bool:
     status = str(result.get("status") or "").lower()
-    if status not in {"completed", "failed", "cancelled", "rejected_duplicate"}:
+    from ouroboros.task_status import SETTLED_STATUSES
+    if status not in SETTLED_STATUSES:
         return False
     bundle = result.get("artifact_bundle") if isinstance(result.get("artifact_bundle"), dict) else {}
     artifact_status = str(bundle.get("status") or result.get("artifact_status") or "").lower()

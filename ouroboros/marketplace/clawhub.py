@@ -8,8 +8,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from ouroboros.marketplace import AllowlistRedirectHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, fields
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
@@ -76,6 +79,18 @@ class ClawHubSkillSummary:
     is_plugin: bool = False
     raw: Dict[str, Any] = field(default_factory=dict)
 
+    def catalog_facts(self) -> Dict[str, Any]:
+        """Normalize ClawHub's author and millisecond update time at the adapter boundary."""
+        publisher = self.raw.get("publisher") if isinstance(self.raw.get("publisher"), dict) else {}
+        facts: Dict[str, Any] = {"owner": str(self.raw.get("ownerHandle") or publisher.get("handle") or "").strip()}
+        stamp = self.raw.get("updatedAt")
+        if isinstance(stamp, (int, float)) and not isinstance(stamp, bool) and stamp > 0:
+            try:
+                facts["updated_at"] = datetime.fromtimestamp(stamp / 1000, timezone.utc).isoformat()
+            except (OverflowError, OSError, ValueError):
+                pass
+        return facts
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "slug": self.slug,
@@ -129,18 +144,17 @@ def _build_url(base: str, path: str, query: Optional[Dict[str, Any]] = None) -> 
     return composed
 
 
-class _AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
-        target = urllib.parse.urlparse(newurl).hostname
-        if target not in _ALLOWED_REGISTRY_HOSTS:
-            raise ClawHubClientHostBlocked(
-                f"Refused to follow redirect to {target!r} outside marketplace allowlist"
-            )
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+def _redirect_handler() -> AllowlistRedirectHandler:
+    return AllowlistRedirectHandler(
+        _ALLOWED_REGISTRY_HOSTS,
+        lambda target: ClawHubClientHostBlocked(
+            f"Refused to follow redirect to {target!r} outside marketplace allowlist"
+        ),
+    )
 
 
 def _build_opener(no_proxy: bool) -> urllib.request.OpenerDirector:
-    handlers: List[Any] = [_AllowlistRedirectHandler()]
+    handlers: List[Any] = [_redirect_handler()]
     # In worker processes, disable system proxy resolution for fork-safety
     # (macOS _scproxy/SCDynamicStoreCopyProxies crashes on the child side of a
     # multi-threaded fork). The supervisor keeps proxy support for corporate

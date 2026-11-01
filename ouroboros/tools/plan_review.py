@@ -1,910 +1,514 @@
-"""Pre-implementation Atlas-backed design review tool."""
+"""``plan_task`` — one tool, three effects over the task's plan record (DESIGN §2).
+
+* WRITE: any of ``goal`` / ``done_when`` / ``affected_paths`` / ``plan`` records
+  revision N+1 — free, nobody is called, omitted fields carry over, identical content
+  creates no revision. ``affected_paths`` is REQUIRED on the first revision (``[]`` =
+  the work changes no files; owner 9=A); the body flag is computed at write.
+* ASK: ``ask="council"`` or ``ask=[participant ids]`` is the ONLY paid act; it sends
+  the current revision (the one this call wrote, or the latest) to exactly the named
+  participants (``plan_ask``). Answers settle into the record and wake the mailbox;
+  under Blocking, a body plan's first ask includes every owner-marked reviewer.
+* READ: no arguments → the free state: the current revision, every participant's open
+  objections (``not_adjudicated`` flagged), who last saw which revision, the latest
+  contributions and the pending asks; pending seats whose producer finished while
+  nobody listened are settled at $0 first.
+
+Every refusal — a schema error, an old-form call (``spec``, ``review_disposition``,
+``author_action``, …: a typed $0 refusal naming the new form, no shim), a missing first
+``affected_paths``, an unknown participant, nothing sendable, the budget or deadline
+rail — writes nothing and engages no gate. There is no cycle counter, no verdict, no
+quorum and no fingerprint routing; the only hold is the finalization gate's
+(``owner_hurry.force_plan_decision`` over ``plan_record.gate_projection``).
+"""
 
 from __future__ import annotations
 
-import asyncio
-import concurrent.futures
 import json
-import os
 import logging
-import pathlib
+from typing import Any, Dict, List, Mapping, Optional
 
-from ouroboros.llm import LLMClient
+from ouroboros import plan_record
+from ouroboros.config import (
+    get_finalization_grace_sec,
+    get_llm_transport_read_timeout_sec,
+    get_review_enforcement,
+    get_task_abs_ceiling_sec,
+    operation_window_sec,
+)
+from ouroboros.tools import plan_ask, plan_packet
+from ouroboros.tools.plan_review_runtime import REVIEWER_EFFORT_SCHEMA as _REVIEWER_EFFORT_SCHEMA
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.tools.review_context_atlas import (
-    ReviewContextAtlasRequest,
-    compile_review_context_atlas,
-)
-from ouroboros.tools.review_helpers import (
-    build_head_snapshot_section,
-    emit_review_usage,
-    load_governance_doc,
-    load_checklist_section,
-)
-from ouroboros.task_results import STATUS_COMPLETED
-from ouroboros.task_status import wait_for_effective_tasks
-from ouroboros.utils import atomic_write_json, estimate_tokens, utc_now_iso
+from ouroboros.tools.tool_result import TOOL_CODE_SPECS, ToolResult, _publish_tool_result
+from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
 
-_PLAN_REVIEW_MAX_TOKENS = 65536
-_PLAN_REVIEW_EFFORT = "high"
-_PLAN_REVIEW_SLOT_TIMEOUT_SEC = 560
-_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC = 620
+WRITE_FIELDS = ("goal", "done_when", "affected_paths", "plan")
+ASK_FIELDS = ("ask", "message", "attach", "reviewer_effort", "reason")
+# The retired engine's arguments: a typed $0 refusal names the new form (no shim).
+RETIRED_FIELDS = frozenset({"spec", "review_disposition", "author_action", "author_disposition", "confirm_fresh_panel",
+                            "review_fingerprint", "items", "acceptance_claims", "evidence", "in_scope", "non_goals",
+                            "invariants", "decisions", "deferred", "affected_resources"})
 
-from ouroboros.tools.review_helpers import REVIEW_PROMPT_TOKEN_BUDGET as _REVIEW_BUDGET
 
-_PLAN_BUDGET_TOKEN_LIMIT = _REVIEW_BUDGET
+def _plan_task_tool_timeout_sec() -> float:
+    """The outer settlement envelope of one call (never a cognition cutoff): an
+    ``agent_session`` participant inherits the task's operation window, an API
+    participant one transport read plus one finalization grace, and the entry covers
+    either plus one grace."""
+    return (max(float(get_llm_transport_read_timeout_sec() + get_finalization_grace_sec()),
+                operation_window_sec(get_task_abs_ceiling_sec()))
+            + get_finalization_grace_sec())
+
+
+_DONE_WHEN_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "id": {"type": "string", "description": "Your stable name for this outcome (minted claim_N when absent); link verify_and_record receipts via criterion_id."},
+            "claim": {"type": "string", "description": "The observable outcome acceptance will judge — what is true when the work is done, not a method."},
+            "support": {"type": "string", "description": "How it will be shown, in your words: a command and its expected output, a screenshot and what it must show, a judgment and by whom, the owner confirming."},
+            "surface": {"type": "string", "description": "Optional: the interface or place where the claim is observed."},
+        },
+        "required": ["claim"],
+    },
+    "description": ("What acceptance will judge, in the acceptance claim grammar (id / claim / support). "
+                    "The LATEST revision's done_when binds acceptance; ingress claims from the task's own contract win over it."),
+}
+
+_SCHEMA = {
+    "name": "plan_task",
+    "description": (
+        "Your plan for this work and the council that weighs it — code, research, a deliverable, a computer-use flow or "
+        "an action in the world. Three effects, one tool. WRITE (free): goal, done_when, affected_paths and/or plan record "
+        "a new revision; omitted fields carry over; identical content records nothing; affected_paths is required on the "
+        "first revision ([] = the work changes no files; a path under Ouroboros's own body makes it a body plan, whose "
+        "participants receive the constitutional pack). ASK (the only paid act): ask='council' sends the current revision "
+        "to the review pool (Main alone when no reviewer is marked), ask=[ids] to exactly those participants — pool seats "
+        "or any enabled catalog row (unticked advisers never hold); Blocking adds all ticked reviewers to a body plan's "
+        "first ask; Advisory requires a ticked reviewer and a reason when narrowed; Cyber Pro is free. Later asks use the named rows. Participants answer in parallel the first time and see each other's answers on later "
+        "asks; each receives the plan or its delta, the council so far, its own open objections, your message and your "
+        "attachments. Answers arrive in your mailbox; READ (no arguments, free) shows the current revision, every open "
+        "objection with who raised it, who saw which revision, the latest contributions and the pending asks. An "
+        "objection stands until the participant who raised it withdraws it (ask that participant again after you "
+        "revise or argue); nobody votes and there is no verdict. Under Blocking, outside Cyber Pro, an open objection of an owner-marked "
+        "reviewer holds your final answer; under Advisory and in Cyber Pro it is disclosed. The old spec/"
+        "review_disposition form is refused at $0."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "goal": {"type": "string", "description": "The outcome the work serves, in your words (what the owner's ask means)."},
+            "done_when": _DONE_WHEN_SCHEMA,
+            "affected_paths": {
+                "type": "array", "items": {"type": "string"},
+                "description": ("The FILES the work will CHANGE — paths relative to the subject workspace root, absolute, or "
+                                "file://; [] when it changes no files. Required on the first revision. The only field read as paths."),
+            },
+            "plan": {"type": "string", "description": ("Prose: your reading of the ask and the bar, the approach, constraints, "
+                                                        "expensive-to-reverse decisions with their alternatives, risks.")},
+            "ask": {
+                "anyOf": [{"type": "string", "enum": ["council"]}, {"type": "array", "items": {"type": "string"}, "minItems": 1}],
+                "description": ("Whom to ask now: 'council' = the review pool; or participant ids (pool seat ids, catalog row ids/handles). "
+                                "Named recipients only — nothing is sent unless you ask."),
+            },
+            "reason": {"type": "string", "description": "Why these reviewers: required when an Advisory first ask about your own code names fewer than all ticked reviewers. Blocking adds missing ticked reviewers; later asks name any enabled rows. Advisers are heard, not counted."},
+            "message": {"type": "string", "description": "What you want from the asked participants now (what changed, what you decided and why, what to look at)."},
+            "attach": {"type": "array", "items": {"type": "string"},
+                       "description": "Evidence locators for the asked participants (paths with optional ::lines=A-B, task:<id>, chat:<id>); attached bounded, every absence named."},
+            "reviewer_effort": {**_REVIEWER_EFFORT_SCHEMA, "description": "Optional panel strength for THIS ask (Auto rows, clamped into the owner's effort range)."},
+        },
+        "required": [],
+    },
+}
 
 
 def get_tools():
-    return [
-        ToolEntry(
-            name="plan_task",
-            schema={
-                "name": "plan_task",
-                "description": (
-                    "Run a pre-implementation design review of a proposed plan. It first starts a small "
-                    "local-readonly planning-scout subagent swarm and waits up to "
-                    "OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC for raw handoffs, then runs 2–3 parallel "
-                    "reviewers. Call this BEFORE writing any code for non-trivial tasks (>2 files or >50 lines "
-                    "of changes). The agent chooses the context level: minimal includes governance docs, the plan, "
-                    "and touched-file snapshots; localized/broad/constitutional add a generated repository Atlas. "
-                    "Reviewers identify forgotten touchpoints, implicit contract "
-                    "violations, simpler alternatives, and Bible/architecture compliance issues — before you've "
-                    "written a single line. Uses the reviewer slots configured in OUROBOROS_REVIEW_MODELS (same "
-                    "slot as the commit triad); duplicate model IDs are allowed and count as separate stochastic "
-                    "slots. Returns structured feedback from every reviewer slot with detailed explanations and "
-                    "alternative approaches. Non-blocking: you decide what to do with the feedback."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "plan": {"type": "string", "description": "Describe what you plan to implement: which files you will change, what the key design decisions are, and what you will NOT change."},
-                        "goal": {"type": "string", "description": "The high-level goal of the task (what problem is being solved)."},
-                        "files_to_touch": {"type": "array", "description": "Optional list of repo-relative file paths you plan to modify. Their current content (HEAD snapshot) will be injected so reviewers can reason about concrete code, not just abstract plans.", "items": {"type": "string"}},
-                        "context_level": {
-                            "type": "string",
-                            "enum": ["minimal", "localized", "broad", "constitutional"],
-                            "description": (
-                                "Agent-chosen repository context level. Choose explicitly: minimal omits generated "
-                                "Atlas context but keeps governance docs and touched-file snapshots; localized adds "
-                                "a small Atlas around files_to_touch; broad is for shared contracts; constitutional "
-                                "is for self-evolution/immune surfaces."
-                            ),
-                        },
-                        "context_notes": {
-                            "type": "string",
-                            "default": "",
-                            "description": "Optional agent-chosen notes explaining why this context level/evidence is appropriate.",
-                        },
-                        "include_tests": {
-                            "type": "boolean",
-                            "default": False,
-                            "description": "Whether generated Atlas context may include related tests.",
-                        },
-                    },
-                    "required": ["plan", "goal", "context_level"],
-                },
-            },
-            handler=_handle_plan_task,
-            timeout_sec=660,
-        )
-    ]
+    return [ToolEntry(name="plan_task", schema=_SCHEMA, handler=_handle_plan_task, timeout_sec=_plan_task_tool_timeout_sec())]
 
 
-def _handle_plan_task(
-    ctx: ToolContext,
-    plan: str = "",
-    goal: str = "",
-    files_to_touch: list | None = None,
-    context_level: str = "",
-    context_notes: str = "",
-    include_tests: bool = False,
-) -> str:
-    if not plan.strip():
-        return "ERROR: plan parameter is required and must not be empty."
-    if not goal.strip():
-        return "ERROR: goal parameter is required and must not be empty."
+def collect_legacy_contributions(ctx: Any, legacy: Mapping[str, Any], *, state_root: Any, task_id: str) -> Dict[str, Any]:
+    """03 D7 (option A): the earlier schema's wave still owed at upgrade is read through the same
+    recorded-actor collector as the organ's seats, so an answer paid before the upgrade reaches the
+    author as read-only HISTORY — never approval of the current revision, never an objection or a
+    claim, never written back into the v2 state, never re-sent. Returns the legacy projection with
+    ``legacy_contributions`` and ``legacy_wave_collection`` added and its disclosed pending ask
+    settled in memory once nothing of that wave is still on its way."""
+    wave = legacy.get("pending_wave") if isinstance(legacy, Mapping) else None
+    out: Dict[str, Any] = dict(legacy or {})
+    if not isinstance(wave, Mapping) or not wave.get("actors"):
+        return out
+    from ouroboros.review_operation import collect_recorded_review_actor
 
-    files_to_touch = files_to_touch or []
+    contributions, owed, unknown, failed = [], [], [], []
+    for row in wave["actors"]:
+        seat = str(row.get("slot_id") or "")
+        actor = collect_recorded_review_actor(state_root, task_id=task_id, surface="plan_review", row=dict(row),
+                                              retry_key=str(wave.get("retry_key") or ""), usage_ctx=ctx)
+        state = str(actor.get("operation_state") or "")
+        if state == "custody_lost":
+            unknown.append(seat)
+        elif state in ("in_flight", "pending_dispatch") or actor.get("late_result_pending"):
+            owed.append(seat)
+        elif str(actor.get("status") or "") == "ok" and str(actor.get("raw_text") or ""):
+            contributions.append({"seat_id": seat, "model": str(actor.get("model") or row.get("model") or ""),
+                                  "operation_id": str(actor.get("operation_id") or ""), "text": str(actor.get("raw_text"))})
+        else:
+            failed.append(seat)
+    out["legacy_contributions"] = contributions
+    out["legacy_wave_collection"] = {"fingerprint": str(wave.get("fingerprint") or ""), "owed": owed, "unknown": unknown, "failed": failed}
+    if not owed:  # nothing of that wave is still on its way: the disclosed pending ask settles — in memory only
+        label = f"legacy wave {str(wave.get('fingerprint') or '')[:12] or '?'}"
+        out["pending_asks"] = [a for a in legacy.get("pending_asks") or [] if a != label]
+    return out
 
+
+# ------------------------------------------------------------------ refusals
+
+def _refuse(ctx: ToolContext, code: str, text: str) -> str:
+    return _publish_tool_result(ctx, ToolResult(status=TOOL_CODE_SPECS[code].status, code=code, text=text))
+
+
+def _arg_error(ctx: ToolContext, text: str) -> str:
+    return _refuse(ctx, "TOOL_ARG_ERROR", "ERROR: PLAN_ARGS_INVALID: " + text + " Nothing was written and nobody was called.")
+
+
+def _retired_form_refusal(ctx: ToolContext, keys: List[str]) -> str:
+    return _refuse(ctx, "TOOL_ARG_ERROR", (
+        "ERROR: PLAN_FORM_RETIRED: " + ", ".join(sorted(keys)) + " belong to the retired plan_task form (spec / "
+        "review_disposition / author_action). The tool now has three effects: WRITE a revision with goal, done_when "
+        "[{id, claim, support}], affected_paths ([] for no files; required on the first revision) and plan prose; ASK "
+        "with ask='council' or ask=[participant ids] plus message/attach/reviewer_effort; READ with no arguments. "
+        "Nothing was written and nobody was called."))
+
+
+def _validate_write(params: Mapping[str, Any]) -> Optional[str]:
+    for key in ("goal", "plan", "message", "reason"):
+        if params.get(key) is not None and not isinstance(params[key], str):
+            return f"{key} must be text."
+    for key in ("affected_paths", "attach"):
+        value = params.get(key)
+        if value is not None and (not isinstance(value, list) or any(not isinstance(item, str) for item in value)):
+            return f"{key} must be an array of strings."
+    done_when = params.get("done_when")
+    if done_when is not None:
+        if not isinstance(done_when, list):
+            return "done_when must be an array of {id, claim, support} objects."
+        for index, row in enumerate(done_when):
+            if not isinstance(row, Mapping) or not str(row.get("claim") or "").strip():
+                return f"done_when[{index}] must be an object with a non-empty claim."
+            if set(row) - {"id", "claim", "support", "surface"}:
+                return f"done_when[{index}] carries unknown keys {sorted(set(row) - {'id', 'claim', 'support', 'surface'})}."
+    ask = params.get("ask")
+    if ask is not None and ask != "council" and (not isinstance(ask, list) or not ask
+                                                or any(not isinstance(item, str) or not item.strip() for item in ask)):
+        return "ask must be 'council' or a non-empty array of participant ids."
+    effort = params.get("reviewer_effort")
+    if effort not in (None, "") and str(effort) not in _REVIEWER_EFFORT_SCHEMA["enum"]:
+        return f"reviewer_effort is not on the effort scale {list(_REVIEWER_EFFORT_SCHEMA['enum'])}."
+    return None
+
+
+# ------------------------------------------------------------------ handler
+
+def _handle_plan_task(ctx: ToolContext, **params) -> str:
+    given = {key: value for key, value in params.items() if value is not None}
+    retired = sorted(key for key in given if key in RETIRED_FIELDS)
+    if retired:
+        return _retired_form_refusal(ctx, retired)
+    unknown = sorted(key for key in given if key not in WRITE_FIELDS and key not in ASK_FIELDS)
+    if unknown:
+        return _arg_error(ctx, f"unknown fields {unknown}.")
+    error = _validate_write(given)
+    if error:
+        return _arg_error(ctx, error)
+    writes = any(key in given for key in WRITE_FIELDS)
+    asks = given.get("ask") is not None
+    if not writes and not asks and any(key in given for key in ("message", "attach", "reviewer_effort", "reason")):
+        return _arg_error(ctx, "message, attach, reviewer_effort and reason travel with an ask (ask='council' or ask=[ids]).")
     try:
-        try:
-            asyncio.get_running_loop()
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                result = pool.submit(
-                    asyncio.run,
-                    asyncio.wait_for(
-                        _run_plan_review_async(ctx, plan, goal, files_to_touch, context_level, context_notes, include_tests),
-                        timeout=_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC,
-                    ),
-                ).result(timeout=_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC + 5)
-        except RuntimeError:
-            result = asyncio.run(
-                asyncio.wait_for(
-                    _run_plan_review_async(ctx, plan, goal, files_to_touch, context_level, context_notes, include_tests),
-                    timeout=_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC,
-                )
-            )
-        return result
-    except concurrent.futures.TimeoutError:
-        return f"ERROR: Plan review timed out after {_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC}s."
-    except asyncio.TimeoutError:
-        return f"ERROR: Plan review timed out after {_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC}s."
-    except Exception as e:
-        log.error("plan_task failed: %s", e, exc_info=True)
-        return f"ERROR: Plan review failed: {e}"
-
-
-def _planning_swarm_count(context_level: str, files_to_touch: list) -> int:
-    try:
-        from ouroboros.config import get_max_active_subagents_per_root
-
-        cap = get_max_active_subagents_per_root()
-    except Exception:
-        cap = 3
-    desired = 2 if context_level in {"broad", "constitutional"} or len(files_to_touch or []) > 3 else 1
-    return max(1, min(int(cap or 1), desired))
-
-
-def _planning_swarm_context(
-    *,
-    plan: str,
-    goal: str,
-    files_to_touch: list,
-    context_level: str,
-    context_notes: str,
-) -> str:
-    return "\n".join([
-        "Review this proposed implementation plan before any edits are made.",
-        "",
-        "[GOAL]",
-        goal,
-        "",
-        "[PLAN]",
-        plan,
-        "",
-        "[FILES_TO_TOUCH]",
-        json.dumps(files_to_touch or [], ensure_ascii=False, indent=2),
-        "",
-        "[CONTEXT_LEVEL]",
-        context_level,
-        "",
-        "[CONTEXT_NOTES]",
-        context_notes or "(none)",
-    ])
-
-
-def _persist_planning_handoffs(ctx: ToolContext, handoffs: dict) -> dict:
-    task_id = str(getattr(ctx, "task_id", "") or "plan_review")
-    try:
-        artifact_dir = pathlib.Path(ctx.drive_root) / "task_results" / "artifacts" / task_id
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        path = artifact_dir / "plan_task_handoffs.json"
-        atomic_write_json(path, handoffs, trailing_newline=True)
-        return {
-            "kind": "plan_task_handoffs",
-            "name": "plan_task_handoffs.json",
-            "path": str(path),
-        }
-    except Exception as exc:
-        log.debug("Failed to persist plan_task handoffs", exc_info=True)
-        return {
-            "kind": "plan_task_handoffs",
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-
-
-def _start_planning_swarm(
-    ctx: ToolContext,
-    *,
-    plan: str,
-    goal: str,
-    files_to_touch: list,
-    context_level: str,
-    context_notes: str,
-) -> dict:
-    from ouroboros.config import get_max_workers, get_plan_task_swarm_timeout_sec
-    from ouroboros.tools.control import _schedule_task
-
-    if get_max_workers() < 2:
-        return {
-            "started": False,
-            "error": (
-                "ERROR: plan_task planning swarm failed closed: no spare worker "
-                "capacity for scout subagents. Increase OUROBOROS_MAX_WORKERS to at least 2."
-            ),
-            "schedule_outputs": [],
-            "task_ids": [],
-        }
-
-    previous_records = list(getattr(ctx, "_last_scheduled_subagents", []) or [])
-    previous_len = len(previous_records)
-    count = _planning_swarm_count(context_level, files_to_touch)
-    schedule_outputs: list[str] = []
-    for idx in range(count):
-        role = f"planning-scout-{idx + 1}"
-        output = _schedule_task(
-            ctx,
-            objective=(
-                "Independently review the proposed implementation plan before code edits. "
-                "Inspect repo/docs/logs if useful. Focus on missing touchpoints, hidden "
-                "contracts, sequencing risks, and simpler alternatives. Do not implement."
-            ),
-            expected_output=(
-                "A concise planning handoff with sections: summary, missed_touchpoints, "
-                "risks, suggested_scope_adjustments, tests_to_run, blockers."
-            ),
-            role=role,
-            context=_planning_swarm_context(
-                plan=plan,
-                goal=goal,
-                files_to_touch=files_to_touch,
-                context_level=context_level,
-                context_notes=context_notes,
-            ),
-            constraints=(
-                "Readonly planning only. Do not edit files, commit, run shell, or request review gates. "
-                "Use concrete file/symbol references when possible."
-            ),
-            memory_mode="forked",
-            model_lane="light",
-        )
-        schedule_outputs.append(str(output or ""))
-
-    new_records = list(getattr(ctx, "_last_scheduled_subagents", []) or [])[previous_len:]
-    task_ids: list[str] = []
-    for record in new_records:
-        if not isinstance(record, dict):
-            continue
-        for task_id in record.get("task_ids") or []:
-            tid = str(task_id or "").strip()
-            if tid and tid not in task_ids:
-                task_ids.append(tid)
-
-    if not task_ids:
-        return {
-            "started": False,
-            "error": (
-                "ERROR: plan_task planning swarm failed closed: no planning subagent "
-                f"started. schedule_outputs={schedule_outputs!r}"
-            ),
-            "schedule_outputs": schedule_outputs,
-            "task_ids": [],
-        }
-
-    wait_timeout = get_plan_task_swarm_timeout_sec()
-    event_queue = getattr(ctx, "event_queue", None)
-    live_queue = event_queue is not None and event_queue.__class__.__module__ in {"queue", "multiprocessing.queues"}
-    if not live_queue:
-        wait_timeout = min(wait_timeout, 0.25)
-    status_root = pathlib.Path(str(getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
-    waited = wait_for_effective_tasks(
-        status_root,
-        task_ids,
-        timeout_sec=wait_timeout,
-        mode="all_terminal",
-        poll_interval_sec=0.25,
-    )
-    handoffs = {
-        "schema_version": 1,
-        "ts": utc_now_iso(),
-        "task_ids": task_ids,
-        "schedule_outputs": schedule_outputs,
-        "wait": waited,
-    }
-    artifact = _persist_planning_handoffs(ctx, handoffs)
-    handoffs["artifact"] = artifact
-    tasks = waited.get("tasks") if isinstance(waited, dict) else {}
-    completed_handoffs = [
-        data for data in (tasks or {}).values()
-        if isinstance(data, dict)
-        and str(data.get("status") or "").strip().lower() == STATUS_COMPLETED
-        and str(data.get("result") or "").strip()
-    ]
-    if not completed_handoffs:
-        capacity_note = ""
-        if isinstance(waited, dict) and waited.get("timed_out"):
-            capacity_note = (
-                " The planning swarm timed out; the worker pool may be saturated. "
-                "Retry when workers are free or increase OUROBOROS_MAX_WORKERS."
-            )
-        return {
-            "started": False,
-            "error": (
-                "ERROR: plan_task planning swarm failed closed: no planning subagent "
-                f"completed with a non-empty handoff.{capacity_note}"
-            ),
-            "task_ids": task_ids,
-            "handoffs": handoffs,
-        }
-    if not artifact.get("path"):
-        return {
-            "started": False,
-            "error": (
-                "ERROR: plan_task planning swarm failed closed: raw planning handoffs "
-                f"could not be saved. artifact={artifact!r}"
-            ),
-            "task_ids": task_ids,
-            "handoffs": handoffs,
-        }
-    return {
-        "started": True,
-        "task_ids": task_ids,
-        "handoffs": handoffs,
-    }
-
-
-def _format_planning_handoffs(handoffs: dict, *, raw: bool) -> str:
-    if not handoffs:
-        return ""
-    if raw:
-        payload = handoffs
-    else:
-        tasks = ((handoffs.get("wait") or {}).get("tasks") or {}) if isinstance(handoffs.get("wait"), dict) else {}
-        payload = {
-            "schema_version": handoffs.get("schema_version", 1),
-            "task_ids": handoffs.get("task_ids") or [],
-            "timed_out": (handoffs.get("wait") or {}).get("timed_out") if isinstance(handoffs.get("wait"), dict) else None,
-            "tasks": {
-                tid: {
-                    "status": data.get("status"),
-                    "role": data.get("role"),
-                    "result": data.get("result"),
-                    "subagent_envelope": data.get("subagent_envelope"),
-                }
-                for tid, data in tasks.items()
-                if isinstance(data, dict)
-            },
-            "artifact": handoffs.get("artifact") or {},
-        }
-    return (
-        "## Planning Subagent Handoffs\n\n"
-        "Raw planning-scout handoffs are included as reviewer evidence. "
-        "If compacted, the full JSON artifact path is listed below.\n\n"
-        "```json\n"
-        + json.dumps(payload, ensure_ascii=False, indent=2, default=str)
-        + "\n```"
-    )
-
-
-async def _run_plan_review_async(
-    ctx: ToolContext,
-    plan: str,
-    goal: str,
-    files_to_touch: list,
-    context_level: str = "",
-    context_notes: str = "",
-    include_tests: bool = False,
-) -> str:
-    repo_dir = ctx.repo_dir
-
-    from ouroboros import config as _cfg
-
-    resolved_models = list(_cfg.get_review_models() or [])
-    if not resolved_models:
-        return (
-            "ERROR: No review models configured. Set OUROBOROS_REVIEW_MODELS "
-            "in settings."
-        )
-
-    if len(resolved_models) < 2:
-        return (
-            "ERROR: plan_task requires at least 2 reviewer slots for "
-            f"review coordination. Got {len(resolved_models)} "
-            f"model(s) from {resolved_models!r}. Fix OUROBOROS_REVIEW_MODELS "
-            f"in settings (example: {_cfg.SETTINGS_DEFAULTS['OUROBOROS_REVIEW_MODELS']!r})."
-        )
-
-    models = _get_review_models()
-    try:
-        resolved_context_level = _resolve_plan_context_level(context_level)
+        state_root, task_id = plan_ask.state_location(ctx)
     except ValueError as exc:
-        return f"ERROR: {exc}"
-
-    swarm = _start_planning_swarm(
-        ctx,
-        plan=plan,
-        goal=goal,
-        files_to_touch=files_to_touch,
-        context_level=resolved_context_level,
-        context_notes=context_notes,
-    )
-    if not swarm.get("started"):
-        return str(swarm.get("error") or "ERROR: plan_task planning swarm failed closed.")
-    planning_handoff_raw = _format_planning_handoffs(dict(swarm.get("handoffs") or {}), raw=True)
-    planning_handoff_compact = _format_planning_handoffs(dict(swarm.get("handoffs") or {}), raw=False)
-
-    checklist = _load_plan_checklist()
-    bible_text = _load_bible(repo_dir)
-    dev_md = _load_doc(repo_dir, "docs/DEVELOPMENT.md")
-    arch_md = _load_doc(repo_dir, "docs/ARCHITECTURE.md")
-    checklists_md = _load_doc(repo_dir, "docs/CHECKLISTS.md")
-
-    ctx.emit_progress_fn("📐 plan_task: reading planned-touch file snapshots…")
-    canonical_docs = {
-        "BIBLE.md",
-        "docs/DEVELOPMENT.md",
-        "docs/ARCHITECTURE.md",
-        "docs/CHECKLISTS.md",
-    }
-    head_snapshots = ""
-    if files_to_touch:
-        head_snapshots = build_head_snapshot_section(repo_dir, files_to_touch)
-
-    system_prompt = _build_system_prompt(
-        checklist,
-        bible_text,
-        dev_md,
-        arch_md,
-        checklists_md,
-        context_level=resolved_context_level,
-    )
-    placeholder = "__GENERATED_PLAN_ATLAS_PENDING__"
-    user_content = _build_user_content(
-        plan,
-        goal,
-        files_to_touch,
-        head_snapshots,
-        placeholder if resolved_context_level != "minimal" else "",
-        "",
-        context_level=resolved_context_level,
-        context_notes=context_notes,
-        include_tests=include_tests,
-    )
-    if planning_handoff_raw:
-        user_content += "\n\n" + planning_handoff_raw
-    fixed_prompt_tokens = estimate_tokens(system_prompt + user_content)
-    if resolved_context_level != "minimal":
-        target_tokens = _plan_context_target_tokens(resolved_context_level)
-        ctx.emit_progress_fn(
-            f"📐 plan_task: building {resolved_context_level} Generated Plan Review Atlas…"
-        )
+        return _refuse(ctx, "TOOL_ERROR", f"ERROR: {exc}. Nothing was written.")
+    try:
+        record = plan_record.load_plan_record(state_root, task_id)
+    except plan_record.PlanRecordInvalid as exc:
+        return _refuse(ctx, "TOOL_ERROR", f"ERROR: PLAN_RECORD_UNREADABLE: {exc}. Nothing was written; the recorded plan state stands.")
+    legacy, legacy_error = plan_record.legacy_facts(state_root, task_id)
+    latest = plan_record.latest_revision(record)
+    revision_fields: Optional[Dict[str, Any]] = None
+    body, body_note = False, ""
+    if writes:
+        if latest is None and given.get("affected_paths") is None:
+            return _refuse(ctx, "TOOL_ARG_ERROR", (
+                "ERROR: PLAN_FIRST_REVISION_NEEDS_AFFECTED_PATHS: the first revision must declare affected_paths — the files "
+                "the work will change, as their own list; send [] when it changes no files. Nothing was written and nobody was called."))
+        revision_fields = plan_record.compose_revision(
+            latest, goal=given.get("goal"), plan=given.get("plan"), done_when=given.get("done_when"),
+            affected_paths=given.get("affected_paths"))
         try:
-            atlas = compile_review_context_atlas(
-                ReviewContextAtlasRequest(
-                    repo_dir=repo_dir,
-                    anchors=tuple(files_to_touch),
-                    already_included=frozenset(set(files_to_touch) | canonical_docs),
-                    fixed_prompt_tokens=fixed_prompt_tokens,
-                    target_total_tokens=target_tokens,
-                    hard_total_tokens=_PLAN_BUDGET_TOKEN_LIMIT,
-                    include_tests=bool(include_tests),
-                    title=f"Generated Plan Review Atlas ({resolved_context_level})",
-                    drive_root=pathlib.Path(ctx.drive_root),
-                )
-            )
-        except Exception as e:
-            return f"ERROR: Failed to build review context atlas: {e}"
-
-        if atlas.status == "budget_exceeded":
-            estimated = int((atlas.manifest or {}).get("estimated_total_tokens") or 0)
-            return (
-                f"⚠️ PLAN_REVIEW_SKIPPED: generated repository atlas exceeded hard budget"
-                + (f" ({estimated:,} estimated tokens)" if estimated else "")
-                + ". Split the plan into a smaller scope or choose a smaller context_level."
-            )
-
-        head, sep, tail = user_content.rpartition(placeholder)
-        if not sep:
-            return "ERROR: Failed to build review context atlas: placeholder missing."
-        user_content = head + atlas.text + tail
-
-    estimated_tokens = estimate_tokens(system_prompt + user_content)
-    if estimated_tokens > _PLAN_BUDGET_TOKEN_LIMIT and planning_handoff_raw:
-        user_content = user_content.replace(planning_handoff_raw, planning_handoff_compact)
-        estimated_tokens = estimate_tokens(system_prompt + user_content)
-    if estimated_tokens > _PLAN_BUDGET_TOKEN_LIMIT:
-        return (
-            f"⚠️ PLAN_REVIEW_SKIPPED: assembled prompt too large "
-            f"({estimated_tokens:,} estimated tokens, limit {_PLAN_BUDGET_TOKEN_LIMIT:,}). "
-            f"Consider reducing files_to_touch or splitting the plan into smaller scopes."
-        )
-
-    ctx.emit_progress_fn(
-        f"📐 plan_task: running {len(models)} parallel reviewers "
-        f"(context={resolved_context_level}, ~{estimated_tokens:,} tokens each)…"
-    )
-
-    raw_results = await _run_plan_review_slots(ctx, models, system_prompt, user_content)
-
-    return _format_output(raw_results, models, goal, estimated_tokens)
-
-
-async def _run_plan_review_slots(
-    ctx: ToolContext,
-    models: list[str],
-    system_prompt: str,
-    user_content: str,
-) -> list[dict]:
-    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
-
-    slots = [
-        ReviewSlot(
-            slot_id=f"plan_slot_{idx + 1}",
-            model=str(model),
-            effort=_PLAN_REVIEW_EFFORT,
-            timeout_sec=_PLAN_REVIEW_SLOT_TIMEOUT_SEC,
-            max_tokens=_PLAN_REVIEW_MAX_TOKENS,
-            temperature=0.2,
-            role_hint="plan reviewer",
-        )
-        for idx, model in enumerate(models)
-    ]
-    request = ReviewRequest(
-        surface="plan_review",
-        goal="Review the proposed implementation plan before code is written.",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-        task_id=str(getattr(ctx, "task_id", "") or "plan_review"),
-        call_type="plan_review",
-        max_tokens=_PLAN_REVIEW_MAX_TOKENS,
-        temperature=0.2,
-        no_proxy=True,
-    )
-    loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(
-        None,
-        lambda: run_review_request(
-            request,
-            slots=slots,
-            drive_root=pathlib.Path(ctx.drive_root),
-            llm=LLMClient(),
-            usage_ctx=ctx,
-        ),
-    )
-    return [_plan_raw_result_from_actor(actor, models[idx] if idx < len(models) else "") for idx, actor in enumerate(result.actors)]
+            system_root, active_root = plan_ask.planning_roots(ctx)
+        except ValueError as exc:
+            return _refuse(ctx, "TOOL_ERROR", f"ERROR: PLAN_SUBJECT_ROOT_INVALID: {exc}. Nothing was written.")
+        body, body_note = plan_ask.plan_is_body(ctx, revision_fields["affected_paths"], system_root=system_root, active_root=active_root)
+    elif asks and latest is None:
+        return _refuse(ctx, "TOOL_ARG_ERROR", (
+            "ERROR: PLAN_ASK_NEEDS_A_PLAN: there is no revision to ask about yet — write one first (goal, done_when, "
+            "affected_paths, plan), in this call or an earlier one. Nothing was written and nobody was called."))
+    prepared = None
+    if asks:
+        candidate = dict(revision_fields, n=(int(latest.get("n") or 0) if latest else 0) + 1, body=body, body_note=body_note,
+                         ts=utc_now_iso()) if revision_fields is not None else dict(latest)
+        if revision_fields is not None and latest is not None and latest.get("content_sha256") == revision_fields["content_sha256"]:
+            candidate = dict(latest)
+        try:
+            prepared = plan_ask.prepare_ask(
+                ctx, record=record, revision=candidate, ask=given["ask"], message=str(given.get("message") or ""),
+                attach=list(given.get("attach") or []), reviewer_effort=str(given.get("reviewer_effort") or ""),
+                reason=str(given.get("reason") or ""),
+                state_root=state_root, task_id=task_id, legacy=legacy)
+        except plan_ask.PlanAskRefused as exc:
+            if exc.attempt is None:
+                return _refuse(ctx, exc.code, exc.text)
+            return _refuse_unroutable(ctx, exc, revision_fields=revision_fields, body=body, body_note=body_note,
+                                      state_root=state_root, task_id=task_id)
+        except Exception as exc:
+            log.error("plan_task ask preparation failed: %s", exc, exc_info=True)
+            return _refuse(ctx, "TOOL_ERROR", f"ERROR: PLAN_ASK_FAILED: {exc}. Nothing was written and nobody was called.")
+    notes: List[str] = []
+    created = False
+    if revision_fields is not None:
+        try:
+            record, latest, created = plan_record.append_revision(state_root, task_id, revision_fields, body=body, body_note=body_note)
+        except (plan_record.PlanRecordInvalid, OSError, ValueError) as exc:
+            return _refuse(ctx, "TOOL_ERROR", f"ERROR: PLAN_RECORD_WRITE_FAILED: {exc}.")
+        if created:
+            plan_ask._progress(ctx, f"📐 Plan: revision {latest.get('n')} recorded" + (" (body plan)" if body else "") + ".")
+            notes.append(f"Revision {latest.get('n')} recorded" + (f" — {body_note}" if body_note else "") + ".")
+        else:
+            notes.append(f"Identical content: revision {latest.get('n')} stands, nothing new was recorded.")
+        plan_ask._reference(ctx, task_id, record, state_root)
+    effect = "write+ask" if (writes and asks) else "ask" if asks else "write" if writes else "read"
+    if prepared is not None:
+        record = plan_ask.dispatch_ask(ctx, prepared, revision=latest, state_root=state_root, task_id=task_id)
+        notes.append(_ask_summary(prepared, record))
+    if effect == "read":
+        try:
+            record = plan_ask.collect_pending(ctx, record, state_root=state_root, task_id=task_id)
+            legacy = collect_legacy_contributions(ctx, legacy, state_root=state_root, task_id=task_id)
+        except Exception:
+            log.warning("plan_task read: pending seats could not be collected", exc_info=True)
+    return _publish(ctx, record, effect=effect, notes=notes, legacy=legacy, legacy_error=legacy_error)
 
 
-def _plan_raw_result_from_actor(actor: dict, request_model: str) -> dict:
-    usage = actor.get("usage") or {}
-    text = actor.get("raw_text") or ""
-    error = actor.get("error") or ""
-    if actor.get("status") not in {"ok", "empty"} and not error:
-        error = str(actor.get("status") or "review failed")
-    return {
-        "model": str(usage.get("resolved_model") or actor.get("model") or request_model),
-        "request_model": request_model or actor.get("model") or "",
-        "text": text,
-        "error": error or None,
-        "prompt_ref": actor.get("prompt_ref") or {},
-        "response_ref": actor.get("response_ref") or {},
-        "tokens_in": usage.get("prompt_tokens", 0),
-        "tokens_out": usage.get("completion_tokens", 0),
-        "cost": float(usage.get("cost", 0) or 0),
-    }
+def _refuse_unroutable(ctx: ToolContext, exc: Any, *, revision_fields: Optional[Dict[str, Any]], body: bool, body_note: str,
+                       state_root: Any, task_id: str) -> str:
+    """The one refusal that leaves a fact: the mind asked and NO named route could take the
+    ask. The revision the call carried is recorded first (the plan exists), then the typed
+    attempt (nobody called, nothing held); a Swarm obligation reads it as attempted."""
+    written = ""
+    revision = plan_record.latest_revision(plan_record.load_plan_record(state_root, task_id))
+    try:
+        if revision_fields is not None:
+            record, revision, created = plan_record.append_revision(state_root, task_id, revision_fields, body=body, body_note=body_note)
+            written = f" Revision {revision.get('n')} {'was recorded' if created else 'stands (identical content)'}."
+            if created:
+                plan_ask._progress(ctx, f"📐 Plan: revision {revision.get('n')} recorded" + (" (body plan)" if body else "") + ".")
+        record = plan_record.append_attempt(state_root, task_id, {**exc.attempt, "revision": (revision or {}).get("n")})
+    except (plan_record.PlanRecordInvalid, OSError, ValueError) as err:
+        return _refuse(ctx, "TOOL_ERROR", f"ERROR: PLAN_RECORD_WRITE_FAILED: {err}.")
+    plan_ask._progress(ctx, f"📐 Plan: ask on revision {(revision or {}).get('n')} reached nobody — "
+                            + "; ".join(f"{sid}: {why}" for sid, why in (exc.attempt.get("not_sendable") or {}).items()) + ".")
+    plan_ask._reference(ctx, task_id, record, state_root)
+    return _refuse(ctx, exc.code, exc.text + written + " The attempt is on the plan record (asked, no route): a planning "
+                   "obligation reads it as attempted — disclosed in your final answer, not held. Ask again when a route is available.")
 
 
-def _emit_plan_review_usage(ctx: "ToolContext", raw_results: list) -> None:
-    """Compatibility helper for explicit plan-review usage emission tests.
-
-    The live plan path emits through ReviewCoordinator; this helper preserves
-    the small SSOT conversion from old raw result dictionaries to events.
-    """
-
-    for result in raw_results:
-        if result.get("error"):
-            continue
-        tokens_in = result.get("tokens_in", 0)
-        tokens_out = result.get("tokens_out", 0)
-        if not tokens_in and not tokens_out:
-            continue
-        model = result.get("model") or result.get("request_model") or ""
-        cost = float(result.get("cost", 0) or 0)
-        emit_review_usage(
-            ctx,
-            model=model,
-            usage={"prompt_tokens": tokens_in, "completion_tokens": tokens_out, "cost": cost},
-            source="plan_review",
-            extra={"cost": cost},
-        )
-
-
-def _format_output(raw_results: list, models: list, goal: str, estimated_tokens: int) -> str:
-    """Render reviewer responses plus coordinated aggregate verdict."""
-    lines = [
-        "## Plan Review Results",
-        "",
-        f"**Goal:** {goal}",
-        f"**Models:** {len(models)} parallel reviewers",
-        f"**Prompt size:** ~{estimated_tokens:,} tokens per reviewer",
-        "",
-        "---",
-        "",
-    ]
-
-    per_reviewer: list[str] = []
-
-    for i, result in enumerate(raw_results):
-        model_label = result.get("model") or result.get("request_model") or f"Model {i+1}"
-        lines.append(f"### Reviewer {i+1}: {model_label}")
-        lines.append("")
-
-        if result.get("error"):
-            lines.extend([f"⚠️ **ERROR:** {result['error']}", ""])
-            per_reviewer.append("DEGRADED")
-            continue
-
-        text = result.get("text", "").strip()
-        if not text:
-            lines.extend(["⚠️ **ERROR:** Empty response from reviewer.", ""])
-            per_reviewer.append("DEGRADED")
-            continue
-
-        lines.extend([text, ""])
-
-        reviewer_signal = _parse_aggregate_signal(text)
-        per_reviewer.append(reviewer_signal if reviewer_signal else "DEGRADED")
-        lines.extend(["---", ""])
-
-    revise_count = sum(1 for sig in per_reviewer if sig == "REVISE_PLAN")
-    review_required_count = sum(1 for sig in per_reviewer if sig == "REVIEW_REQUIRED")
-    degraded_count = sum(1 for sig in per_reviewer if sig == "DEGRADED")
-    green_count = sum(1 for sig in per_reviewer if sig == "GREEN")
-
-    if not per_reviewer:
-        lines.extend(["## Aggregate Signal", "", "❓ **REVIEW_REQUIRED**", ""])
-        lines.append("No reviewer responses were collected (empty reviewer list). "
-                     "Treat as REVIEW_REQUIRED — re-run plan_task with at least one reviewer configured.")
-        return "\n".join(lines)
-
-    if revise_count >= 2:
-        aggregate_signal = "REVISE_PLAN"
-    elif revise_count == 1 or review_required_count > 0 or degraded_count > 0:
-        aggregate_signal = "REVIEW_REQUIRED"
-    elif green_count == len(per_reviewer):
-        aggregate_signal = "GREEN"
-    else:
-        aggregate_signal = "REVIEW_REQUIRED"
-
-    signal_emoji = {
-        "GREEN": "✅",
-        "REVIEW_REQUIRED": "⚠️",
-        "REVISE_PLAN": "❌",
-    }.get(aggregate_signal, "❓")
-
-    lines.extend(["## Aggregate Signal", "", f"{signal_emoji} **{aggregate_signal}**", ""])
-    lines.append(
-        f"Per-reviewer signals: REVISE_PLAN={revise_count}, "
-        f"REVIEW_REQUIRED={review_required_count}, "
-        f"GREEN={green_count}, DEGRADED={degraded_count}."
-    )
-    lines.append("")
-
-    if aggregate_signal == "GREEN":
-        lines.append(
-            "All reviewers converged on GREEN. Read every reviewer's PROPOSALS "
-            "section (they are the point of this call) and proceed with implementation."
-        )
-    elif aggregate_signal == "REVIEW_REQUIRED":
-        reasons: list[str] = []
-        if revise_count == 1:
-            reasons.append(
-                "one reviewer dissented with REVISE_PLAN while the others did not — "
-                "a single dissent often sees the structural issue the others missed; "
-                "read the dissenting reviewer's response in full before deciding"
-            )
-        if review_required_count > 0:
-            reasons.append(
-                f"{review_required_count} reviewer(s) raised RISKs or non-structural concerns"
-            )
-        if degraded_count > 0:
-            reasons.append(
-                f"{degraded_count} reviewer(s) failed to return a parseable response "
-                "(error, empty, or missing AGGREGATE line) — GREEN cannot be confirmed"
-            )
-        if reasons:
-            lines.append("Reason: " + "; ".join(reasons) + ".")
-        lines.append(
-            "Read every reviewer's full response and PROPOSALS section. "
-            "Decide whether to adjust the plan before coding."
-        )
-    else:  # REVISE_PLAN
-        lines.append(
-            f"{revise_count} reviewers independently flagged REVISE_PLAN — majority "
-            "confirms a structural problem with the plan. Redesign to address the "
-            "flagged issues before writing any code."
-        )
-
+def _ask_summary(prepared: Any, record: Mapping[str, Any]) -> str:
+    ask = next((a for a in record.get("asks") or [] if a.get("ask_id") == prepared.ask_id), {})
+    rows = ask.get("participants") or []
+    sent = [p for p in rows if p.get("dispatched")]
+    lines = [f"Ask {prepared.ask_id} on revision {ask.get('revision')}: sent to "
+             + ", ".join(f"{p['seat_id']} ({p.get('model') or '?'}{'' if p.get('owner_marked') else ', added by you — its objections never hold'}"
+                         f"{', continued' if p.get('continued') else ''})" for p in sent)
+             + ("; not sent: " + "; ".join(f"{p['seat_id']} — {p.get('not_dispatched_reason') or p.get('error') or 'not sendable'}"
+                                             for p in rows if not p.get("dispatched")) if any(not p.get("dispatched") for p in rows) else "")
+             + "."]
+    if ask.get("host_added"):
+        lines.append("This is the first ask on a body plan, so every owner-marked reviewer was included: the host added "
+                     + ", ".join(ask["host_added"]) + " beside the participants you named.")
+    unknown = [p["seat_id"] for p in sent if p.get("status") == "pending" and p.get("unresolved")]
+    pending = [p["seat_id"] for p in sent if p.get("status") == "pending" and not p.get("unresolved")]
+    if unknown:
+        lines.append(f"Dispatch outcome unknown for {', '.join(unknown)} ({next(p.get('error') for p in sent if p['seat_id'] == unknown[0])}): "
+                     "the substrate held them when the host lost track, so a reply may still arrive through custody; a new ask to them may pay twice.")
+    if pending:
+        lines.append("Answers settle in the background and arrive in your mailbox (await_messages / wait_task); plan_task() reads them. "
+                     f"Still working: {', '.join(pending)}.")
     return "\n".join(lines)
 
 
-def _build_system_prompt(
-    checklist: str,
-    bible_text: str,
-    dev_md: str,
-    arch_md: str,
-    checklists_md: str = "",
-    context_level: str = "",
-) -> str:
-    atlas_note = (
-        f"Repository evidence is bounded by context_level={context_level!r}: "
-        "`minimal` includes governance docs, the plan, and touched-file snapshots "
-        "without a generated Atlas; `localized`, `broad`, and `constitutional` add "
-        "progressively larger generated Atlas context. Use only evidence actually present."
-    )
-    parts = [(
-        "You are a senior design reviewer for Ouroboros, a self-creating AI agent.\n"
-        "Your job is to review a proposed implementation plan BEFORE any code is written.\n"
-        "You are validating a concrete candidate plan, not brainstorming from zero. If the plan is weak, say exactly why and what boundary or contract was missed.\n"
-        f"{atlas_note}\n\n"
-        "## Review stance — GENERATIVE, not audit\n\n"
-        "Your primary job is to CONTRIBUTE ideas the implementer may not see, using the repository evidence provided for this context level.\n"
-        "Finding defects in the plan is secondary; proposing concrete alternatives, surfacing existing surfaces that already solve the goal, and flagging subtle contract breaks is primary.\n"
-        "Assume the implementer has already thought through the first-pass design — you are a design PARTNER who contributes, not an auditor who rubber-stamps.\n\n"
-        "## Required output structure (follow exactly)\n\n"
-        "1. **Your own approach** (1-2 sentences). State what YOU would do with the available repository evidence: the concrete alternative path, the existing file/function you would reuse, or the simpler route. If after real effort you see no better approach, say so explicitly.\n"
-        "2. **`## PROPOSALS` section** (top 1-2 ideas). Each proposal is one of:\n   - An existing function/module that already solves this (named exactly).\n   - A subtle contract break or shared-state interaction the plan likely missed.\n   - A simpler path with less surface area preserving the goal.\n   - A risk pattern visible from codebase history in your context.\n   - A BIBLE.md alignment issue with a specific principle cited.\n"
-        "3. **Per-item verdicts**. For each checklist item below:\n   - **verdict**: PASS | RISK | FAIL\n   - **explanation**: 2-5 sentences describing what you found (or why it's fine)\n   - **concrete fix** (if RISK or FAIL): exact file, function, or line to address\n   - **alternative approaches** (if applicable): 1-2 more elegant solutions\n"
-        "4. **Final line** (exactly one of):\n   - `AGGREGATE: GREEN` — no critical issues, implementer can proceed\n   - `AGGREGATE: REVIEW_REQUIRED` — risks or minor concerns, implementer should consider adjustments\n   - `AGGREGATE: REVISE_PLAN` — critical structural issues, plan must be revised before coding\n\n"
-        "Be specific. Name exact files, functions, constants, or call sites.\nVague concerns without a concrete pointer are advisory at most.\nIf you see a simpler solution, say so directly — don't just hint.\n\n"
-        "## Rules (what NOT to flag)\n\n"
-        "- Do NOT mark RISK on `minimalism` just because you would have done it differently. Flag RISK only when you can name (a) fewer files touched, (b) fewer lines changed, or (c) reuse of a specific existing surface — concrete alternative, not taste.\n"
-        "- Do NOT penalise missing tests, `VERSION` bumps, `README.md` changelog rows, or `docs/ARCHITECTURE.md` updates — the plan has no code yet. Focus on design correctness and elegance, not commit hygiene. Commit-gate reviewers handle that later.\n\n"
-        "## Aggregate level — majority-vote coordination across 2-3 reviewer slots\n\n"
-        "- `AGGREGATE: REVISE_PLAN` should be used ONLY when you are confident the plan has a concrete structural problem that warrants a redesign. The coordinator escalates to final `REVISE_PLAN` only when at least 2 reviewer slots independently flag it — a lone dissenting `REVISE_PLAN` will surface as `REVIEW_REQUIRED` with your dissent noted (with 2-reviewer setups, \"≥2 reviewers\" means both reviewers agreed). This is deliberate: `plan_review` is a coordinative signal, not a block. Use `REVIEW_REQUIRED` for real but non-structural risks; reserve `REVISE_PLAN` for defects worth blocking the plan on.\n\n---\n"
-    )]
+# ------------------------------------------------------------------ rendering
 
-    if checklist and not checklists_md:
-        parts.append(f"## Plan Review Checklist\n\n{checklist}\n\n---\n")
+def _decision(ctx: ToolContext, record: Mapping[str, Any], legacy: Optional[Mapping[str, Any]] = None, *,
+              unreadable: bool = False) -> Dict[str, Any]:
+    from ouroboros.owner_hurry import latched
+    from ouroboros.tools.review_helpers import review_enforcement_blocks
 
-    for title, body in (
-        ("## BIBLE.md (Constitution — highest priority)", bible_text),
-        ("## DEVELOPMENT.md (Engineering handbook)", dev_md),
-        ("## ARCHITECTURE.md (Current system structure)", arch_md),
-    ):
-        if body:
-            parts.append(f"{title}\n\n{body}\n\n---\n")
-
-    if checklists_md:
-        parts.append(
-            "## CHECKLISTS.md (review contracts and critical thresholds)\n\n"
-            "Use the `## Plan Review Checklist` section inside this file as the per-item matrix for this plan review.\n\n"
-            f"{checklists_md}\n\n---\n"
-        )
-
-    return "\n".join(parts)
+    metadata = getattr(ctx, "task_metadata", {})
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    return plan_record.gate_projection(
+        record, enforcement=str(get_review_enforcement() or ""), cyber_pro=not review_enforcement_blocks("blocking"),
+        hurry=latched(ctx) is not None, force_plan=metadata.get("force_plan") is True, legacy=legacy, unreadable=unreadable)
 
 
-def _build_user_content(
-    plan: str,
-    goal: str,
-    files_to_touch: list,
-    head_snapshots: str,
-    repo_pack: str,
-    omitted_note: str,
-    *,
-    context_level: str = "",
-    context_notes: str = "",
-    include_tests: bool = False,
-) -> str:
-    parts = [
-        f"## Implementation Plan Under Review\n\n**Goal:** {goal}\n\n**Proposed Plan:**\n{plan}\n",
-        (
-            "## Plan Context Contract\n\n"
-            f"**Context level:** {context_level}\n"
-            f"**Include tests in generated Atlas:** {bool(include_tests)}\n"
-        ),
-    ]
-    if context_notes:
-        parts.append(f"**Agent context notes:** {context_notes}\n")
-
-    if files_to_touch:
-        parts.append(f"**Files planned to touch:** {', '.join(files_to_touch)}\n")
-
-    if head_snapshots:
-        parts.append(f"## Current State of Planned-Touch Files (HEAD)\n\n{head_snapshots}\n")
-
-    if repo_pack:
-        parts.append(f"## Generated Repository Atlas (for cross-module analysis)\n\n{repo_pack}")
-
-    if omitted_note:
-        parts.append(omitted_note)
-
-    return "\n".join(parts)
+def _render_done_when(rows: List[Mapping[str, Any]]) -> str:
+    if not rows:
+        return "  (none stated yet)"
+    return "\n".join(f"  - {r.get('id')}: {r.get('claim')}" + (f" — shown by: {r.get('support')}" if r.get("support") else "")
+                     for r in rows)
 
 
-def _resolve_plan_context_level(raw_level: str) -> str:
-    level = str(raw_level or "").strip().lower()
-    valid = {"minimal", "localized", "broad", "constitutional"}
-    if level not in valid:
-        allowed = ", ".join(sorted(valid))
-        raise ValueError(
-            "plan_task requires an explicit context_level chosen by the agent "
-            f"({allowed}); do not rely on host-side auto selection."
-        )
-    return level
+def render_record(record: Mapping[str, Any], decision: Mapping[str, Any], legacy: Optional[Mapping[str, Any]] = None,
+                  legacy_error: Optional[Mapping[str, str]] = None) -> str:
+    """The read view as text: current revision, council, open objections, gate facts."""
+    view = plan_record.read_view(record, legacy)
+    revision = view.get("revision")
+    if revision is None:
+        imported = [o for o in (decision.get("open_objections") or []) if o.get("legacy")]
+        lead = "No plan revision recorded for this task yet. Write one: goal, done_when, affected_paths ([] for no files), plan."
+        if imported:
+            lead += ("\n\nImported from this task's previous plan review (still open until their raisers withdraw them):\n- "
+                     + "\n- ".join(f"{o['seat_id']} / {o['id']}: {o.get('text')}" for o in imported))
+        return lead
+    lines = [f"# Plan — revision {revision.get('n')} of {view['revisions']}"
+             + (" (body plan: " + str(revision.get("body_note") or "changes Ouroboros's own body") + ")" if revision.get("body") else "")]
+    lines += [f"goal: {revision.get('goal') or '(none)'}", "done_when:", _render_done_when(revision.get("done_when") or []),
+              f"affected_paths: {json.dumps(revision.get('affected_paths') or [], ensure_ascii=False)}",
+              "plan:", (str(revision.get("plan") or "").strip() or "(no prose)")
+              + ("" if revision.get("plan_inline", True) else "  [prose moved to its exact source: " + str((revision.get("text_ref") or {}).get("path") or "") + "]"),
+              ""]
+    lines.append("## Council")
+    if not view["asks"]:
+        lines.append("No ask yet — nobody has seen this plan. plan_task(ask='council', message=...) sends it.")
+    for ask in view["asks"]:
+        parts = []
+        for p in ask["participants"]:
+            tag = p["status"] + (f" ({p['ignored_items']} malformed item{'' if p['ignored_items'] == 1 else 's'} ignored)"
+                                 if p.get("ignored_items") else "")
+            if p["status"] == "not_dispatched":
+                tag = f"not sent — {p.get('not_dispatched_reason') or 'not sendable'}"
+            elif p["status"] == "failed":
+                tag = plan_packet.failure_tag(p)
+            elif p["status"] == "unparseable":
+                tag = "unparseable" + (f" — {p.get('parse_error')}" if p.get("parse_error") else "")
+            elif p["status"] == "pending" and p.get("unresolved"):
+                tag = ("pending — outcome unknown" + (f" ({p['error']})" if p.get("error") else "")
+                       + "; a reply may still arrive, and a new ask to it may pay twice")
+            parts.append(f"{p['seat_id']} ({p.get('model') or '?'}{'' if p.get('owner_marked') else ', added'}): {tag}")
+        lines.append(f"- ask {ask['ask_id']} on revision {ask['revision']}" + (f" — «{ask['message']}»" if ask.get("message") else "")
+                     + ": " + "; ".join(parts))
+    for attempt in view.get("attempts") or []:  # asks no route could take: nobody was called, nothing holds
+        lines.append(f"- attempt at {attempt.get('ts')} on revision {attempt.get('revision')}: no route — "
+                     + "; ".join(f"{sid}: {why}" for sid, why in (attempt.get("not_sendable") or {}).items()) + " (nobody was called)")
+    seen = [f"{sid}: saw revision {v['last_seen_revision']}" + (f", last answered in ask {v['last_answered_ask']}" if v["last_answered_ask"] else ", never answered")
+            for sid, v in view["participants"].items() if v.get("last_seen_revision") is not None]
+    if seen:
+        lines.append("who saw what: " + "; ".join(seen))
+    lines.append("")
+    lines.append("## Open objections")
+    open_rows = decision.get("open_objections") or []
+    if not open_rows:
+        lines.append("none")
+    for row in open_rows:
+        flags = []
+        if row.get("holds"):
+            flags.append("holds your final answer under Blocking" if decision.get("enforcement") == "blocking" and not decision.get("decision_authority")
+                         else "owner-marked reviewer — disclosed, not held under " + ("Cyber Pro" if decision.get("decision_authority") else "Advisory"))
+        else:
+            flags.append("added participant — never holds")
+        if row.get("not_adjudicated"):
+            flags.append("NOT ADJUDICATED in its raiser's last reply")
+        if row.get("legacy"):
+            flags.append("imported from the previous plan review")
+        lines.append(f"- {row['seat_id']} / {row['id']} (ask {row.get('ask_id')}, revision {row.get('revision')}) [{'; '.join(flags)}]: {row.get('text')}")
+    lines.append("Only the participant who raised an objection can withdraw it: ask it again (ask=[its id]) after you revise or answer it.")
+    withdrawn = view.get("withdrawn") or []
+    if withdrawn:
+        lines.append("withdrawn: " + "; ".join(f"{w['seat_id']}/{w['id']} in ask {w['withdrawn_in']} — {w.get('why') or ''}" for w in withdrawn))
+    if view.get("unknown_withdrawals"):
+        lines.append("ignored withdrawals of objections the seat never raised: "
+                     + "; ".join(f"{w['seat_id']}/{w['id']} in ask {w['ask_id']}" for w in view["unknown_withdrawals"]))
+    contributions = [(sid, v["latest_prose"]) for sid, v in view["participants"].items() if v.get("latest_prose")]
+    if contributions:
+        lines.append("")
+        lines.append("## Latest contributions")
+        for sid, prose in contributions:
+            lines.append(f"### {sid}\n{prose}")
+    legacy_rows = (legacy or {}).get("legacy_contributions") or []
+    if legacy_rows:  # read-only history from the earlier plan review's wave: never approval of this revision
+        from ouroboros.utils import truncate_review_artifact
+
+        lines.append("")
+        lines.append("## Legacy contributions (history; not approval of the current revision)")
+        for row in legacy_rows:
+            lines.append(f"### {row['seat_id']} ({row.get('model') or '?'}) — answered the earlier plan review; read back from its retained source\n"
+                         + truncate_review_artifact(str(row.get("text") or ""), limit=6000))
+    collection = (legacy or {}).get("legacy_wave_collection") or {}
+    if collection.get("owed") or collection.get("unknown") or collection.get("failed"):
+        lines.append("")
+        lines.append("legacy wave " + str(collection.get("fingerprint") or "")[:12] + ": "
+                     + "; ".join(f"{name}: {', '.join(collection[name])}" for name in ("owed", "unknown", "failed") if collection.get(name)))
+    lines.append("")
+    lines.append("## Gate")
+    status = str(decision.get("status") or "")
+    if status == "unreadable":  # the same fact the finalization gate reads (I-17): engaged, not absent
+        lines.append("HELD: this task's earlier plan-review state cannot be read"
+                     + (f" ({(legacy_error or {}).get('error')})" if (legacy_error or {}).get("error") else "")
+                     + ", so the gate holds until it can; finish_task(action='stop') ends honestly with unfinished work.")
+    elif status == "held":
+        lines.append("HELD: under Blocking the open objections marked above hold your normal final answer until their raisers withdraw "
+                     "them, the owner hurries or changes enforcement, or you stop honestly with unfinished work (finish_task action=stop).")
+    elif status == "objections_open":
+        lines.append("Open objections are disclosed in your final answer; nothing holds it.")
+    elif status == "awaiting":
+        lines.append(f"Answers still on their way for ask(s) {', '.join(decision.get('pending_asks') or view['pending_asks'])}; silence never holds."
+                     + (f" The dispatch outcome of ask(s) {', '.join(decision['unknown_outcome'])} is unknown: the substrate held the "
+                        "seats when the host lost track, so a reply may still arrive and a new ask to them may pay twice."
+                        if decision.get("unknown_outcome") else ""))
+    elif status == "force_plan_unmet" and decision.get("allow") and decision.get("asks_unroutable"):
+        lines.append("This task was admitted with a planning obligation; your ask reached nobody (no route could take it, "
+                     f"{decision['asks_unroutable']} attempt{'' if decision['asks_unroutable'] == 1 else 's'} recorded) — disclosed in "
+                     "your final answer, not held. Ask again when a route is available.")
+    elif status == "force_plan_unmet":
+        lines.append("This task was admitted with a planning obligation: ask the council before you finish.")
+    else:
+        lines.append("Nothing holds your final answer.")
+    return "\n".join(lines)
 
 
-def _plan_context_target_tokens(level: str) -> int:
-    return {
-        "localized": 80_000,
-        "broad": 350_000,
-        "constitutional": 850_000,
-    }.get(str(level or ""), 80_000)
+def _publish(ctx: ToolContext, record: Mapping[str, Any], *, effect: str, notes: List[str],
+             legacy: Optional[Dict[str, Any]] = None, legacy_error: Optional[Dict[str, str]] = None) -> str:
+    state_root, task_id = plan_ask.state_location(ctx)
+    if legacy is None:
+        legacy, legacy_error = plan_record.legacy_facts(state_root, task_id)
+    legacy_error = dict(legacy_error or {})
+    # An earlier-schema state that cannot be read holds the finalization gate (owner_hurry._plan_facts);
+    # the tool's read says the same, never "nothing holds".
+    decision = _decision(ctx, record, legacy, unreadable=legacy_error.get("source") == "plan_review_state")
+    text = ("\n".join(notes) + "\n\n" if notes else "") + render_record(record, decision, legacy, legacy_error)
+    latest = plan_record.latest_revision(record)
+    return _publish_tool_result(ctx, ToolResult(status="ok", code="OK", text=text, meta={
+        "plan_effect": effect,
+        "plan_revision": int(latest.get("n") or 0) if latest else 0,
+        "plan_open_objections": len(decision.get("open_objections") or []),
+        "plan_holding": len(decision.get("holding") or []),
+        "plan_pending_asks": len(decision.get("pending_asks") or []),
+    }))
 
 
-def _classify_reviewer_error(exc: BaseException, model: str) -> str:
-    """Return actionable reviewer failure text without swallowing details."""
-    import json
-
-    exc_type = type(exc).__name__
-    exc_str = str(exc)
-
-    # JSONDecodeError usually means provider returned a non-JSON error body.
-    if isinstance(exc, json.JSONDecodeError):
-        return (
-            f"API error (provider returned non-JSON response body — likely oversized prompt "
-            f"or HTTP error from {model}): {exc_str}"
-        )
-
-    # Import lazily so the module loads without openai installed.
-    try:
-        from openai import (
-            APIConnectionError,
-            APIStatusError,
-            BadRequestError,
-            RateLimitError,
-        )
-        if isinstance(exc, RateLimitError):
-            return f"Rate limit / quota exceeded for {model} (HTTP 429): {exc_str}"
-        if isinstance(exc, BadRequestError):
-            return (
-                f"Bad request for {model} (HTTP 400 — prompt may be too large "
-                f"for this model's context window): {exc_str}"
-            )
-        if isinstance(exc, APIConnectionError):
-            return f"API connection error for {model} (network failure): {exc_str}"
-        if isinstance(exc, APIStatusError):
-            status = getattr(exc, "status_code", "?")
-            return f"API status error {status} for {model}: {exc_str}"
-    except ImportError:
-        pass
-
-    # Catch-all: preserve the full unknown exception text.
-    return f"{exc_type}: {exc_str}"
-
-
-def _parse_aggregate_signal(text: str) -> str:
-    """Extract the final valid ``AGGREGATE:`` signal from reviewer text."""
-    import re
-    pattern = re.compile(
-        r"^\s*AGGREGATE\s*:\s*(GREEN|REVIEW_REQUIRED|REVISE_PLAN)\s*$",
-        re.IGNORECASE | re.MULTILINE,
-    )
-    matches = pattern.findall(text)
-    if matches:
-        return matches[-1].upper()
-    return ""
-
-
-def _get_review_models() -> list[str]:
-    """Return up to 3 review-model slots, preserving explicit duplicates."""
-    from ouroboros import config as _cfg
-
-    models = list(_cfg.get_review_models() or [])
-    if not models:
-        main = os.environ.get("OUROBOROS_MODEL", _cfg.SETTINGS_DEFAULTS["OUROBOROS_MODEL"])
-        models = [main]
-
-    return models[:3]  # cap at 3
-
-
-def _load_plan_checklist() -> str:
-    """Load the Plan Review Checklist section from CHECKLISTS.md."""
-    try:
-        return load_checklist_section("Plan Review Checklist")
-    except Exception as e:
-        log.warning("Could not load Plan Review Checklist: %s", e)
-        return ""
-
-
-def _load_bible(repo_dir) -> str:
-    return load_governance_doc(repo_dir, "BIBLE.md", on_missing="explicit")
-
-
-def _load_doc(repo_dir, rel_path: str) -> str:
-    return load_governance_doc(repo_dir, rel_path, on_missing="explicit")
+# The retired form reaches the handler through the registry's hidden-legacy seam so the
+# refusal can name the new form; the model-visible schema never lists these keys.
+setattr(_handle_plan_task, "_hidden_legacy_params", tuple(sorted(RETIRED_FIELDS)))

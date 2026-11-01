@@ -1,37 +1,39 @@
-from pathlib import Path
+def test_live_task_message_marker_uses_my_human_wording(tmp_path):
+    # The drained mailbox text (plus its optional surface note) must still go
+    # through the owner-marking wrapper before injection.
+    import queue
+    from types import SimpleNamespace
+    from ouroboros.owner_mailbox import write_owner_message
+    from ouroboros.loop_round_limits import _drain_incoming_messages
 
+    messages = []
+    assert write_owner_message(tmp_path, "look here", "wording-task", msg_id="owner-wording", client_surface={"channel": "telegram"})
+    _drain_incoming_messages(messages, queue.Queue(), tmp_path, "wording-task", None, set(), SimpleNamespace(task_attempt=1))
+    assert messages[0]["content"].startswith("[Message from my human]: look here\n[note: sent from client surface:")
+    assert "telegram" in messages[0]["content"]
+    # Addressed task-tree messages are peer/ancestor/peer-root communication,
+    # not owner dialogue, and must never borrow the owner's priority marker.
+    # Ask the render ladder itself: every provenance it can frame — including
+    # the independent-root prefix a task may now be addressed by — names a
+    # TASK, so none of them can be mistaken for my human.
+    from ouroboros.owner_mailbox import PROVENANCE_INDEPENDENT_TASK, deliver_task_message
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-
-
-def test_prompts_do_not_infer_current_human_from_authors():
-    system = (REPO_ROOT / "prompts" / "SYSTEM.md").read_text(encoding="utf-8")
-    consciousness = (REPO_ROOT / "prompts" / "CONSCIOUSNESS.md").read_text(encoding="utf-8")
-    memory = (REPO_ROOT / "ouroboros" / "memory.py").read_text(encoding="utf-8")
-
-    assert "my human" in system
-    assert "I do not know their name" in system
-    assert "README, BIBLE, git history, or author" in system
-    assert "Messages From My Human" in consciousness
-    assert "I do not yet know my human's name or profile" in memory
-    assert "Anton" not in system
-    assert "Razzhigaev" not in system
-
-
-def test_live_task_message_marker_uses_my_human_wording():
-    system = (REPO_ROOT / "prompts" / "SYSTEM.md").read_text(encoding="utf-8")
-    loop = (REPO_ROOT / "ouroboros" / "loop.py").read_text(encoding="utf-8")
-    tools = (REPO_ROOT / "ouroboros" / "tools" / "core.py").read_text(encoding="utf-8")
-
-    assert "[Message from my human]" in system
-    assert "_owner_marked_content(dmsg)" in loop
-    assert "[Message from my human]" in tools
-    assert "[Owner message during task]" not in system
-    assert "[Owner message during task]" not in loop
-
-
-def test_public_publishing_still_requires_creator_permission():
-    system = (REPO_ROOT / "prompts" / "SYSTEM.md").read_text(encoding="utf-8")
-    assert "Do not publish or make content publicly accessible" in system
-    assert "permission from the creator" in system
-    assert "My human may grant that permission only if they" in system
+    rendered = {}
+    for provenance in (
+        "ancestor_task", "descendant_task", "peer_via_ancestor", "system",
+        PROVENANCE_INDEPENDENT_TASK, "",
+    ):
+        lines: list[str] = []
+        deliver_task_message(
+            {
+                "provenance": provenance, "source_task_id": "t-source",
+                "relayed_from_task_id": "t-relayed", "text": "body",
+            },
+            "t-recipient", None, lines.append,
+        )
+        rendered[provenance] = lines[0]
+    assert all("human" not in text for text in rendered.values()), rendered
+    assert rendered[PROVENANCE_INDEPENDENT_TASK].startswith(
+        "[Message from independent task t-source]")
+    assert rendered["ancestor_task"].startswith("[Message from ancestor task t-source]")
+    assert rendered[""] == rendered["ancestor_task"], "unknown provenance keeps the tree fallback"

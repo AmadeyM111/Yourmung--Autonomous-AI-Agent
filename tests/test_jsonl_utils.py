@@ -35,6 +35,27 @@ def test_iter_jsonl_objects_supports_tail_and_max_entries(tmp_path):
     assert list(iter_jsonl_objects(path, tail_bytes=0)) == []
 
 
+def test_iter_jsonl_objects_reports_raw_tail_truncation(tmp_path):
+    from ouroboros.utils import iter_jsonl_objects
+
+    path = tmp_path / "events.jsonl"
+    path.write_text(
+        "\n".join([
+            json.dumps({"i": 0}),
+            "",
+            json.dumps({"i": 1}),
+            json.dumps({"i": 2}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    gaps = set()
+
+    rows = list(iter_jsonl_objects(path, max_entries=3, gap_reasons=gaps))
+
+    assert [row["i"] for row in rows] == [1, 2]
+    assert gaps == {"max_entries_truncated"}
+
+
 def test_iter_jsonl_objects_tail_keeps_line_boundary_start(tmp_path):
     from ouroboros.utils import iter_jsonl_objects
 
@@ -81,6 +102,9 @@ def test_supervisor_usage_summaries_use_shared_cost_normalizer(tmp_path, monkeyp
         encoding="utf-8",
     )
 
+    from ouroboros import usage_store
+
+    usage_store.migrate_from_journal(tmp_path)  # the lifecycle job the server runs before any display
     assert state.budget_breakdown({}) == {"task": 1.25, "review": 0.5}
     assert state.model_breakdown({})["m2"]["cost"] == 0.5
     assert [item["task_id"] for item in state.per_task_cost_summary(max_tasks=2)] == ["a", "b"]

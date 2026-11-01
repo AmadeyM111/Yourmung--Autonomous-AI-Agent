@@ -13,26 +13,15 @@ import zipfile
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from ouroboros.config import get_runtime_mode
+from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
+
 log = logging.getLogger(__name__)
 
 
 _MAX_TOTAL_BYTES = 50 * 1024 * 1024  # 50 MB total uncompressed
 _MAX_FILE_COUNT = 200
 _MAX_PER_FILE_BYTES = 8 * 1024 * 1024  # 8 MB per individual file
-
-# Mirrors ClawHub text allowlist plus inert assets; loadable binaries stay denied.
-_ALLOWED_EXTENSIONS = frozenset({
-    ".md", ".markdown", ".txt", ".rst", ".org", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
-    ".py", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
-    ".html", ".htm", ".css", ".scss", ".sass", ".svg", ".csv", ".tsv", ".sql", ".graphql", ".gql",
-    ".lock", ".license", ".png", ".jpg", ".jpeg", ".gif", ".webp",
-})
-
-_ALLOWED_BARE_BASENAMES = frozenset({
-    "LICENSE", "COPYING", "NOTICE", "README", "CHANGELOG", "AUTHORS", "CONTRIBUTORS", "AGENTS",
-    ".gitignore", ".npmignore", ".editorconfig", ".gitattributes", ".eslintrc", ".prettierrc", ".nvmrc",
-})
-
 
 class FetchError(RuntimeError):
     """Archive validation failed closed."""
@@ -85,7 +74,7 @@ def _is_sensitive(path: pathlib.PurePosixPath) -> bool:
 
 def _is_loadable_binary(path: pathlib.PurePosixPath) -> bool:
     try:
-        from ouroboros.skill_review import _LOADABLE_BINARY_EXTENSIONS
+        from ouroboros.skill_review_packs import _LOADABLE_BINARY_EXTENSIONS
     except Exception:  # pragma: no cover
         return False
     name_lower = path.name.lower()
@@ -98,13 +87,17 @@ def _has_review_opaque_dir(path: pathlib.PurePosixPath) -> bool:
 
 def _validate_member_path(name: str) -> pathlib.PurePosixPath:
     """Normalize and reject absolute/traversal zip members before extraction."""
-    cleaned = name.replace("\\", "/").lstrip("/")
+    cleaned = name.replace("\\", "/")
     _reject_if(not cleaned, f"Archive member has empty path: {name!r}")
     posix = pathlib.PurePosixPath(cleaned)
     _reject_if(bool(posix.is_absolute() or posix.anchor), f"Archive member uses absolute path: {name!r}")
     parts = posix.parts
     _reject_if(any(part == ".." for part in parts), f"Archive member uses '..' traversal: {name!r}")
     _reject_if(any(part.startswith("/") for part in parts), f"Archive member has malformed segment: {name!r}")
+    # Windows drive/ADS escapes: a "C:" segment re-roots pathlib joins on
+    # Windows and ":" opens NTFS alternate data streams.
+    _reject_if(any(":" in part or "\\" in part for part in parts),
+               f"Archive member contains ':' or backslash segment: {name!r}")
     return posix
 
 
@@ -120,16 +113,6 @@ def _classify_member(member: zipfile.ZipInfo) -> str:
     return "file"
 
 
-def _extension_allowed(path: pathlib.PurePosixPath) -> bool:
-    name_lower = path.name.lower()
-    if path.name in _ALLOWED_BARE_BASENAMES or name_lower in {
-        bn.lower() for bn in _ALLOWED_BARE_BASENAMES
-    }:
-        return True
-    suffix = path.suffix.lower()
-    return suffix in _ALLOWED_EXTENSIONS
-
-
 def stage(
     archive_bytes: bytes,
     *,
@@ -139,6 +122,7 @@ def stage(
     staging_root: Optional[pathlib.Path] = None,
 ) -> StagedSkill:
     """Validate and extract into a private staging dir, cleaning up on failure."""
+    advisory = mode_has_unrestricted_agency(get_runtime_mode())
     _reject_if(
         not isinstance(archive_bytes, (bytes, bytearray)),
         f"archive_bytes must be bytes, got {type(archive_bytes).__name__}",
@@ -196,13 +180,16 @@ def stage(
                             rel_path = pathlib.PurePosixPath(*parts[1:])
                             if not rel_path.parts:
                                 continue
-                    _reject_if(_is_sensitive(rel_path), f"Archive contains sensitive-shape filename {rel_path}")
-                    _reject_if(_has_review_opaque_dir(rel_path), f"Archive contains review-opaque dependency directory {rel_path}")
-                    _reject_if(
-                        _is_loadable_binary(rel_path),
-                        f"Archive contains loadable-binary file {rel_path} (.so/.dll/.wasm/.pyc/.exe etc. are not permitted)",
-                    )
-                    _reject_if(not _extension_allowed(rel_path), f"Archive contains disallowed extension: {rel_path}")
+                    for finding, reason in (
+                        (_is_sensitive(rel_path), f"Archive contains sensitive-shape filename {rel_path}"),
+                        (_has_review_opaque_dir(rel_path), f"Archive contains review-opaque dependency directory {rel_path}"),
+                        (_is_loadable_binary(rel_path), f"Archive contains loadable-binary file {rel_path}"),
+                    ):
+                        if finding:
+                            if advisory:
+                                log.warning("Cyber Pro archive advice: %s", reason)
+                            else:
+                                raise FetchError(reason)
                     _reject_if(
                         member.file_size > _MAX_PER_FILE_BYTES,
                         f"Archive member {rel_path} is {member.file_size} bytes (cap {_MAX_PER_FILE_BYTES})",
@@ -210,6 +197,14 @@ def stage(
                     file_count += 1
                     _reject_if(file_count > _MAX_FILE_COUNT, f"Archive exceeds file count cap {_MAX_FILE_COUNT}")
                     target_path = staging_dir / pathlib.Path(*rel_path.parts)
+                    # Post-join containment: belt-and-braces against any
+                    # platform-specific join surprise the lexical checks missed.
+                    _reject_if(
+                        not target_path.resolve(strict=False).is_relative_to(
+                            staging_dir.resolve(strict=False)
+                        ),
+                        f"Archive member escapes staging dir after join: {rel_path}",
+                    )
                     target_path.parent.mkdir(parents=True, exist_ok=True)
                     with zf.open(member, "r") as src:
                         # Zip-bomb defense: trust actual cap+1 read, not file_size metadata.
@@ -246,6 +241,58 @@ def stage(
             has_skill_md=has_skill_md,
             has_plugin_manifest=has_plugin_manifest,
         )
+    except Exception:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+
+
+def copy_tree_checked(source: pathlib.Path, staging_dir: pathlib.Path) -> int:
+    """Copy a skill folder from a source clone into ``staging_dir`` under the archive policy.
+
+    The same bounds as an archive: no symlinks, no traversal, review-opaque or loadable-binary files
+    refused outside Cyber Pro (advice there), per-file and total size caps, a file-count cap. The
+    loader's cache names (``.git``, ``__pycache__``, ``node_modules``...) are not copied: they are never
+    part of a release digest either. Returns the number of files copied; a refusal removes ``staging_dir``.
+    """
+    from ouroboros.skill_loader import _SKILL_DIR_CACHE_NAMES as skip
+
+    advisory = mode_has_unrestricted_agency(get_runtime_mode())
+    source = pathlib.Path(source)
+    total = count = 0
+    staging_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        pending = [source]
+        while pending:
+            directory = pending.pop()
+            for path in sorted(directory.iterdir()):
+                if path.name in skip:
+                    continue
+                rel = pathlib.PurePosixPath(path.relative_to(source).as_posix())
+                _reject_if(path.is_symlink(), f"Skill file {rel} is a symlink (rejected)")
+                if path.is_dir():
+                    pending.append(path)
+                    continue
+                for finding, reason in (
+                    (_is_sensitive(rel), f"Skill contains sensitive-shape filename {rel}"),
+                    (_is_loadable_binary(rel), f"Skill contains loadable-binary file {rel}"),
+                ):
+                    if finding:
+                        if advisory:
+                            log.warning("Cyber Pro skill copy advice: %s", reason)
+                        else:
+                            raise FetchError(reason)
+                size = path.stat().st_size
+                _reject_if(size > _MAX_PER_FILE_BYTES, f"Skill file {rel} is {size} bytes (cap {_MAX_PER_FILE_BYTES})")
+                total += size
+                count += 1
+                _reject_if(total > _MAX_TOTAL_BYTES, f"Skill exceeds {_MAX_TOTAL_BYTES} bytes")
+                _reject_if(count > _MAX_FILE_COUNT, f"Skill exceeds file count cap {_MAX_FILE_COUNT}")
+                target = staging_dir / pathlib.Path(*rel.parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, target)
+        _reject_if(not ((staging_dir / "SKILL.md").is_file() or (staging_dir / "skill.json").is_file()),
+                   "Skill folder has no SKILL.md or skill.json")
+        return count
     except Exception:
         shutil.rmtree(staging_dir, ignore_errors=True)
         raise
@@ -295,6 +342,7 @@ def _common_top_prefix(members: List[zipfile.ZipInfo]) -> str:
 __all__ = [
     "FetchError",
     "StagedSkill",
+    "copy_tree_checked",
     "land_staged_tree",
     "stage",
 ]

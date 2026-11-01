@@ -5,9 +5,12 @@ Covers:
   - POLICY_CHECK: always LLM call.
   - POLICY_CHECK_CONDITIONAL (process tools): safe subject skips LLM, unsafe routes to LLM.
   - DEFAULT_POLICY: unknown tools fall through to LLM check.
+  - Declared policy: a built-in's ToolEntry.safety_policy routes a name the
+    table omits; the table outranks it; an invalid value is checked.
   - LLM verdict handling: SAFE / SUSPICIOUS / DANGEROUS.
   - LLM failure paths: exception, unparseable response.
-  - Coverage invariant: every built-in tool name has an explicit TOOL_POLICY entry.
+  - Coverage invariant: every built-in tool name has exactly one explicit policy,
+    a TOOL_POLICY entry or its own declaration.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from __future__ import annotations
 import json
 import pathlib
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,7 +45,7 @@ class _StubLLMClient:
 
     def __init__(
         self,
-        response_content: str,
+        response_content: str | list[str],
         *,
         raise_exc: Exception | None = None,
         usage: dict | None = None,
@@ -51,17 +55,27 @@ class _StubLLMClient:
         self.usage = usage
         self.calls: list[dict] = []
 
-    def chat(self, *, messages, model, use_local):
-        self.calls.append({"messages": messages, "model": model, "use_local": use_local})
+    def chat(self, *, messages, model, use_local, **kwargs):
+        # v6.54.3 parse-fix params (max_tokens / reasoning_effort / timeout /
+        # response_format) ride through **kwargs and are recorded for assertions.
+        self.calls.append({"messages": messages, "model": model, "use_local": use_local, **kwargs})
         if self.raise_exc is not None:
             raise self.raise_exc
-        return {"content": self.response_content}, self.usage
+        if isinstance(self.response_content, list):
+            idx = min(len(self.calls) - 1, len(self.response_content) - 1)
+            content = self.response_content[idx]
+        else:
+            content = self.response_content
+        return {"content": content}, self.usage
 
 
 def _patch_llm_client(monkeypatch, stub: _StubLLMClient) -> None:
     import ouroboros.safety as safety
+    from ouroboros.llm import LLMClient
 
-    monkeypatch.setattr(safety, "LLMClient", lambda: stub)
+    factory = lambda: stub
+    factory.supports_response_format = LLMClient.supports_response_format
+    monkeypatch.setattr(safety, "LLMClient", factory)
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +97,21 @@ def test_policy_skip_does_not_call_llm(monkeypatch):
     assert stub.calls == []
 
 
+def test_send_links_policy_skip_does_not_call_llm(monkeypatch):
+    from ouroboros.safety import check_safety
+
+    stub = _StubLLMClient('{"status":"DANGEROUS","reason":"should not be called"}')
+    _patch_llm_client(monkeypatch, stub)
+
+    ok, msg = check_safety(
+        "send_links", {"links": [{"label": "Docs", "url": "https://example.com"}]},
+    )
+
+    assert ok is True
+    assert msg == ""
+    assert stub.calls == []
+
+
 def test_policy_check_calls_llm(monkeypatch):
     """A tool marked POLICY_CHECK must always invoke the LLM."""
     from ouroboros.safety import check_safety
@@ -90,11 +119,36 @@ def test_policy_check_calls_llm(monkeypatch):
     stub = _StubLLMClient('{"status":"SAFE","reason":"ok"}')
     _patch_llm_client(monkeypatch, stub)
 
-    ok, msg = check_safety("comment_on_pr", {"pr_number": 1, "body": "hi"})
+    ok, msg = check_safety("github_write", {"method": "comment", "target": 1, "body": "hi"})
 
     assert ok is True
     assert msg == ""
     assert len(stub.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("model", "key_name"),
+    [
+        ("poolside/laguna-xs.2:free", "LAGUNA_API_KEY"),
+        ("google/gemma-4-26b-a4b-it:free", "GEMMA_API_KEY"),
+        ("google/gemma-4-31b-it:free", "GEMA_API_KEY"),
+        ("nvidia/nemotron-3-nano-30b-a3b:free", "NEMOTRON_API_KEY"),
+    ],
+)
+def test_model_scoped_openrouter_key_enables_safety_backend(monkeypatch, model, key_name):
+    from ouroboros.safety import check_safety
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv(key_name, "model-scoped-key")
+    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", model)
+    stub = _StubLLMClient('{"status":"SAFE","reason":"ok"}')
+    _patch_llm_client(monkeypatch, stub)
+
+    ok, msg = check_safety("comment_on_pr", {"pr_number": 1, "body": "hi"})
+
+    assert ok is True
+    assert msg == ""
+    assert stub.calls[0]["model"] == model
 
 
 def test_unknown_tool_defaults_to_check(monkeypatch):
@@ -108,6 +162,53 @@ def test_unknown_tool_defaults_to_check(monkeypatch):
 
     assert ok is True
     assert len(stub.calls) == 1, "Unknown tools must hit the LLM default path"
+
+
+@pytest.mark.parametrize(("tool_name", "declared", "llm_calls"), [
+    # A built-in's own declaration routes a name the table does not list.
+    ("agent_created_tool", "skip", 0),
+    # The protected table outranks a declaration: a listed tool keeps its check.
+    ("pr_merge", "skip", 1),
+    # An invalid declaration (misspelled or not a string) is DEFAULT_POLICY.
+    ("agent_created_tool", "skp", 1),
+    ("agent_created_tool", ["skip"], 1),
+    # No declaration: the unknown-tool default.
+    ("agent_created_tool", "", 1),
+])
+def test_declared_policy_fills_only_unlisted_names(monkeypatch, tool_name, declared, llm_calls):
+    from ouroboros.safety import check_safety
+
+    stub = _StubLLMClient('{"status":"SAFE","reason":"ok"}')
+    _patch_llm_client(monkeypatch, stub)
+
+    ok, msg = check_safety(tool_name, {"arg": 1}, declared_policy=declared)
+
+    assert (ok, msg) == (True, "")
+    assert len(stub.calls) == llm_calls
+
+
+def test_registry_passes_the_entry_declaration(tmp_path, monkeypatch):
+    """First-party dispatch hands the real router its entry's declaration: the
+    declared twin reaches no Supervisor call, the undeclared one reaches one."""
+    import ouroboros.safety as safety
+    from ouroboros.tools.registry import ToolEntry, ToolRegistry
+
+    supervised = []
+
+    def supervisor(name, *_args, **_kwargs):
+        supervised.append(name)
+        return True, ""
+
+    monkeypatch.setattr(safety, "_run_llm_check", supervisor)
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    for name, declared in (("declared_fixture", "skip"), ("plain_fixture", "")):
+        registry.register(ToolEntry(name, {
+            "name": name, "description": "fixture",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        }, lambda _ctx: "ok", safety_policy=declared))
+        assert registry.execute_result(name, {}).status == "ok"
+
+    assert supervised == ["plain_fixture"]
 
 
 def test_run_shell_conditional_safe_subject_skips_llm(monkeypatch):
@@ -148,10 +249,28 @@ def test_llm_verdict_safe_proceeds_silently(monkeypatch):
     stub = _StubLLMClient('{"status":"SAFE","reason":"all good"}')
     _patch_llm_client(monkeypatch, stub)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"})
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"})
 
     assert ok is True
     assert msg == ""
+
+
+def test_safety_calls_request_low_effort(monkeypatch):
+    """v6.73.2 (owner 7b): the safety supervisor requests "low", not "none" —
+    some endpoints make reasoning mandatory and 400 on disabled reasoning (the
+    2026-07-20 gemini-3.5-flash incident); the learned-floor machinery in llm.py
+    remains the general class fix. BOTH the primary and the parse-repair call
+    carry the literal."""
+    from ouroboros.safety import check_safety
+
+    stub = _StubLLMClient(["not json at all", '{"status":"SAFE","reason":"ok"}'])
+    _patch_llm_client(monkeypatch, stub)
+
+    ok, _ = check_safety("github_write", {"method": "create_issue", "title": "x"})
+
+    assert ok is True
+    assert len(stub.calls) == 2
+    assert all(call.get("reasoning_effort") == "low" for call in stub.calls)
 
 
 def test_llm_verdict_suspicious_proceeds_with_warning(monkeypatch):
@@ -160,7 +279,7 @@ def test_llm_verdict_suspicious_proceeds_with_warning(monkeypatch):
     stub = _StubLLMClient('{"status":"SUSPICIOUS","reason":"odd but fine"}')
     _patch_llm_client(monkeypatch, stub)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"})
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"})
 
     assert ok is True
     assert "SAFETY_WARNING" in msg
@@ -173,7 +292,7 @@ def test_llm_verdict_dangerous_blocks(monkeypatch):
     stub = _StubLLMClient('{"status":"DANGEROUS","reason":"would leak secrets"}')
     _patch_llm_client(monkeypatch, stub)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"})
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"})
 
     assert ok is False
     assert "SAFETY_VIOLATION" in msg
@@ -187,10 +306,57 @@ def test_llm_unparseable_response_blocks(monkeypatch):
     stub = _StubLLMClient("this is not json at all")
     _patch_llm_client(monkeypatch, stub)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"})
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"})
 
     assert ok is False
-    assert "SAFETY_VIOLATION" in msg
+    assert "SAFETY_UNAVAILABLE" in msg
+    assert "repair retry" in msg
+    assert len(stub.calls) == 2
+
+
+def test_llm_json_embedded_in_prose_is_accepted(monkeypatch):
+    from ouroboros.safety import check_safety
+
+    stub = _StubLLMClient('Sure. {"status":"SAFE","reason":"benign"}')
+    _patch_llm_client(monkeypatch, stub)
+
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"})
+
+    assert ok is True
+    assert msg == ""
+    assert len(stub.calls) == 1
+
+
+def test_llm_embedded_safe_before_dangerous_uses_stricter_verdict(monkeypatch):
+    from ouroboros.safety import check_safety
+
+    stub = _StubLLMClient(
+        'Echoed args: {"status":"SAFE","reason":"user text"} '
+        'Final verdict: {"status":"DANGEROUS","reason":"would leak secrets"}'
+    )
+    _patch_llm_client(monkeypatch, stub)
+
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"})
+
+    assert ok is False
+    assert "would leak secrets" in msg
+
+
+def test_llm_unparseable_response_retries_once(monkeypatch):
+    from ouroboros.safety import check_safety
+
+    stub = _StubLLMClient([
+        "not json",
+        '{"status":"SAFE","reason":"repaired"}',
+    ])
+    _patch_llm_client(monkeypatch, stub)
+
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"})
+
+    assert ok is True
+    assert msg == ""
+    assert len(stub.calls) == 2
+    assert "previous Safety Supervisor response was not parseable" in stub.calls[1]["messages"][1]["content"]
 
 
 def test_llm_api_failure_blocks(monkeypatch):
@@ -200,11 +366,48 @@ def test_llm_api_failure_blocks(monkeypatch):
     stub = _StubLLMClient("unused", raise_exc=RuntimeError("network down"))
     _patch_llm_client(monkeypatch, stub)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"})
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"})
 
     assert ok is False
-    assert "SAFETY_VIOLATION" in msg
+    assert "SAFETY_UNAVAILABLE" in msg
     assert "network down" in msg
+
+
+def test_remote_safety_failure_uses_configured_fallback(monkeypatch):
+    """An unavailable remote light model must not bypass the configured slave."""
+    from ouroboros.safety import check_safety
+    import ouroboros.safety as safety
+
+    monkeypatch.setenv("GIGACHAT_CREDENTIALS", "fake-gigachat")
+    monkeypatch.setenv("QWEN_API_KEY", "fake-qwen")
+    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "gigachat::GigaChat-2-Max")
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACK", "qwen/qwen3.6-flash")
+
+    class _FallbackClient:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, *, messages, model, use_local, **_kwargs):
+            self.calls.append({"messages": messages, "model": model, "use_local": use_local})
+            if model.startswith("gigachat::"):
+                raise RuntimeError("No such model")
+            return {"content": '{"status":"SAFE","reason":"ok"}'}, {}
+
+    stub = _FallbackClient()
+    from ouroboros.llm import LLMClient
+
+    factory = lambda: stub
+    factory.supports_response_format = LLMClient.supports_response_format
+    monkeypatch.setattr(safety, "LLMClient", factory)
+
+    ok, msg = check_safety("create_github_issue", {"title": "x"})
+
+    assert ok is True
+    assert msg == ""
+    assert [call["model"] for call in stub.calls] == [
+        "gigachat::GigaChat-2-Max",
+        "qwen/qwen3.6-flash",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -212,21 +415,23 @@ def test_llm_api_failure_blocks(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _collect_all_builtin_tool_names() -> set[str]:
-    """Collect every built-in tool name from ``ToolEntry("name", …)`` literals
-    across ``ouroboros/`` via AST scan.
+def _scan_builtin_tool_literals(root: pathlib.Path | None = None) -> tuple[set[str], dict]:
+    """Every built-in tool name from ``ToolEntry("name", …)`` literals under
+    ``root`` (default ``ouroboros/``) via AST scan, plus the constant
+    ``safety_policy=`` each literal declares.
 
     This covers both:
       - modules picked up by ``ToolRegistry._load_modules`` (via ``get_tools()``);
       - tools manually registered through ``registry.register(ToolEntry(…))``
         outside ``get_tools()`` (e.g. ``ouroboros/consciousness.py``'s
         ``set_next_wakeup``), which would otherwise slip past a registry-only
-        scan.
+        scan. A non-constant declaration is read from the live registry instead.
     """
     import ast
 
-    root = pathlib.Path(__file__).resolve().parent.parent / "ouroboros"
+    root = root or pathlib.Path(__file__).resolve().parent.parent / "ouroboros"
     names: set[str] = set()
+    declared: dict = {}
     for py in root.rglob("*.py"):
         if py.name == "safety.py":
             # TOOL_POLICY itself constructs ToolEntry-looking literals nowhere,
@@ -258,13 +463,30 @@ def _collect_all_builtin_tool_names() -> set[str]:
                         break
             if isinstance(cand, ast.Constant) and isinstance(cand.value, str):
                 names.add(cand.value)
-    return names
+                for kw in node.keywords:
+                    if kw.arg == "safety_policy" and isinstance(kw.value, ast.Constant) and kw.value.value != "":
+                        declared[cand.value] = kw.value.value
+    return names, declared
+
+
+def _policy_coverage_problems(names, declared: dict, table) -> dict:
+    """Why ``names`` do not each carry exactly one explicit, known policy."""
+    from ouroboros.safety import POLICY_VALUES
+
+    return {
+        "missing": sorted(set(names) - set(table) - set(declared)),
+        "declared_and_listed": sorted(set(declared) & set(table)),
+        "invalid": {name: value for name, value in sorted(declared.items())
+                    if not (isinstance(value, str) and value in POLICY_VALUES)},
+    }
 
 
 def test_tool_policy_covers_all_builtin_tools():
     """Every built-in tool — whether exported via ``get_tools()`` or registered
-    manually via ``registry.register(ToolEntry(…))`` — MUST have an explicit
-    entry in ``TOOL_POLICY``.
+    manually via ``registry.register(ToolEntry(…))`` — MUST carry exactly one
+    explicit, known safety policy: its own ``ToolEntry.safety_policy`` OR an
+    entry in the protected ``TOOL_POLICY`` table, never both (the table would
+    silently outrank the declaration).
 
     Without this invariant, a new built-in tool would silently fall through to
     ``DEFAULT_POLICY = POLICY_CHECK`` and pay an LLM call per invocation, which
@@ -277,8 +499,10 @@ def test_tool_policy_covers_all_builtin_tools():
         tmp_path = pathlib.Path(tmp)
         registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
         discovered = set(registry.available_tools())
+        live_declared = {name: entry.safety_policy for name, entry in registry._entries.items()
+                         if entry.safety_policy}
 
-    ast_scanned = _collect_all_builtin_tool_names()
+    ast_scanned, ast_declared = _scan_builtin_tool_literals()
     builtin_names = discovered | ast_scanned
 
     # Sanity: the AST scan must at least include the auto-loaded set.
@@ -288,25 +512,67 @@ def test_tool_policy_covers_all_builtin_tools():
         f"{sorted(discovered - ast_scanned)}"
     )
 
-    missing = builtin_names - set(TOOL_POLICY.keys())
-    assert missing == set(), (
-        "Built-in tools without explicit TOOL_POLICY entry (would hit LLM by "
-        f"default): {sorted(missing)}"
+    problems = _policy_coverage_problems(builtin_names, {**ast_declared, **live_declared}, TOOL_POLICY)
+    assert problems == {"missing": [], "declared_and_listed": [], "invalid": {}}, (
+        "Each built-in needs one explicit safety policy: ToolEntry.safety_policy "
+        "or a TOOL_POLICY entry, not both, with a known value (a missing one "
+        f"would hit the LLM by default): {problems}"
     )
 
 
+def test_policy_coverage_accepts_one_declared_home_and_refuses_the_rest(tmp_path):
+    """The coverage gate in both directions, on literals it scans itself: a
+    declaration alone covers a tool; no policy, a second home or an unknown
+    value is refused."""
+    from ouroboros.safety import POLICY_CHECK
+
+    (tmp_path / "probe_tools.py").write_text(
+        "from ouroboros.tools.registry import ToolEntry\n"
+        "def get_tools():\n"
+        "    return [\n"
+        "        ToolEntry('declared_tool', {}, print, safety_policy='skip'),\n"
+        "        ToolEntry('silent_tool', {}, print),\n"
+        "        ToolEntry('typo_tool', {}, print, safety_policy='skp'),\n"
+        "        ToolEntry('twice_tool', {}, print, safety_policy='skip'),\n"
+        "    ]\n",
+        encoding="utf-8",
+    )
+
+    names, declared = _scan_builtin_tool_literals(tmp_path)
+
+    assert names == {"declared_tool", "silent_tool", "typo_tool", "twice_tool"}
+    assert declared == {"declared_tool": "skip", "typo_tool": "skp", "twice_tool": "skip"}
+    assert _policy_coverage_problems(names, declared, {"twice_tool": POLICY_CHECK}) == {
+        "missing": ["silent_tool"],
+        "declared_and_listed": ["twice_tool"],
+        "invalid": {"typo_tool": "skp"},
+    }
+
+
 def test_tool_policy_values_are_valid():
-    """Every TOOL_POLICY value must be one of the three known policy constants."""
+    """Every TOOL_POLICY value must be one of the three known policy constants,
+    and they are the whole vocabulary a declaration is validated against."""
     from ouroboros.safety import (
         TOOL_POLICY,
         POLICY_SKIP,
         POLICY_CHECK,
         POLICY_CHECK_CONDITIONAL,
+        POLICY_VALUES,
     )
 
     valid = {POLICY_SKIP, POLICY_CHECK, POLICY_CHECK_CONDITIONAL}
+    assert POLICY_VALUES == valid
     bad = {name: policy for name, policy in TOOL_POLICY.items() if policy not in valid}
     assert bad == {}, f"Invalid policy values: {bad}"
+
+
+def test_cross_focus_projection_tools_have_explicit_skip_policy():
+    """Awareness projections use their existing host guards and never add a
+    model safety round or an unexpected provider call."""
+    from ouroboros.safety import TOOL_POLICY, POLICY_SKIP
+
+    assert TOOL_POLICY["live_roots"] == POLICY_SKIP
+    assert TOOL_POLICY["update_focus"] == POLICY_SKIP
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +634,7 @@ def test_build_check_prompt_includes_runtime_mode(monkeypatch):
     from ouroboros.safety import _build_check_prompt
 
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "pro")
-    prompt = _build_check_prompt("claude_code_edit", {"prompt": "edit"})
+    prompt = _build_check_prompt("run_command", {"command": "ls"})
 
     assert "Runtime mode: pro" in prompt
 
@@ -414,6 +680,7 @@ def test_unknown_tool_under_local_only_config_uses_local_light(monkeypatch):
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
@@ -430,6 +697,25 @@ def test_unknown_tool_under_local_only_config_uses_local_light(monkeypatch):
     assert stub.calls[0]["use_local"] is True
 
 
+def test_minimax_key_enables_remote_safety_routing(monkeypatch):
+    from ouroboros.safety import (
+        _REMOTE_PROVIDER_KEYS,
+        _any_remote_provider_configured,
+        _light_model_has_reachable_provider,
+    )
+
+    for key in _REMOTE_PROVIDER_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+    assert not _any_remote_provider_configured()
+    assert not _light_model_has_reachable_provider("minimax::MiniMax-M2.7")
+
+    monkeypatch.setenv("MINIMAX_API_KEY", "minimax-key")
+
+    assert _any_remote_provider_configured()
+    assert _light_model_has_reachable_provider("minimax::MiniMax-M2.7")
+
+
 def test_unknown_tool_with_no_safety_backend_fails_open_with_warning(monkeypatch):
     """When the runtime has neither remote keys nor local routing configured,
     the safety check must fail open with a visible ``SAFETY_WARNING`` rather
@@ -443,11 +729,12 @@ def test_unknown_tool_with_no_safety_backend_fails_open_with_warning(monkeypatch
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
         "USE_LOCAL_MAIN",
-        "USE_LOCAL_CODE",
+        "USE_LOCAL_HEAVY",
         "USE_LOCAL_LIGHT",
         "USE_LOCAL_FALLBACK",
     ):
@@ -456,7 +743,7 @@ def test_unknown_tool_with_no_safety_backend_fails_open_with_warning(monkeypatch
     stub = _StubLLMClient('{"status":"DANGEROUS","reason":"should not be called"}')
     _patch_llm_client(monkeypatch, stub)
 
-    ok, msg = check_safety("totally_new_tool_misconfigured", {"arg": 1})
+    ok, msg = check_safety("totally_new_tool_misconfigured", {"arg": 1}, ctx=SimpleNamespace(task_metadata={"work_kind": "owner"}))
     assert ok is True
     assert "SAFETY_WARNING" in msg
     assert "not configured" in msg
@@ -474,11 +761,12 @@ def test_openrouter_only_with_direct_provider_light_model_fails_open(monkeypatch
     for k in (
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
         "USE_LOCAL_MAIN",
-        "USE_LOCAL_CODE",
+        "USE_LOCAL_HEAVY",
         "USE_LOCAL_LIGHT",
         "USE_LOCAL_FALLBACK",
     ):
@@ -489,7 +777,7 @@ def test_openrouter_only_with_direct_provider_light_model_fails_open(monkeypatch
     stub = _StubLLMClient('{"status":"DANGEROUS","reason":"should not reach here"}')
     _patch_llm_client(monkeypatch, stub)
 
-    ok, msg = check_safety("totally_new_tool_mismatch", {"arg": 1})
+    ok, msg = check_safety("totally_new_tool_mismatch", {"arg": 1}, ctx=SimpleNamespace(task_metadata={"work_kind": "owner"}))
     assert ok is True
     assert "SAFETY_WARNING" in msg
     assert "provider key missing" in msg or "not configured" in msg
@@ -509,11 +797,12 @@ def test_mixed_remote_local_provider_mismatch_local_failure_fails_open(monkeypat
     for k in (
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
         "USE_LOCAL_LIGHT",
-        "USE_LOCAL_CODE",
+        "USE_LOCAL_HEAVY",
         "USE_LOCAL_FALLBACK",
     ):
         monkeypatch.delenv(k, raising=False)
@@ -524,7 +813,7 @@ def test_mixed_remote_local_provider_mismatch_local_failure_fails_open(monkeypat
     stub = _StubLLMClient("unused", raise_exc=RuntimeError("local server down"))
     _patch_llm_client(monkeypatch, stub)
 
-    ok, msg = check_safety("totally_new_tool_mixed_config", {"arg": 1})
+    ok, msg = check_safety("totally_new_tool_mixed_config", {"arg": 1}, ctx=SimpleNamespace(task_metadata={"work_kind": "owner"}))
     assert ok is True
     assert "SAFETY_WARNING" in msg
     assert "Local safety runtime unreachable" in msg
@@ -540,6 +829,7 @@ def test_explicit_local_light_failure_still_blocks(monkeypatch):
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
@@ -552,7 +842,7 @@ def test_explicit_local_light_failure_still_blocks(monkeypatch):
 
     ok, msg = check_safety("some_tool", {"arg": 1})
     assert ok is False
-    assert "SAFETY_VIOLATION" in msg
+    assert "SAFETY_UNAVAILABLE" in msg
 
 
 def test_local_fallback_runtime_error_fails_open_with_warning(monkeypatch):
@@ -566,6 +856,7 @@ def test_local_fallback_runtime_error_fails_open_with_warning(monkeypatch):
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
@@ -577,7 +868,7 @@ def test_local_fallback_runtime_error_fails_open_with_warning(monkeypatch):
     stub = _StubLLMClient("unused", raise_exc=RuntimeError("local server down"))
     _patch_llm_client(monkeypatch, stub)
 
-    ok, msg = check_safety("totally_new_tool_local_down", {"arg": 1})
+    ok, msg = check_safety("totally_new_tool_local_down", {"arg": 1}, ctx=SimpleNamespace(task_metadata={"work_kind": "owner"}))
     assert ok is True
     assert "SAFETY_WARNING" in msg
     assert "Local safety runtime unreachable" in msg
@@ -634,12 +925,14 @@ def test_python_m_pytest_still_whitelisted_after_pip_removal():
 
 
 def test_check_conditional_is_only_process_tools():
-    """POLICY_CHECK_CONDITIONAL currently applies only to process tools; other
-    tools using it would silently bypass the LLM via the shell whitelist."""
+    """POLICY_CHECK_CONDITIONAL applies only to command-running tools; another tool
+    using it must extend the safe-subject extraction in _run_llm_check or it would
+    silently bypass the LLM via the shell whitelist. verify_and_record runs its
+    declared `check` like run_command (its `check` arg IS wired into the extractor)."""
     from ouroboros.safety import TOOL_POLICY, POLICY_CHECK_CONDITIONAL
 
     conditional = {n for n, p in TOOL_POLICY.items() if p == POLICY_CHECK_CONDITIONAL}
-    assert conditional == {"run_command", "run_script", "start_service"}, (
+    assert conditional == {"run_command", "run_script", "start_service", "verify_and_record"}, (
         "Extend _run_llm_check if you add another check_conditional tool; "
         f"found: {conditional}"
     )
@@ -690,22 +983,14 @@ def test_non_secret_keys_are_not_redacted(key):
     assert not _is_secret_key(key), f"{key!r} should NOT be classified as secret"
 
 
-def test_secret_crossing_truncation_boundary_is_still_redacted():
-    """Redaction must run BEFORE the 500-char message truncation so a
-    Bearer-style token that straddles the cutoff can't evade the regex."""
-    from ouroboros.safety import _format_messages_for_safety
+def test_complete_prompt_sources_are_redacted_without_truncation():
+    from ouroboros.safety import _build_check_prompt
 
     secret = "sk-crossingboundary1234567890ABCDEF"
-    # Place the secret so it starts well before the 500-char cutoff but
-    # extends past it; the pre-truncation redaction must catch the whole shape.
-    prefix = "A" * 480
-    long_text = prefix + secret + "B" * 200
-    output = _format_messages_for_safety([
-        {"role": "user", "content": long_text},
-    ])
-
-    assert "sk-crossingboundary" not in output
-    assert "REDACTED" in output
+    text = "A" * 480 + secret + "B" * 200 + "\nSOURCE_END"
+    prompt = _build_check_prompt("remote_write", {"text": "SUBJECT"}, [{"role": "user", "content": text}])
+    assert secret not in prompt and "REDACTED" in prompt
+    assert "SOURCE_END" in prompt and "SUBJECT" in prompt
 
 
 def test_check_safety_tolerates_none_arguments(monkeypatch):
@@ -810,7 +1095,7 @@ def test_usage_event_uses_resolved_model_and_inferred_provider_on_openrouter(mon
         event_queue = object()
         task_id = "t-openrouter"
 
-    ok, _ = check_safety("create_github_issue", {"title": "x"}, ctx=_Ctx())
+    ok, _ = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=_Ctx())
     assert ok is True
     assert captured["provider"] == "openrouter"
     assert captured["source"] == "safety_check"
@@ -846,7 +1131,7 @@ def test_usage_event_uses_direct_provider_when_resolved_by_client(monkeypatch):
         event_queue = object()
         task_id = "t-anthropic"
 
-    ok, _ = check_safety("create_github_issue", {"title": "x"}, ctx=_Ctx())
+    ok, _ = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=_Ctx())
     assert ok is True
     assert captured["provider"] == "anthropic"
     assert captured["model_name"] == "anthropic/claude-sonnet-4-6"
@@ -854,7 +1139,7 @@ def test_usage_event_uses_direct_provider_when_resolved_by_client(monkeypatch):
     assert isinstance(captured["cost"], float)
 
 
-def test_no_event_queue_falls_back_to_update_budget_from_usage(monkeypatch):
+def test_no_event_queue_preserves_unknown_cost_in_budget_fallback(monkeypatch):
     """When ctx is None (or ctx.event_queue is missing), the safety path must
     attribute spend via ``supervisor.state.update_budget_from_usage`` instead
     of emitting an ``llm_usage`` event — otherwise direct-provider safety
@@ -866,10 +1151,10 @@ def test_no_event_queue_falls_back_to_update_budget_from_usage(monkeypatch):
 
     usage_payload = {
         "resolved_model": "anthropic/claude-sonnet-4.6",
-        "provider": "openrouter",
+        "provider": "anthropic",
         "prompt_tokens": 200,
         "completion_tokens": 50,
-        "cost": 0.0,  # force estimate branch too
+        "cost": None,
     }
     stub = _StubLLMClient('{"status":"SAFE","reason":"ok"}', usage=usage_payload)
     _patch_llm_client(monkeypatch, stub)
@@ -884,15 +1169,15 @@ def test_no_event_queue_falls_back_to_update_budget_from_usage(monkeypatch):
     def _record(usage):
         captured.append(dict(usage))
 
-    monkeypatch.setattr(safety_mod, "update_budget_from_usage", _record)
+    monkeypatch.setattr("supervisor.state.update_budget_from_usage", _record)
 
     # ctx=None path
-    ok, _ = check_safety("create_github_issue", {"title": "x"}, ctx=None)
+    ok, _ = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=None)
     assert ok is True
     assert len(captured) == 1
-    # The estimate should have populated usage['cost'] so the budget
-    # accounting isn't zero-attributed.
-    assert captured[0]["cost"] > 0
+    # Direct Anthropic has no automatic catalog. The fallback must preserve
+    # unknown rather than fabricating a price or silently attributing $0.
+    assert captured[0]["cost"] is None
     assert captured[0]["prompt_tokens"] == 200
 
     # ctx present but without event_queue path
@@ -901,7 +1186,7 @@ def test_no_event_queue_falls_back_to_update_budget_from_usage(monkeypatch):
 
     captured.clear()
     stub.calls.clear()
-    ok2, _ = check_safety("create_github_issue", {"title": "y"}, ctx=_CtxNoQueue())
+    ok2, _ = check_safety("github_write", {"method": "create_issue", "title": "y"}, ctx=_CtxNoQueue())
     assert ok2 is True
     assert len(captured) == 1
 
@@ -914,6 +1199,7 @@ def test_usage_event_uses_local_provider_when_use_local_light(monkeypatch):
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
@@ -936,7 +1222,89 @@ def test_usage_event_uses_local_provider_when_use_local_light(monkeypatch):
         event_queue = object()
         task_id = "t-local"
 
-    ok, _ = check_safety("create_github_issue", {"title": "x"}, ctx=_Ctx())
+    ok, _ = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=_Ctx())
     assert ok is True
     assert captured["provider"] == "local"
     assert "(local)" in captured["model_name"]
+
+
+# ---------------------------------------------------------------------------
+# Host facts of a safety call (ADOPTION D05): where its records land, and who
+# charges it. Both were cwd-/import-coupled before the port.
+# ---------------------------------------------------------------------------
+
+
+def test_safety_drive_root_without_context_is_the_configured_data_root(monkeypatch, tmp_path):
+    """``ctx=None`` — the extension/MCP dispatch shape — used to resolve to the
+    literal ``../data``: whatever directory happens to sit beside the process's
+    cwd. The configured data root is the SSOT, and it is read LATE so a test or
+    a runtime rebind of ``config.DATA_DIR`` is honored rather than frozen at
+    import time."""
+    from ouroboros import config
+    from ouroboros.safety import _safety_drive_root
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "configured-root")
+    assert _safety_drive_root(None) == tmp_path / "configured-root"
+
+    # A context-shaped object that carries no drive_root falls the same way —
+    # never onto a cwd-relative guess.
+    class _NoRoot:
+        task_id = "t"
+
+    assert _safety_drive_root(_NoRoot()) == tmp_path / "configured-root"
+
+
+def test_safety_drive_root_prefers_the_context(tmp_path):
+    """The context owns the answer whenever it has one (isolated benchmark
+    servers and per-worker drives depend on this)."""
+    from ouroboros.safety import _safety_drive_root
+
+    class _Ctx:
+        drive_root = str(tmp_path / "ctx-root")
+
+    assert _safety_drive_root(_Ctx()) == tmp_path / "ctx-root"
+
+
+def test_importing_safety_does_not_import_supervisor_state():
+    """The budget writer is imported AT CALL TIME. ``ouroboros.safety`` is
+    imported by every worker and consulted on every guarded tool call, so an
+    import-time edge into the supervisor package is a cycle risk the six
+    sibling call sites of this writer already avoid. Asserted in a CLEAN
+    interpreter: in-process, an earlier test's import would mask a regression."""
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; import ouroboros.safety; "
+         "print('supervisor.state' in sys.modules)"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "False", proc.stdout
+
+
+def test_record_safety_usage_prefers_the_injected_ledger_writer(monkeypatch):
+    """A context that owns its accounting is charged where it lives; the
+    process-wide supervisor state is the FALLBACK, not the first choice."""
+    import supervisor.state as sup_state
+    from ouroboros.safety import _record_safety_usage
+
+    def _explode(_usage):  # pragma: no cover — guardrail
+        raise AssertionError("the injected sink must win over supervisor state")
+
+    monkeypatch.setattr(sup_state, "update_budget_from_usage", _explode)
+
+    seen: list = []
+
+    class _Ctx:
+        update_budget_from_usage = staticmethod(seen.append)
+
+    _record_safety_usage(_Ctx(), {"cost": 0.5})
+    assert seen == [{"cost": 0.5}]
+
+    # No sink on the context -> the process's own supervisor state.
+    fallback: list = []
+    monkeypatch.setattr(sup_state, "update_budget_from_usage", fallback.append)
+    _record_safety_usage(None, {"cost": 0.25})
+    assert fallback == [{"cost": 0.25}]

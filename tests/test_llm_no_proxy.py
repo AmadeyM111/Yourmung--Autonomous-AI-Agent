@@ -5,16 +5,30 @@ Covers:
 - chat_async with no_proxy=True passes no_proxy through to _chat_anthropic for Anthropic
 - _chat_anthropic with no_proxy=True uses requests.Session(trust_env=False)
 - _chat_remote passes no_proxy through to _chat_anthropic for Anthropic provider
-- plan_review, review.py, scope_review.py call chat_async with no_proxy=True
+- plan_review, review.py, review_multi_model.py call chat_async with no_proxy=True
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolated_request_capabilities(monkeypatch, tmp_path):
+    """Each fake provider starts without another test's learned wire policy."""
+    from ouroboros import request_wire_contract
+    from ouroboros.llm import LLMClient
+
+    # A successful retry persists a drop-field action. Clearing the legacy
+    # rejected-params cache cannot reset that evidence, and a warm /models
+    # cache can also strip temperature before the fake's first rejection.
+    monkeypatch.setattr(request_wire_contract, "canonical_wire_evidence_root", lambda: tmp_path)
+    monkeypatch.setattr(LLMClient, "_SUPPORTED_PARAMS_CACHE", {})
+    monkeypatch.setattr(LLMClient, "_SUPPORTED_PARAMS_FETCHED", False)
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +55,7 @@ def test_chat_anthropic_no_proxy_uses_session_trust_env_false():
 
     fake_response = MagicMock()
     fake_response.raise_for_status = MagicMock()
+    fake_response.status_code = 200
     fake_response.json.return_value = {
         "content": [{"type": "text", "text": "Hi"}],
         "usage": {"input_tokens": 10, "output_tokens": 5},
@@ -51,9 +66,7 @@ def test_chat_anthropic_no_proxy_uses_session_trust_env_false():
 
     captured_session_trust_env = []
 
-    import requests as _requests
 
-    original_session = _requests.Session
 
     class FakeSession:
         def __init__(self):
@@ -100,6 +113,7 @@ def test_chat_anthropic_no_proxy_false_uses_requests_post():
 
     ok_response = MagicMock()
     ok_response.raise_for_status = MagicMock()
+    ok_response.status_code = 200
     ok_response.json.return_value = {
         "content": [{"type": "text", "text": "Hi"}],
         "usage": {"input_tokens": 10, "output_tokens": 5},
@@ -107,9 +121,10 @@ def test_chat_anthropic_no_proxy_false_uses_requests_post():
         "role": "assistant",
     }
     rejected_response = MagicMock()
-    rejected_response.raise_for_status.side_effect = RuntimeError(
-        "temperature is not supported for this model"
-    )
+    rejected_response.status_code = 400
+    rejected_response.reason = "Bad Request"
+    rejected_response.url = "https://api.anthropic.com/v1/messages"
+    rejected_response.text = "temperature is not supported for this model"
 
     session_called = []
 
@@ -142,7 +157,11 @@ def test_chat_anthropic_no_proxy_false_uses_requests_post():
     assert captured_payloads[1]["temperature"] == 0.2
     assert captured_payloads[2]["model"] == "claude-opus-4-8"
     assert "temperature" not in captured_payloads[2]
-    assert "thinking" not in captured_payloads[2]
+    # v6.73.2 named-param binding: the error names ONLY temperature, so the
+    # thinking/output_config effort carrier SURVIVES the retry — a temperature
+    # rejection no longer collaterally strips reasoning control.
+    assert "thinking" in captured_payloads[2]
+    assert captured_payloads[2]["output_config"] == {"effort": "medium"}
     assert direct_target["provider"] == "anthropic"
     assert direct_target["resolved_model"] == "claude-opus-4-8"
     assert direct_target["usage_model"] == "anthropic/claude-opus-4-8"
@@ -163,6 +182,7 @@ def test_chat_anthropic_honors_explicit_timeout():
     }
     fake_response = MagicMock()
     fake_response.raise_for_status = MagicMock()
+    fake_response.status_code = 200
     fake_response.json.return_value = {
         "content": [{"type": "text", "text": "Hi"}],
         "usage": {"input_tokens": 10, "output_tokens": 5},
@@ -195,12 +215,12 @@ def test_chat_async_no_proxy_anthropic_path():
 
     captured_no_proxy = []
 
-    def fake_chat_anthropic(target, messages, tools, effort, max_tokens, tool_choice, temp, np=False):
+    def fake_chat_anthropic(target, messages, tools, effort, max_tokens, tool_choice, temp, np=False, timeout=None):
         captured_no_proxy.append(np)
         return {"role": "assistant", "content": "Hi"}, {"prompt_tokens": 10, "completion_tokens": 5}
 
     with patch.object(client, "_chat_anthropic", side_effect=fake_chat_anthropic):
-        result = asyncio.run(
+        asyncio.run(
             client.chat_async(messages=messages, model=model, no_proxy=True)
         )
 
@@ -225,7 +245,6 @@ def test_chat_async_no_proxy_non_anthropic_uses_httpx_async_client():
 
     captured_httpx_kwargs = []
 
-    import httpx as _httpx
 
     class FakeAsyncClient:
         def __init__(self, **kwargs):
@@ -244,8 +263,9 @@ def test_chat_async_no_proxy_non_anthropic_uses_httpx_async_client():
     ))
     fake_oa_client.chat.completions.create = fake_create
 
-    with patch("httpx.AsyncClient", FakeAsyncClient), \
-         patch("openai.AsyncOpenAI", return_value=fake_oa_client), \
+    # Resolve SDK inheritance before substituting its HTTP base class.
+    with patch("openai.AsyncOpenAI", return_value=fake_oa_client), \
+         patch("httpx.AsyncClient", FakeAsyncClient), \
          patch("requests.get", side_effect=AssertionError("no_proxy must not use requests.get")):
         asyncio.run(
             client.chat_async(messages=messages, model=model, no_proxy=True)
@@ -300,21 +320,28 @@ def test_chat_remote_passes_no_proxy_to_anthropic():
     assert captured_timeout[0] == 88.0
 
 
-def test_chat_remote_no_proxy_retries_openrouter_parameter_rejection():
+def test_chat_remote_no_proxy_retries_openrouter_parameter_rejection(monkeypatch):
     """OpenRouter no_proxy path retries once without optional sampling params."""
     from ouroboros.llm import LLMClient
 
-    LLMClient._REJECTED_PARAMS_CACHE.clear()
     client = LLMClient(api_key="test-or-key")
     target = client._resolve_remote_target("anthropic/claude-opus-4.8")
     messages = [{"role": "user", "content": "hello"}]
     captured_kwargs = []
 
+    class ParameterRejection(RuntimeError):
+        status_code = 404
+        body = {"error": {
+            "message": "No endpoints found for requested parameter temperature",
+        }}
+
     class FakeCompletions:
         def create(self, **kwargs):
             captured_kwargs.append(kwargs)
             if len(captured_kwargs) == 1:
-                raise RuntimeError("404 No endpoints found that can handle the requested parameters")
+                raise ParameterRejection(
+                    "404 No endpoints found for requested parameter temperature"
+                )
             return MagicMock(
                 model_dump=lambda: {
                     "choices": [{"message": {"role": "assistant", "content": "ok", "tool_calls": None}}],
@@ -347,14 +374,60 @@ def test_chat_remote_no_proxy_retries_openrouter_parameter_rejection():
     assert captured_kwargs[1]["extra_body"]["provider"]["require_parameters"] is True
     fake_http_client.close.assert_called_once()
 
+    # The successful retry learns a route-scoped repair in the durable wire
+    # store. A later call must use it on its FIRST send, without another 404.
+    with patch.object(client, "_make_no_proxy_client", return_value=(fake_oa_client, fake_http_client)), \
+         patch("requests.get", side_effect=AssertionError("no_proxy must not fetch capabilities")):
+        learned_msg, _ = client._chat_remote(
+            target, messages, None, "medium", 1024, "auto", 0.2, no_proxy=True,
+        )
+    assert learned_msg["content"] == "ok"
+    assert len(captured_kwargs) == 3
+    assert "temperature" not in captured_kwargs[2]
+    assert captured_kwargs[2]["extra_body"]["reasoning"]["effort"] == "medium"
+    assert captured_kwargs[2]["extra_body"]["provider"]["require_parameters"] is True
+    assert fake_http_client.close.call_count == 2
+
+
+def test_chat_remote_no_proxy_uses_warm_capabilities_without_a_rejection(monkeypatch):
+    """A prior catalog fetch can omit temperature before the first no_proxy send."""
+    from ouroboros.llm import LLMClient
+
+    model = "anthropic/claude-opus-4.8"
+    monkeypatch.setattr(LLMClient, "_SUPPORTED_PARAMS_FETCHED", True)
+    LLMClient._SUPPORTED_PARAMS_CACHE[model] = {"max_tokens", "reasoning"}
+    client = LLMClient(api_key="test-or-key")
+    target = client._resolve_remote_target(model)
+    response = MagicMock(model_dump=lambda: {
+        "choices": [{"message": {"role": "assistant", "content": "ok", "tool_calls": None}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+    })
+    fake_oa_client, fake_http_client = MagicMock(), MagicMock()
+    fake_oa_client.chat.completions.create.return_value = response
+
+    with patch.object(client, "_make_no_proxy_client", return_value=(fake_oa_client, fake_http_client)), \
+         patch("requests.get", side_effect=AssertionError("no_proxy must not fetch capabilities")):
+        msg, _ = client._chat_remote(
+            target, [{"role": "user", "content": "hello"}], None,
+            "medium", 1024, "auto", 0.2, no_proxy=True,
+        )
+
+    assert msg["content"] == "ok"
+    fake_oa_client.chat.completions.create.assert_called_once()
+    payload = fake_oa_client.chat.completions.create.call_args.kwargs
+    assert "temperature" not in payload
+    assert payload["extra_body"]["reasoning"]["effort"] == "medium"
+    assert payload["extra_body"]["provider"]["require_parameters"] is True
+    fake_http_client.close.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # Test: plan_review ReviewCoordinator path calls LLM with no_proxy=True
 # ---------------------------------------------------------------------------
 
 def test_plan_review_slots_use_no_proxy(tmp_path):
-    """plan_review's shared ReviewCoordinator path must pass no_proxy=True."""
-    from ouroboros.tools import plan_review
+    """The plan ask's shared review-substrate path must pass no_proxy=True."""
+    from ouroboros.tools import plan_review_runtime
 
     captured_kwargs = []
 
@@ -375,13 +448,17 @@ def test_plan_review_slots_use_no_proxy(tmp_path):
         "event_queue": None,
     })()
 
-    with patch.object(plan_review, "LLMClient", return_value=FakeLLMClient()):
+    # The slot runner (and its LLMClient construction site) lives in
+    # plan_review_runtime; patch the owning module.
+    from ouroboros.review_substrate import ReviewSlot
+
+    with patch.object(plan_review_runtime, "LLMClient", return_value=FakeLLMClient()):
         result = _asyncio.run(
-            plan_review._run_plan_review_slots(
+            plan_review_runtime.run_plan_review_slots(
                 fake_ctx,
-                ["openai/gpt-5.5"],
-                "system prompt",
-                "user content",
+                [ReviewSlot(slot_id="slot_1", model="openai/gpt-5.5", effort="high")],
+                system_prompt="system prompt",
+                user_content="user content",
             )
         )
 
@@ -437,33 +514,36 @@ def test_review_query_model_uses_no_proxy():
 
 
 # ---------------------------------------------------------------------------
-# Test: scope_review _call_scope_llm calls chat_async with no_proxy=True
+# Test: the retrieving seat of the one wave sends with no_proxy=True
 # ---------------------------------------------------------------------------
 
-def test_scope_review_call_scope_llm_uses_no_proxy():
-    """_call_scope_llm in scope_review.py must call chat_async with no_proxy=True.
+def test_retrieving_review_seat_uses_no_proxy(tmp_path):
+    """A retrieving seat (two-part brief, native inspection episode) must send
+    with no_proxy=True.
 
-    Both the ThreadPoolExecutor path and the RuntimeError fallback path must pass
-    no_proxy=True. We test the asyncio.run() fallback path (RuntimeError branch)
-    by ensuring no running loop is active during the call.
+    The send is the bounded native inspection episode's synchronous ``chat``
+    call; the flag rides the shared request the same way it does on every
+    other review transport.
     """
     import asyncio
-    from ouroboros.tools import scope_review
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.tools.review_multi_model import _query_model
 
     captured_kwargs = []
 
     class FakeLLMClient:
-        async def chat_async(self, **kwargs):
+        def chat(self, **kwargs):
             captured_kwargs.append(kwargs)
             return {"content": "[]"}, {"prompt_tokens": 100, "completion_tokens": 50}
 
-    prompt = "test prompt for scope review"
+    ctx = SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, task_id="t", pending_events=[])
+    asyncio.run(_query_model(
+        FakeLLMClient(), "openai/gpt-5.5", [], asyncio.Semaphore(1), ctx=ctx, slot_id="slot_1",
+        route=ReviewRouteKind.API_CHAT, native_retrieval=True,
+        session_task="review the staged change", session_root=str(tmp_path)))
 
-    with patch.object(scope_review, "LLMClient", return_value=FakeLLMClient()):
-        raw_text, usage, error = scope_review._call_scope_llm(prompt)
-
-    assert len(captured_kwargs) >= 1, "chat_async should be called at least once"
+    assert len(captured_kwargs) >= 1, "the episode should send at least once"
     for kw in captured_kwargs:
         assert kw.get("no_proxy") is True, (
-            f"scope_review._call_scope_llm chat_async called without no_proxy=True: {kw}"
+            f"the retrieving seat sent without no_proxy=True: {kw}"
         )

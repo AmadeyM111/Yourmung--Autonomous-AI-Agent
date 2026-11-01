@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import errno
 import logging
 import mimetypes
 import os
 import pathlib
 import shutil
+import uuid
 from contextlib import suppress
 from typing import Any
 from urllib.parse import quote
@@ -15,10 +17,11 @@ log = logging.getLogger(__name__)
 
 from starlette.datastructures import UploadFile
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse
+from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from ouroboros.gateway._helpers import json_error
+from ouroboros import chat_uploads, store
+from ouroboros.gateway._helpers import json_error, run_sync_to_completion
 from ouroboros.server_auth import is_loopback_host
 from ouroboros.utils import safe_relpath
 from ouroboros.contracts.skill_payload_policy import (
@@ -54,8 +57,8 @@ class FileBrowserPayloadTooLarge(ValueError):
     """Upload exceeded the configured limit."""
 
 
-class ChatUploadPayloadTooLarge(ValueError):
-    """Chat upload exceeded the configured limit."""
+class AudioUploadPayloadTooLarge(ValueError):
+    """Audio upload exceeded the independently configured audio limit."""
 
 
 def _request_is_local(request: Request) -> bool:
@@ -90,6 +93,44 @@ def _get_file_browser_root(request: Request) -> pathlib.Path:
     raise ValueError(f"Configured file browser root does not exist: {root_dir}")
 
 
+def download_url_for_local_file(abs_path: pathlib.Path | str) -> str:
+    """Return a loopback ``/api/files/download`` URL for a local file that lives
+    inside the file-browser root, else ``""``.
+
+    Request-less companion to ``_get_file_browser_root`` (used by chat file
+    delivery, which has no HTTP request in hand). The path is resolved first so
+    a symlink whose target escapes the root cannot leak. The returned URL uses a
+    root-relative, URL-quoted path because ``safe_relpath`` lstrips a leading
+    ``/`` (an absolute ``path=`` would resolve under the root, not to the file).
+    """
+    raw = _configured_root_text()
+    root = _normalize_root(raw) if raw and _normalize_root(raw).is_dir() else pathlib.Path.home().resolve()
+    try:
+        rel = pathlib.Path(abs_path).expanduser().resolve(strict=False).relative_to(root)
+    except (ValueError, OSError):
+        return ""
+    return "/api/files/download?path=" + quote(rel.as_posix())
+
+
+def resolve_task_file_reference(drive_root: Any, task_id: str, ref: Any) -> pathlib.Path:
+    """Resolve a captured document under its actual task, with exact byte identity."""
+    from ouroboros.artifacts import artifact_store_path_block_reason, stream_artifact_file, task_artifact_dir_path
+
+    if not isinstance(ref, dict) or ref.get("kind") != "task_artifact" or ref.get("root") != "artifact_store" or ref.get("task_id") != task_id:
+        raise ValueError("document reference has no matching task owner")
+    name = str(ref.get("path") or "")
+    if not name or pathlib.PurePosixPath(name).name != name or "\\" in name or artifact_store_path_block_reason(pathlib.Path(name)):
+        raise ValueError("document reference has an invalid artifact name")
+    root = task_artifact_dir_path(drive_root, task_id).resolve(strict=False)
+    path = root / name
+    if path.is_symlink() or not path.resolve(strict=False).is_relative_to(root):
+        raise ValueError("document reference escapes its task owner")
+    if type(ref.get("size")) is not int or not isinstance(ref.get("sha256"), str) or len(ref["sha256"]) != 64:
+        raise ValueError("document reference has no captured byte identity")
+    stream_artifact_file(path, expected=ref)
+    return path
+
+
 def _resolve_target(request: Request, rel_path: str) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
     root_dir = _get_file_browser_root(request)
     requested = root_dir / safe_relpath(rel_path or ".")
@@ -98,6 +139,15 @@ def _resolve_target(request: Request, rel_path: str) -> tuple[pathlib.Path, path
     except ValueError as exc:
         raise ValueError("Path escapes file browser root.") from exc
     resolved = requested.resolve(strict=False)
+    # Symlink containment: the lexical check above cannot see where a link
+    # POINTS. Every endpoint operates within the configured root, so a path
+    # whose resolution leaves the root (e.g. root/link -> /etc) is rejected
+    # outright — including symlinks themselves (deleting such a link via the
+    # API is intentionally blocked rather than special-cased).
+    try:
+        resolved.relative_to(root_dir)
+    except ValueError as exc:
+        raise ValueError("Path escapes file browser root (symlink target outside root).") from exc
     return root_dir, requested, resolved
 
 
@@ -205,8 +255,7 @@ def _format_path(root_dir: pathlib.Path, rel_path: str) -> str:
 
 
 def _read_prefix(path: pathlib.Path, limit: int) -> bytes:
-    with path.open("rb") as handle:
-        return handle.read(limit)
+    return store.read_file_bytes(path, limit=limit)
 
 
 def _guess_text_file(path: pathlib.Path) -> bool:
@@ -223,6 +272,21 @@ def _guess_text_file(path: pathlib.Path) -> bool:
         return True
     except UnicodeDecodeError:
         return False
+
+
+def _file_response(target: pathlib.Path, *, filename: str | None = None, media_type: str | None = None) -> Response:
+    """A SQLite file is streamed through store.iter_file_bytes, whose descriptor never closes under
+    a store connection of this process, and a WAL index is refused before anything opens it; any
+    other file keeps FileResponse (length, ranges, HEAD)."""
+    try:
+        store.refuse_wal_index(target)
+    except store.WalIndexRefused as exc:
+        return json_error(str(exc), status=403)
+    if os.name == "nt" or not store.is_sqlite_file(target):  # Windows locks belong to their handle
+        return FileResponse(str(target), filename=filename, media_type=media_type)
+    headers = {"Content-Disposition": f"attachment; filename*=utf-8''{quote(filename)}"} if filename else None
+    return StreamingResponse(store.iter_file_bytes(target), media_type=media_type or "application/octet-stream",
+                             headers=headers)
 
 
 def _sanitize_upload_filename(filename: str) -> str:
@@ -253,9 +317,12 @@ def _copy_path(source: pathlib.Path, destination: pathlib.Path) -> None:
         destination.symlink_to(os.readlink(source), target_is_directory=source.is_dir())
         return
     if source.is_dir():
-        shutil.copytree(source, destination, symlinks=True)
+        # A WAL index stays behind: the copy's first open rebuilds its own from the copied log.
+        shutil.copytree(source, destination, symlinks=True, copy_function=store.copy_file_bytes,
+                        ignore=lambda folder, names: [name for name in names
+                                                      if store.is_wal_index(pathlib.Path(folder) / name)])
         return
-    shutil.copy2(source, destination)
+    store.copy_file_bytes(source, destination)
 
 
 def _relative_path(root_dir: pathlib.Path, path: pathlib.Path) -> str:
@@ -348,13 +415,14 @@ async def api_files_read(request: Request) -> JSONResponse:
     try:
         if not rel_path:
             return json_error("Missing path.", status=400)
-        root_dir, target, _ = _resolve_target(request, rel_path)
+        root_dir, _requested, target = _resolve_target(request, rel_path)
         if not target.exists():
             return JSONResponse({"error": f"Path not found: {rel_path}"}, status_code=404)
         if not target.is_file():
             return JSONResponse({"error": f"Not a file: {rel_path}"}, status_code=400)
         if _is_owner_only_file(target):
             return json_error("Owner-only state is not readable from Files.", status=403)
+        store.refuse_wal_index(target)  # 403 below, before any reader opens it
 
         size = int(target.stat().st_size)
         rel = _relative_path(root_dir, target)
@@ -394,23 +462,79 @@ async def api_files_read(request: Request) -> JSONResponse:
         ))
     except ValueError as exc:
         return json_error(str(exc), status=400)
+    except store.WalIndexRefused as exc:
+        return json_error(str(exc), status=403)
     except Exception as exc:
         return json_error(str(exc), status=500)
 
 
-async def api_files_download(request: Request) -> FileResponse | JSONResponse:
+_UPLOAD_GONE = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EMLINK, errno.EINVAL, errno.EISDIR})
+
+
+def _open_chat_upload(upload: str) -> tuple[Any, os.stat_result, str, str]:
+    handle, observed = chat_uploads.open_upload(upload)
+    try:
+        mime, kind = chat_uploads.detect_media(handle.read(64), upload[33:])
+        handle.seek(0)
+    except BaseException:
+        handle.close()
+        raise
+    return handle, observed, mime, kind
+
+
+async def _serve_chat_upload(request: Request) -> Response:
+    """``?upload=<stored id>``: one owner chat attachment, independent of the Files root.
+
+    The same authentication as every API route; read through the confined open
+    (no link, FIFO or device; Windows by handle proof) and streamed from that one
+    descriptor with GET/HEAD and a single Range. Only bytes that prove an image,
+    video or audio type are inline; everything else (HTML, SVG, PDF, unknown) is
+    an ``application/octet-stream`` download. Always ``nosniff``, private cache,
+    a sandboxing CSP and same-origin resource policy.
+    """
+    params = request.query_params
+    upload = chat_uploads.upload_id(params.get("upload"))
+    if len(params.getlist("upload")) != 1 or "path" in params:
+        return json_error("upload must be the only file selector", status=400)
+    if not upload:
+        return json_error("Invalid upload id.", status=400)
+    try:
+        handle, observed, mime, kind = await run_sync_to_completion(_open_chat_upload, upload)
+    except OSError as exc:
+        if exc.errno is None or exc.errno in _UPLOAD_GONE:
+            return json_error("Attachment is missing or is not a regular file.", status=404,
+                              reason_code="upload_unavailable")
+        return json_error("Attachment could not be read.", status=503, reason_code="upload_unreadable")
+    from ouroboros.gateway.task_archive import DescriptorResponse
+
+    name = upload[33:]
+    inline = kind in {"image", "video", "audio"}
+    quoted = quote(name)
+    disposition = "inline" if inline else "attachment"
+    disposition += f"; filename*=utf-8''{quoted}" if quoted != name else f'; filename="{name}"'
+    headers = {"content-disposition": disposition, "x-content-type-options": "nosniff",
+               "cache-control": "private, max-age=86400", "cross-origin-resource-policy": "same-origin",
+               "content-security-policy": "sandbox" if inline else "default-src 'none'; sandbox"}
+    return DescriptorResponse(handle, name, observed, media_type=mime if inline else "application/octet-stream",
+                              headers=headers)
+
+
+async def api_files_download(request: Request) -> Response:
+    if "upload" in request.query_params:
+        # A separate early authority: chat attachments never depend on the Files root.
+        return await _serve_chat_upload(request)
     rel_path = request.query_params.get("path", "")
     try:
         if not rel_path:
             return json_error("Missing path.", status=400)
-        _, target, _ = _resolve_target(request, rel_path)
+        _, _requested, target = _resolve_target(request, rel_path)
         if not target.exists():
             return JSONResponse({"error": f"Path not found: {rel_path}"}, status_code=404)
         if not target.is_file():
             return JSONResponse({"error": f"Not a file: {rel_path}"}, status_code=400)
         if _is_owner_only_file(target):
             return json_error("Owner-only state cannot be downloaded.", status=403)
-        return FileResponse(str(target), filename=target.name)
+        return _file_response(target, filename=target.name)
     except ValueError as exc:
         return json_error(str(exc), status=400)
     except Exception as exc:
@@ -422,14 +546,14 @@ async def api_files_content(request: Request) -> FileResponse | JSONResponse:
     try:
         if not rel_path:
             return json_error("Missing path.", status=400)
-        _, target, _ = _resolve_target(request, rel_path)
+        _, _requested, target = _resolve_target(request, rel_path)
         if not target.exists():
             return JSONResponse({"error": f"Path not found: {rel_path}"}, status_code=404)
         if not target.is_file():
             return JSONResponse({"error": f"Not a file: {rel_path}"}, status_code=400)
         if _is_owner_only_file(target):
             return json_error("Owner-only state cannot be served.", status=403)
-        return FileResponse(str(target), media_type=_guess_media_type(target))
+        return _file_response(target, media_type=_guess_media_type(target))
     except ValueError as exc:
         return json_error(str(exc), status=400)
     except Exception as exc:
@@ -683,6 +807,8 @@ async def api_files_transfer(request: Request) -> JSONResponse:
         })
     except ValueError as exc:
         return json_error(str(exc), status=400)
+    except store.WalIndexRefused as exc:
+        return json_error(str(exc), status=403)
     except Exception as exc:
         return json_error(str(exc), status=500)
 
@@ -762,111 +888,211 @@ def file_browser_routes() -> list[Route]:
     ]
 
 
-import mimetypes
-import os
-import pathlib
-import uuid
+def store_chat_upload(
+    source: pathlib.Path, display_name: str = "", *, data_dir: pathlib.Path | None = None,
+) -> pathlib.Path:
+    """Copy an already-local file into ``data/uploads`` as a chat upload.
 
-from starlette.datastructures import UploadFile
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-
-
-_CHAT_UPLOAD_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
-_CHUNK = 64 * 1024  # 64 KB
+    The Host Service owns source confinement; the shared store (``chat_uploads``)
+    owns naming, stable byte capture and atomic publication. Returns the Path.
+    """
+    source = pathlib.Path(source)
+    return _store_chat_upload(source, display_name or source.name, data_dir=data_dir)[0]
 
 
-def _data_dir() -> pathlib.Path:
-    return pathlib.Path(os.environ.get(
-        "OUROBOROS_DATA_DIR",
-        pathlib.Path.home() / "Ouroboros" / "data",
-    ))
+def _store_chat_upload(source: Any, display_name: str, *, data_dir=None, pending: bool = False):
+    """Store a confined path or completed borrowed multipart spool: ``(path, measured ref)``."""
+    return chat_uploads.store_upload(source, display_name, data_dir=data_dir, pending=pending)
 
 
 async def api_chat_upload(request: Request) -> JSONResponse:
     """Upload a chat attachment to data/uploads/ with a unique name."""
-    # Quick Content-Length reject before multipart parsing.
-    try:
-        cl = int(request.headers.get("content-length", 0) or 0)
-    except (ValueError, TypeError):
-        cl = 0
-    if cl > _CHAT_UPLOAD_MAX_BYTES + 4096:
-        return JSONResponse({"ok": False, "error": "File exceeds 50 MB limit"}, status_code=413)
-
-    # Enforce size while Starlette receives multipart bytes.
-    _original_receive = request._receive
-    _body_bytes = 0
-
-    async def _size_limited_receive():
-        nonlocal _body_bytes
-        msg = await _original_receive()
-        _body_bytes += len(msg.get("body", b""))
-        if _body_bytes > _CHAT_UPLOAD_MAX_BYTES + 8192:
-            raise ChatUploadPayloadTooLarge("File exceeds 50 MB limit")
-        return msg
-
-    request._receive = _size_limited_receive
+    # Multipart files spool to disk in Starlette; copy them in bounded chunks.
+    # File custody is independent of downstream transport and prompt limits.
     try:
         form = await request.form()
-    except Exception as e:
-        request._receive = _original_receive
-        if isinstance(e, ChatUploadPayloadTooLarge):
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=413)
-        return JSONResponse({"ok": False, "error": f"Upload failed: {str(e)}"}, status_code=400)
-    finally:
-        request._receive = _original_receive
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"Upload failed: {exc}"}, status_code=400)
 
     upload = form.get("file")
     if not isinstance(upload, UploadFile):
         return JSONResponse({"ok": False, "error": "No valid file field"}, status_code=400)
 
-    raw_name = getattr(upload, "filename", "") or "upload"
-    safe_base = os.path.basename(raw_name).replace(" ", "_")[:200] or "upload"
+    safe_base = chat_uploads.safe_upload_name(getattr(upload, "filename", "") or "upload")
+    def copy_and_close():
+        # The worker owns the completed spool through copy AND close. Cleanup
+        # cannot itself be cancelled at an async thread-pool checkpoint.
+        try:
+            return _store_chat_upload(upload.file, safe_base, pending=True)
+        finally:
+            upload.file.close()
 
-    # Unique stored names avoid repeated-upload conflicts.
-    unique_name = f"{uuid.uuid4().hex}_{safe_base}"
+    dest, ref = await run_sync_to_completion(copy_and_close)
+    if pathlib.Path(safe_base).suffix.lower() == ".xlsx":
+        try:
+            from ouroboros.spreadsheets import inspect_xlsx
 
-    upload_dir = _data_dir() / "uploads"
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    dest = upload_dir / unique_name
+            inspect_xlsx(dest, max_rows=1, max_columns=1)
+        except Exception as exc:
+            dest.unlink(missing_ok=True)
+            return JSONResponse(
+                {"ok": False, "error": f"Invalid XLSX workbook: {exc}"},
+                status_code=400,
+            )
 
-    # Per-request temp file keeps publish atomic under concurrent uploads.
-    tmp_dest = upload_dir / f".{uuid.uuid4().hex}.uploading"
-    bytes_written = 0
-    too_large = False
+    # ``mime`` keeps its extension meaning (the model-input rail reads it); the
+    # byte-proven kind and the one attachment view are the display facts.
+    mime = mimetypes.guess_type(safe_base)[0] or "application/octet-stream"
+    return JSONResponse({
+        "ok": True,
+        "filename": dest.name,
+        "display_name": safe_base,
+        "path": str(dest),
+        "size": ref["size"],
+        "sha256": ref["sha256"],
+        "mime": mime,
+        "view": chat_uploads.attachment_view(ref),
+    })
+
+
+def _audio_upload_max_bytes() -> int:
+    raw: Any = os.environ.get("OUROBOROS_AUDIO_UPLOAD_MAX_BYTES")
+    if raw is None:
+        try:
+            from ouroboros.config import load_settings
+
+            raw = load_settings().get("OUROBOROS_AUDIO_UPLOAD_MAX_BYTES")
+        except Exception:
+            raw = None
     try:
-        with tmp_dest.open("wb") as fh:
+        value = int(raw if raw is not None else 1024 * 1024 * 1024)
+    except (TypeError, ValueError):
+        value = 1024 * 1024 * 1024
+    return max(1, value)
+
+
+def _env_disk_reserve_bytes() -> int:
+    raw: Any = os.environ.get("OUROBOROS_AUDIO_UPLOAD_DISK_RESERVE_BYTES")
+    if raw is None:
+        try:
+            from ouroboros.config import load_settings
+
+            raw = load_settings().get("OUROBOROS_AUDIO_UPLOAD_DISK_RESERVE_BYTES")
+        except Exception:
+            raw = None
+    try:
+        return int(raw if raw is not None else 64 * 1024 * 1024)
+    except (TypeError, ValueError):
+        return 64 * 1024 * 1024
+
+
+async def api_audio_upload(request: Request) -> JSONResponse:
+    """Stream one supported long-form audio attachment into ``data/uploads``."""
+    from ouroboros.transcription import SUPPORTED_EXTENSIONS, SUPPORTED_MIME_TYPES, validate_audio_file
+
+    max_bytes = _audio_upload_max_bytes()
+    try:
+        content_length = int(request.headers.get("content-length", 0) or 0)
+    except (TypeError, ValueError):
+        content_length = 0
+    # Multipart framing is small but not byte-exact, so leave bounded headroom.
+    if content_length > max_bytes + 1024 * 1024:
+        return JSONResponse({"ok": False, "error": f"Audio exceeds {max_bytes}-byte limit"}, status_code=413)
+
+    upload_dir = chat_uploads.uploads_dir()
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    reserve = max(0, _env_disk_reserve_bytes())
+    expected = min(max_bytes, content_length or max_bytes)
+    if shutil.disk_usage(upload_dir).free < expected + reserve:
+        return JSONResponse({"ok": False, "error": "Insufficient disk space for audio upload"}, status_code=507)
+
+    original_receive = request._receive
+    body_bytes = 0
+
+    async def size_limited_receive():
+        nonlocal body_bytes
+        message = await original_receive()
+        body_bytes += len(message.get("body", b""))
+        if body_bytes > max_bytes + 1024 * 1024:
+            raise AudioUploadPayloadTooLarge(f"Audio exceeds {max_bytes}-byte limit")
+        return message
+
+    request._receive = size_limited_receive
+    try:
+        form = await request.form()
+    except Exception as exc:
+        if isinstance(exc, AudioUploadPayloadTooLarge):
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=413)
+        return JSONResponse({"ok": False, "error": f"Upload failed: {exc}"}, status_code=400)
+    finally:
+        request._receive = original_receive
+
+    upload = form.get("file")
+    if not isinstance(upload, UploadFile):
+        return JSONResponse({"ok": False, "error": "No valid file field"}, status_code=400)
+    raw_name = getattr(upload, "filename", "") or "audio"
+    safe_base = chat_uploads.safe_upload_name(raw_name or "audio")
+    extension = pathlib.Path(safe_base).suffix.lower()
+    mime = str(getattr(upload, "content_type", "") or mimetypes.guess_type(safe_base)[0] or "").split(";", 1)[0].lower()
+    if extension not in SUPPORTED_EXTENSIONS or (
+        mime and mime not in SUPPORTED_MIME_TYPES and mime != "application/octet-stream"
+    ):
+        await upload.close()
+        return JSONResponse({"ok": False, "error": "Unsupported audio format"}, status_code=415)
+
+    unique_name = f"{uuid.uuid4().hex}_{safe_base}"
+    destination = upload_dir / unique_name
+    temporary = upload_dir / f".{uuid.uuid4().hex}.uploading"
+    bytes_written = 0
+    try:
+        with temporary.open("wb") as handle:
             while True:
-                chunk = await upload.read(_CHUNK)
+                chunk = await upload.read(1024 * 1024)
                 if not chunk:
                     break
                 bytes_written += len(chunk)
-                if bytes_written > _CHAT_UPLOAD_MAX_BYTES:
-                    too_large = True
-                    break
-                fh.write(chunk)
-        if too_large:
-            tmp_dest.unlink(missing_ok=True)
-            return JSONResponse({"ok": False, "error": "File exceeds 50 MB limit"}, status_code=413)
-        tmp_dest.replace(dest)  # atomic; unique name has no collision
+                if bytes_written > max_bytes:
+                    raise AudioUploadPayloadTooLarge(f"Audio exceeds {max_bytes}-byte limit")
+                handle.write(chunk)
+        temporary.replace(destination)
+        try:
+            metadata = validate_audio_file(destination, max_bytes=max_bytes)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+    except AudioUploadPayloadTooLarge as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=413)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     finally:
         await upload.close()
-        if tmp_dest.exists():
-            tmp_dest.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
 
-    mime = mimetypes.guess_type(safe_base)[0] or "application/octet-stream"
+    try:
+        ref = await run_sync_to_completion(chat_uploads.measure_upload, unique_name)
+    except OSError as exc:
+        destination.unlink(missing_ok=True)
+        return JSONResponse({"ok": False, "error": f"Upload failed: {exc}"}, status_code=400)
     return JSONResponse({
         "ok": True,
         "filename": unique_name,
         "display_name": safe_base,
-        "path": str(dest),
+        "path": str(destination),
         "size": bytes_written,
-        "mime": mime,
+        "sha256": ref["sha256"],
+        "mime": mime or mimetypes.guess_type(safe_base)[0] or "application/octet-stream",
+        "duration_sec": metadata.duration_sec,
+        "codec": metadata.codec,
+        "view": chat_uploads.attachment_view(ref),
     })
 
 
 async def api_chat_upload_delete(request: Request) -> JSONResponse:
-    """Delete a chat attachment from data/uploads/."""
+    """Delete a composer upload that no message has accepted (the failed-send cleanup).
+
+    An accepted original, another source's upload, or one stored before this
+    process started is refused (409) and kept: see ``chat_uploads`` pending guard.
+    """
     try:
         body = await request.json()
     except Exception:
@@ -880,14 +1106,13 @@ async def api_chat_upload_delete(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "error": "Missing filename"}, status_code=400)
 
     safe_name = os.path.basename(filename)
-    if not safe_name or safe_name != filename or safe_name in {".", ".."}:
+    if not safe_name or safe_name != filename or safe_name in {".", ".."} or "\\" in filename:
         return JSONResponse({"ok": False, "error": "Invalid filename"}, status_code=400)
 
-    target = _data_dir() / "uploads" / safe_name
-    if not target.exists():
+    outcome = await run_sync_to_completion(chat_uploads.delete_pending_upload, safe_name)
+    if outcome == "missing":
         return JSONResponse({"ok": False, "error": "File not found"}, status_code=404)
-    if not target.is_file():
-        return JSONResponse({"ok": False, "error": "Invalid filename"}, status_code=400)
-
-    target.unlink()
+    if outcome == "accepted":
+        return JSONResponse({"ok": False, "error": "Attachment is not a pending upload; it is kept"},
+                            status_code=409)
     return JSONResponse({"ok": True, "filename": safe_name})

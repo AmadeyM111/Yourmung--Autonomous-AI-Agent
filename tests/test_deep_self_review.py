@@ -1,160 +1,90 @@
-"""Tests for ouroboros.deep_self_review module."""
+"""Tests for ouroboros.deep_self_review and ``/review`` (decision 3A): the system
+review runs on ONE row — an enabled catalog row the call names, else the direct
+Main row — as ``review_change(subject=system, surface=system)``."""
 
 from __future__ import annotations
 
 import os
-import pathlib
+import subprocess
 from unittest import mock
 
 import pytest
 
-from ouroboros.deep_self_review import (
-    _is_probably_binary,
-    build_review_pack,
-    is_review_available,
-    run_deep_self_review,
-)
+from ouroboros.provider_models import OPENAI_DIRECT_DEFAULTS
+from ouroboros.deep_self_review import deep_review_route, main_review_row
+from ouroboros.tools.review_helpers import _is_probably_binary
+from tests.test_git_review_preflight_gate import _roster
+from tests.test_review_pool import provider_call
 
 
-def _make_dulwich_mock(file_list: list[str]):
-    """Return a mock for dulwich.repo.Repo that yields the given file list from open_index()."""
-    mock_index = mock.Mock()
-    mock_index.__iter__ = mock.Mock(return_value=iter(f.encode() for f in file_list))
-    mock_repo = mock.Mock()
-    mock_repo.open_index.return_value = mock_index
-    mock_repo_cls = mock.Mock(return_value=mock_repo)
-    return mock_repo_cls
+class TestApiRouteAvailability:
+    """Availability (`deep_review_route`) of the DEFAULT row — the direct Main row
+    (`OUROBOROS_MODEL`): the routed model's credentials, and the direct-OpenAI
+    resolution (with its -pro rewrite) for a stored OpenRouter spelling."""
 
-
-@pytest.fixture
-def tmp_repo(tmp_path):
-    """Create a minimal git repo with tracked files."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / "main.py").write_text("print('hello')\n", encoding="utf-8")
-    (repo / "lib.py").write_text("def add(a, b): return a + b\n", encoding="utf-8")
-    return repo
-
-
-@pytest.fixture
-def tmp_drive(tmp_path):
-    """Create a drive root with some memory files."""
-    drive = tmp_path / "drive"
-    drive.mkdir()
-    mem = drive / "memory"
-    mem.mkdir()
-    (mem / "identity.md").write_text("I am Ouroboros.\n", encoding="utf-8")
-    (mem / "scratchpad.md").write_text("Working notes.\n", encoding="utf-8")
-    know = mem / "knowledge"
-    know.mkdir()
-    (know / "patterns.md").write_text("## Patterns\n- Error class A\n", encoding="utf-8")
-    return drive
-
-
-class TestBuildReviewPack:
-    def test_reads_tracked_files(self, tmp_repo, tmp_drive):
-        """git ls-files output determines which repo files are included."""
-        with mock.patch("dulwich.repo.Repo", _make_dulwich_mock(["main.py", "lib.py"])):
-            pack, stats = build_review_pack(tmp_repo, tmp_drive)
-
-        assert "### main.py" in pack
-        assert "### lib.py" in pack
-        assert "print('hello')" in pack
-        assert stats["file_count"] >= 2
-
-        atlas = mock.Mock(
-            status="budget_exceeded",
-            manifest={"estimated_total_tokens": 950_000},
-            omitted=(),
-            selected=(),
-            text="small atlas",
-        )
-        with (
-            mock.patch("dulwich.repo.Repo", _make_dulwich_mock(["main.py"])),
-            mock.patch("ouroboros.deep_self_review.compile_review_context_atlas", return_value=atlas),
-        ):
-            pack, stats = build_review_pack(tmp_repo, tmp_drive)
-        assert pack == ""
-        assert "exceeded hard budget" in stats["skipped"][0]
-        assert stats["context_manifest"]["estimated_total_tokens"] == 950_000
-
-    def test_includes_memory_whitelist(self, tmp_repo, tmp_drive):
-        """Memory whitelist files from drive_root are included."""
-        with mock.patch("dulwich.repo.Repo", _make_dulwich_mock(["main.py"])):
-            pack, stats = build_review_pack(tmp_repo, tmp_drive)
-
-        assert "## FILE: drive/memory/identity.md" in pack
-        assert "I am Ouroboros." in pack
-        assert "## FILE: drive/memory/scratchpad.md" in pack
-        assert "## FILE: drive/memory/knowledge/patterns.md" in pack
-
-    def test_includes_improvement_backlog_when_present(self, tmp_repo, tmp_drive):
-        (tmp_drive / "memory" / "knowledge" / "improvement-backlog.md").write_text(
-            "# Improvement Backlog\n\n### ibl-1\n- summary: Fix recurring review blocker\n",
-            encoding="utf-8",
-        )
-        with mock.patch("dulwich.repo.Repo", _make_dulwich_mock(["main.py"])):
-            pack, _stats = build_review_pack(tmp_repo, tmp_drive)
-
-        assert "## FILE: drive/memory/knowledge/improvement-backlog.md" in pack
-        assert "Fix recurring review blocker" in pack
-
-    def test_skips_missing_memory(self, tmp_repo, tmp_drive):
-        """Missing memory files are silently skipped."""
-        with mock.patch("dulwich.repo.Repo", _make_dulwich_mock(["main.py"])):
-            pack, stats = build_review_pack(tmp_repo, tmp_drive)
-
-        # registry.md, WORLD.md, index-full.md don't exist — should not appear
-        assert "registry.md" not in pack
-        assert "WORLD.md" not in pack
-        assert "index-full.md" not in pack
-
-
-class TestIsReviewAvailable:
     def test_openrouter(self):
-        with (
-            mock.patch("ouroboros.deep_self_review.get_deep_self_review_model", return_value="openai/gpt-5.5-pro"),
-            mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test"}, clear=True),
+        with mock.patch.dict(
+            os.environ,
+            {"OPENROUTER_API_KEY": "sk-or-test", "OUROBOROS_MODEL": "openai/gpt-5.5-pro"},
+            clear=True,
         ):
-            available, model = is_review_available()
-        assert available is True
+            reason, model = deep_review_route()
+        assert reason == ""
         assert model == "openai/gpt-5.5-pro"
 
     def test_openai(self):
-        env = {"OPENAI_API_KEY": "sk-test"}
-        with mock.patch.dict(os.environ, env, clear=False):
-            # Ensure OPENROUTER_API_KEY and OPENAI_BASE_URL are not set
-            os.environ.pop("OPENROUTER_API_KEY", None)
-            os.environ.pop("OPENAI_BASE_URL", None)
-            available, model = is_review_available()
-        assert available is True
-        assert model == "openai::gpt-5.5-pro"
+        with mock.patch.dict(
+            os.environ, {"OPENAI_API_KEY": "sk-test", "OUROBOROS_MODEL": "openai/gpt-5.6-sol-pro"}, clear=True,
+        ):
+            reason, model = deep_review_route()
+        assert reason == ""
+        # The direct route lands on the PROVIDER default, not a mechanical
+        # `openai::` + router-slug rewrite: `-pro` is an OpenRouter routing slug
+        # that 404s on api.openai.com (live-probed 2026-07-29).
+        assert model == OPENAI_DIRECT_DEFAULTS["deep_self_review"]
+        assert not model.endswith("-pro")
 
     def test_none(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            available, model = is_review_available()
-        assert available is False
+        with mock.patch.dict(os.environ, {"OUROBOROS_MODEL": "openai/gpt-5.5"}, clear=True):
+            reason, model = deep_review_route()
+        assert reason
         assert model is None
 
     def test_direct_provider_prefix_requires_matching_key_even_with_openrouter(self):
-        with (
-            mock.patch("ouroboros.deep_self_review.get_deep_self_review_model", return_value="anthropic::claude-opus-4.8"),
-            mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test"}, clear=True),
+        with mock.patch.dict(
+            os.environ,
+            {"OPENROUTER_API_KEY": "sk-or-test", "OUROBOROS_MODEL": "anthropic::claude-opus-4.8"},
+            clear=True,
         ):
-            available, model = is_review_available()
+            reason, model = deep_review_route()
 
-        assert available is False
+        assert reason
         assert model is None
 
     def test_direct_provider_prefix_available_with_matching_key(self):
-        with (
-            mock.patch("ouroboros.deep_self_review.get_deep_self_review_model", return_value="anthropic::claude-opus-4.8"),
-            mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-test"}, clear=True),
+        with mock.patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "sk-ant-test", "OUROBOROS_MODEL": "anthropic::claude-opus-4.8"},
+            clear=True,
         ):
-            available, model = is_review_available()
+            reason, model = deep_review_route()
 
-        assert available is True
+        assert reason == ""
         assert model == "anthropic::claude-opus-4.8"
+
+    def test_the_deep_review_model_key_no_longer_chooses_the_executor(self):
+        env = {"OPENROUTER_API_KEY": "sk-or-test", "OUROBOROS_MODEL": "openai/main-model",
+               "OUROBOROS_MODEL_DEEP_SELF_REVIEW": "openai/deep-model"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            row = main_review_row()
+            route = deep_review_route()
+        assert (row.slot_id, row.kind, row.target_id, row.use_local) == ("main", "api_chat", "openai/main-model", False)
+        assert route == ("", "openai/main-model")
+
+
+class _FakeCtx:
+    def __init__(self):
+        self.pending_events = []
 
 
 class TestRequestToolEmitsEvent:
@@ -162,13 +92,10 @@ class TestRequestToolEmitsEvent:
         """_request_deep_self_review emits a deep_self_review_request event."""
         from ouroboros.tools.control import _request_deep_self_review
 
-        class FakeCtx:
-            pending_events = []
-
-        ctx = FakeCtx()
+        ctx = _FakeCtx()
         with mock.patch(
-            "ouroboros.deep_self_review.is_review_available",
-            return_value=(True, "openai/gpt-5.5-pro"),
+            "ouroboros.deep_self_review.deep_review_route",
+            return_value=("", "openai/gpt-5.5-pro"),
         ):
             result = _request_deep_self_review(ctx, "test reason")
         assert len(ctx.pending_events) == 1
@@ -176,96 +103,314 @@ class TestRequestToolEmitsEvent:
         assert evt["type"] == "deep_self_review_request"
         assert evt["reason"] == "test reason"
         assert evt["model"] == "openai/gpt-5.5-pro"
-        assert "Deep self-review" in result
+        assert evt["reviewer"] == ""
+        assert "Deep self-review" in result and "reviewer: Main" in result
 
-    def test_unavailable_returns_error(self):
-        """When no API key is available, returns error without emitting event."""
+    def test_a_named_row_rides_the_event_to_the_queue(self, monkeypatch):
         from ouroboros.tools.control import _request_deep_self_review
 
-        class FakeCtx:
-            pending_events = []
+        _roster(monkeypatch)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+        ctx = _FakeCtx()
+        result = _request_deep_self_review(ctx, "look again", reviewer=" api-scout ")
+        [evt] = ctx.pending_events
+        assert (evt["reviewer"], evt["model"]) == ("api-scout", "openai/fake-reviewer")
+        assert "reviewer: api-scout" in result
 
-        ctx = FakeCtx()
+    @pytest.mark.parametrize("enabled, name", [(False, "api-scout"), (True, "nobody")])
+    def test_a_row_that_is_not_enabled_is_refused_before_any_event(self, monkeypatch, enabled, name):
+        from ouroboros.tools.control import _request_deep_self_review
+
+        _roster(monkeypatch, enabled=enabled)
+        ctx = _FakeCtx()
+        result = _request_deep_self_review(ctx, "look again", reviewer=name)
+        assert ctx.pending_events == []
+        assert result.startswith("⚠️ TOOL_ARG_ERROR (request_deep_self_review): ")
+        assert "is not an enabled catalog row" in result and result.endswith("No review was queued.")
+
+    def test_unavailable_returns_error(self):
+        """An unavailable ROW returns the typed reason without emitting an event."""
+        from ouroboros.tools.control import _request_deep_self_review
+
+        ctx = _FakeCtx()
         with mock.patch(
-            "ouroboros.deep_self_review.is_review_available",
-            return_value=(False, None),
+            "ouroboros.deep_self_review.deep_review_route",
+            return_value=("no provider credentials for openai/x", None),
         ):
             result = _request_deep_self_review(ctx, "test reason")
         assert len(ctx.pending_events) == 0
-        assert "unavailable" in result
+        assert result.startswith("❌ Deep self-review unavailable: no provider credentials for openai/x")
+        assert "Main model (the default)" in result and "Review lanes" not in result
 
 
-class TestVendoredFilesExcluded:
-    def test_minified_js_skipped(self, tmp_repo, tmp_drive):
-        """Files with .min.js suffix are excluded from the review pack."""
-        (tmp_repo / "lib.min.js").write_text("!function(){var a=1;}()\n")
-        with mock.patch("dulwich.repo.Repo", _make_dulwich_mock(["main.py", "lib.min.js"])):
-            pack, stats = build_review_pack(tmp_repo, tmp_drive)
+class TestSystemReviewRow:
+    def test_no_name_is_the_direct_main_row(self, monkeypatch):
+        from ouroboros.tools.review_change import system_review_row
 
-        assert "vendored_minified" in str(stats["skipped"])
-        assert "## FILE: lib.min.js" not in pack
+        monkeypatch.setenv("OUROBOROS_MODEL", "openai/main-model")
+        row = system_review_row("")
+        assert (row.slot_id, row.target_id) == ("main", "openai/main-model")
 
-    def test_chart_umd_skipped(self, tmp_repo, tmp_drive):
-        """chart.umd.min.js (vendored Chart.js) is excluded by name and appears in OMITTED section."""
-        (tmp_repo / "chart.umd.min.js").write_text("!function(t,e){/* chart.js minified */}()\n")
-        with mock.patch("dulwich.repo.Repo", _make_dulwich_mock(["main.py", "chart.umd.min.js"])):
-            pack, stats = build_review_pack(tmp_repo, tmp_drive)
+    def test_any_enabled_catalog_row_pool_member_or_not(self, monkeypatch):
+        from ouroboros.tools.review_change import system_review_row
 
-        assert "## FILE: chart.umd.min.js" not in pack
-        assert any("chart.umd.min.js" in s for s in stats["skipped"])
-        # Omission section must be present and mention the file
-        assert "## OMITTED FILES" in pack
-        assert "chart.umd.min.js" in pack
+        _roster(monkeypatch)
+        row = system_review_row("api-scout")
+        assert (row.slot_id, row.subagent_id, row.target_id) == ("api-scout", "api-scout", "openai/fake-reviewer")
 
-    def test_min_css_skipped(self, tmp_repo, tmp_drive):
-        """Files with .min.css suffix are excluded."""
-        (tmp_repo / "style.min.css").write_text("body{margin:0}a{color:red}\n")
-        with mock.patch("dulwich.repo.Repo", _make_dulwich_mock(["main.py", "style.min.css"])):
-            pack, stats = build_review_pack(tmp_repo, tmp_drive)
+    def test_a_disabled_row_is_an_argument_error(self, monkeypatch):
+        from ouroboros.tools.review_change import ReviewChangeArgumentError, system_review_row
 
-        assert "## FILE: style.min.css" not in pack
-        assert any("style.min.css" in s for s in stats["skipped"])
+        _roster(monkeypatch, enabled=False)
+        with pytest.raises(ReviewChangeArgumentError, match="is not an enabled catalog row"):
+            system_review_row("api-scout")
 
-    def test_regular_js_included(self, tmp_repo, tmp_drive):
-        """Regular (non-minified) JS files are NOT excluded."""
-        (tmp_repo / "app.js").write_text("console.log('hello');\n")
-        with mock.patch("dulwich.repo.Repo", _make_dulwich_mock(["main.py", "app.js"])):
-            pack, stats = build_review_pack(tmp_repo, tmp_drive)
+    def test_w5_the_bare_main_row_carries_mains_pinned_account(self, monkeypatch):
+        """A bare ``/review`` runs where Main runs: the row's credential profile is Main's
+        saved pin (``OUROBOROS_MODEL_ACCOUNTS["main"]``), because the executor sends it as
+        ``model_account_override`` and an empty override is Auto, not Main's role. An
+        unpinned Main is Auto, as before."""
+        from ouroboros.tools.review_change import system_review_row
 
-        assert "### app.js" in pack
-        assert "console.log('hello');" in pack
-        assert not any("app.js" in s for s in stats["skipped"])
+        monkeypatch.setenv("OUROBOROS_MODEL", "openai/main-model")
+        monkeypatch.setenv("OUROBOROS_MODEL_ACCOUNTS", '{"main": "personal", "light": "other"}')
+        row = system_review_row("")
+        assert (row.slot_id, row.target_id, row.profile_id) == ("main", "openai/main-model", "personal")
+        monkeypatch.setenv("OUROBOROS_MODEL_ACCOUNTS", '{"main": ""}')
+        assert system_review_row("").profile_id == ""
+        monkeypatch.delenv("OUROBOROS_MODEL_ACCOUNTS")
+        assert main_review_row().profile_id == ""
 
-    def test_omission_section_after_memory_whitelist(self, tmp_repo, tmp_drive):
-        """OMITTED FILES section is appended after both repo and memory passes, capturing all skips.
+    def test_w5_a_named_row_keeps_its_own_credential_pin_not_mains(self, monkeypatch):
+        """The working side: a catalog row the call names rides its own route credential
+        (a managed-source row may pin one) or none; Main's pin never leaks onto it."""
+        from ouroboros.tools.review_change import system_review_row
+        from tests.review_pool_rosters import pool_roster, pool_seat, set_review_pool
 
-        Simulates a memory-whitelist read error by patching pathlib.Path.read_text so that
-        identity.md raises PermissionError, ensuring it lands in skipped and the OMITTED section.
-        """
-        (tmp_repo / "lib.min.js").write_text("minified\n")
-        (tmp_drive / "memory" / "identity.md").write_text("I am Ouroboros.\n")
-        target_path = str(tmp_drive / "memory" / "identity.md")
+        monkeypatch.setenv("OUROBOROS_MODEL_ACCOUNTS", '{"main": "personal"}')
+        set_review_pool(monkeypatch, pool_roster(
+            pool_seat("pinned-scout", "claudexor::codex=model-x", profile_id="row-pin", marked=False),
+            pool_seat("free-scout", "openai/fake-reviewer", marked=False)))
+        assert system_review_row("pinned-scout").profile_id == "row-pin"
+        assert system_review_row("free-scout").profile_id == ""
 
-        original_read_text = pathlib.Path.read_text
 
-        def patched_read_text(self, encoding="utf-8", errors="replace"):
-            if str(self) == target_path:
-                raise PermissionError("mocked read error")
-            return original_read_text(self, encoding=encoding, errors=errors)
+def _git(cwd, *args):
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
 
-        with mock.patch("dulwich.repo.Repo", _make_dulwich_mock(["main.py", "lib.min.js"])):
-            with mock.patch("pathlib.Path.read_text", patched_read_text):
-                pack, stats = build_review_pack(tmp_repo, tmp_drive)
 
-        assert "## OMITTED FILES" in pack
-        omitted_section_pos = pack.index("## OMITTED FILES")
-        # Vendored file listed in omitted section
-        assert "lib.min.js" in pack[omitted_section_pos:]
-        # Memory read error captured in skipped
-        memory_errors = [s for s in stats["skipped"] if "identity.md" in s and "read error" in s]
-        assert memory_errors, "identity.md read error should appear in skipped"
-        # And it appears in the OMITTED section too
-        assert "identity.md" in pack[omitted_section_pos:]
+@pytest.fixture()
+def system_ctx(tmp_path):
+    from ouroboros.tools.registry import ToolContext
+
+    repo, drive = tmp_path / "repo", tmp_path / "drive"
+    repo.mkdir()
+    (drive / "memory").mkdir(parents=True)
+    (drive / "memory" / "deep_review.md").write_text("PREVIOUS REPORT", encoding="utf-8")
+    (repo / "BIBLE.md").write_text("# BIBLE\n", encoding="utf-8")
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "base")
+    ctx = ToolContext(repo_dir=repo, drive_root=drive)
+    ctx.task_id = "dsr-1"
+    return ctx
+
+
+class TestRunSystemReview:
+    """``run_system_review`` writes ONE ``surface=system`` record whose one seat
+    answers ``report`` (never a verdict question), and replaces
+    ``memory/deep_review.md`` only with a delivered report."""
+
+    def _stub(self, monkeypatch, value):
+        import ouroboros.deep_self_review as dsr
+
+        seen = {}
+
+        def review(*args, **kwargs):
+            seen.update(kwargs, args=args)
+            return value
+
+        monkeypatch.setattr(dsr, "run_deep_self_review", review)
+        return seen
+
+    def test_a_named_row_writes_the_report_record(self, system_ctx, monkeypatch):
+        from ouroboros.review_ledger import load_record
+        from ouroboros.tools.review_change import run_review_change
+
+        _roster(monkeypatch)
+        seen = self._stub(monkeypatch, ("REPORT BODY", {"resolved_model": "openai/fake-reviewer", "cost": 0.25}))
+        result = run_review_change(system_ctx, subject="system", surface="system", reviewers=["api-scout"])
+        assert seen["slot"].subagent_id == "api-scout" and seen["task_id"] == "dsr-1"
+        assert result["report"] == "REPORT BODY" and result["report_delivered"] is True
+        record = load_record(system_ctx.drive_root, result["record_id"])
+        assert record["surface"] == "system" and record["subject"]["kind"] == "system"
+        [seat] = record["rows"]
+        assert (seat["seat_id"], seat["parts"], seat["parts_answered"]) == ("api-scout", ["report"], ["report"])
+        assert record["panel"]["chosen_by"] == "ouroboros" and record["panel"]["reviewers_requested"] == ["api-scout"]
+        assert record["verdict"]["report"] == {"delivered": True, "chars": len("REPORT BODY")}
+        assert record["verdict"]["aggregate"] != "PASS"
+        assert (system_ctx.drive_root / "memory" / "deep_review.md").read_text(encoding="utf-8") == "REPORT BODY"
+
+    def test_no_name_runs_main_and_a_refusal_keeps_the_previous_report(self, system_ctx, monkeypatch):
+        from ouroboros.review_ledger import load_record
+        from ouroboros.tools.review_change import run_system_review
+
+        monkeypatch.setenv("OUROBOROS_MODEL", "openai/main-model")
+        refusal = "❌ Deep self-review unavailable: no OpenRouter or direct OpenAI credentials for openai/main-model."
+        seen = self._stub(monkeypatch, (refusal, {"execution_status": "infra_failed",
+                                                  "reason_code": "deep_self_review_unavailable"}))
+        result = run_system_review(system_ctx)
+        assert seen["slot"].slot_id == "main" and result["report_delivered"] is False
+        record = load_record(system_ctx.drive_root, result["record_id"])
+        assert record["panel"]["chosen_by"] == "owner" and record["panel"]["reviewers_requested"] == []
+        assert record["dispatch_refusal"] == {"kind": "reviewer_unavailable", "message": refusal}
+        assert (system_ctx.drive_root / "memory" / "deep_review.md").read_text(encoding="utf-8") == "PREVIOUS REPORT"
+
+    def _session_row(self, monkeypatch):
+        """An unmarked enabled session row with its own effort and credential pin."""
+        from tests.review_pool_rosters import mixed_pool_rows, pool_roster, pool_seat, set_review_pool
+
+        set_review_pool(monkeypatch, pool_roster(*mixed_pool_rows(), pool_seat(
+            "deep-session", "codex=gpt-5.6-sol", kind="agent_session", effort="xhigh", profile_id="prof-1", marked=False)))
+        return "deep-session"
+
+    @pytest.mark.parametrize("local", [False, True], ids=["remote", "local"])
+    def test_a_bare_review_sends_mains_whole_binding(self, system_ctx, monkeypatch, local):
+        """``/review`` with no reviewer named sends Main's model, local flag, account pin and
+        processing (``main_review_row``) on the provider call itself."""
+        import ouroboros.deep_self_review as dsr
+        from ouroboros.review_native_episode import NativeToolRoundReviewExecutor
+        from ouroboros.tools.review_change import system_review_row
+
+        for key, value in {"OPENAI_API_KEY": "sk-present-key", "OUROBOROS_MODEL": "openai::gpt-5.6-sol",
+                           "USE_LOCAL_MAIN": str(local), "OUROBOROS_MODEL_ACCOUNTS": '{"main": "personal"}',
+                           "OUROBOROS_PROCESSING_PREFERENCE": "fast",
+                           "OUROBOROS_MODEL_PROCESSING_PREFERENCES": '{"main": "economy"}'}.items():
+            monkeypatch.setenv(key, value)
+        sent = {}
+
+        def execute(executor):
+            sent["kwargs"] = executor._chat_kwargs([], [], 8)
+            raise RuntimeError("sent")
+
+        monkeypatch.setattr(NativeToolRoundReviewExecutor, "execute", execute)
+        dsr.run_deep_self_review(system_ctx.repo_dir, system_ctx.drive_root, None, lambda _line: None,
+                                 slot=system_review_row(""))
+        assert provider_call(monkeypatch, sent["kwargs"]) == (
+            "openai::gpt-5.6-sol", "reviewer:main", "personal", "economy", local)
+
+    def test_the_record_names_the_chosen_rows_real_seat_plan(self, system_ctx, monkeypatch):
+        """D1-04 / V11 / D2-03: the system seat is written in the wave's shared ``rows``
+        contract, so the record carries the row's route, effort, profile, session
+        target and catalog id — not a seat rebuilt from the answer's model name."""
+        from ouroboros.review_ledger import load_record
+        from ouroboros.tools.review_change import run_review_change
+
+        row = self._session_row(monkeypatch)
+        self._stub(monkeypatch, ("REPORT", {"resolved_model": "codex=gpt-5.6-sol", "cost": 0.5}))
+        result = run_review_change(system_ctx, subject="system", surface="system", reviewers=[row])
+        [seat] = load_record(system_ctx.drive_root, result["record_id"])["rows"]
+        assert seat["seat_id"] == row and seat["subagent_id"] == row
+        assert seat["requested"] == {"route": "agent_session", "model": "codex=gpt-5.6-sol", "effort": "xhigh",
+                                     "profile": "prof-1", "delivery": "retrieving", "session_target": "codex=gpt-5.6-sol",
+                                     "processing_preference": "", "subagent_id": row}
+        assert seat["effective"]["route"] == "agent_session" and seat["parts_answered"] == ["report"]
+
+    def test_a_refused_review_still_records_the_seat_it_chose(self, system_ctx, monkeypatch):
+        from ouroboros.review_ledger import load_record
+        from ouroboros.tools.review_change import run_review_change
+
+        row = self._session_row(monkeypatch)
+        self._stub(monkeypatch, ("❌ Deep self-review unavailable: no harness.",
+                                 {"execution_status": "infra_failed", "reason_code": "deep_self_review_unavailable"}))
+        result = run_review_change(system_ctx, subject="system", surface="system", reviewers=[row])
+        record = load_record(system_ctx.drive_root, result["record_id"])
+        assert record["dispatch_refusal"]["kind"] == "reviewer_unavailable"
+        [seat] = record["rows"]
+        assert (seat["seat_id"], seat["status"], seat["parts_answered"]) == (row, "not_dispatched", [])
+        assert (seat["requested"]["route"], seat["requested"]["effort"], seat["requested"]["profile"]) == (
+            "agent_session", "xhigh", "prof-1")
+        assert record["verdict"]["aggregate"] == "NOT_DISPATCHED"
+
+    def test_the_calls_goal_questions_and_reason_reach_the_executor_and_the_record(self, system_ctx, monkeypatch):
+        """D1-03 / V10: one typed ask (``SystemReviewAsk``) goes to the brief builder and
+        the ledger; the standing questionnaire stays, the call's own goal and questions
+        are added, and the reason is recorded as given."""
+        from ouroboros.deep_self_review import STANDING_GOAL, SystemReviewAsk
+        from ouroboros.review_ledger import load_record
+        from ouroboros.tools.review_change import run_review_change
+
+        _roster(monkeypatch)
+        seen = self._stub(monkeypatch, ("REPORT", {"resolved_model": "openai/fake-reviewer"}))
+        result = run_review_change(
+            system_ctx, subject="system", surface="system", reviewers=["api-scout"], goal="Check the routing",
+            author_questions=["Does the pinned profile reach the provider?", "Is the fallback disclosed?"],
+            reason="the route specialist")
+        ask = seen["ask"]
+        assert ask == SystemReviewAsk(goal="Check the routing", reason="the route specialist",
+                                      author_questions=("Does the pinned profile reach the provider?",
+                                                        "Is the fallback disclosed?"))
+        record = load_record(system_ctx.drive_root, result["record_id"])
+        assert record["brief"]["goal"] == "Check the routing"
+        assert record["brief"]["author_questions"] == list(ask.author_questions)
+        assert (record["panel"]["reason"], record["panel"]["reason_missing"]) == ("the route specialist", False)
+
+        bare = run_review_change(system_ctx, subject="system", surface="system")
+        assert seen["ask"] == SystemReviewAsk() and seen["ask"].effective_goal == STANDING_GOAL
+        assert load_record(system_ctx.drive_root, bare["record_id"])["brief"]["goal"] == STANDING_GOAL
+
+    def test_the_brief_carries_the_standing_questionnaire_and_the_calls_questions(self, system_ctx):
+        from ouroboros.deep_self_review import SystemReviewAsk, _ROLE_PROMPT, _retrieving_task
+
+        ask = SystemReviewAsk(goal="Check the routing", author_questions=("Does the pin reach the provider?",))
+        asked, _facts = _retrieving_task(system_ctx.repo_dir, system_ctx.drive_root, ask=ask)
+        bare, _facts = _retrieving_task(system_ctx.repo_dir, system_ctx.drive_root)
+        for text in (asked, bare):
+            assert text.startswith(_ROLE_PROMPT) and "Prioritize: CRITICAL > IMPORTANT > ADVISORY." in text
+        assert "The caller's goal for this review" in asked and "Check the routing" in asked
+        assert "Author questions (answer each as asked, after your own questionnaire):\n1. Does the pin reach the provider?" in asked
+        assert "Author questions" not in bare and "caller's goal" not in bare
+
+    def test_the_record_binds_the_tree_the_reviewer_read_not_the_one_after(self, system_ctx, monkeypatch):
+        """D1-06 / V13: the subject is snapshotted BEFORE the reviewer reads; a tree that
+        moves under the review is disclosed, never passed off as the one read."""
+        import ouroboros.deep_self_review as dsr
+        from supervisor.update_candidate import worktree_snapshot_tree
+        from ouroboros.review_ledger import load_record
+        from ouroboros.tools.review_change import run_system_review
+
+        repo = system_ctx.repo_dir
+        before_tree, _ = worktree_snapshot_tree("HEAD", cwd=str(repo))
+        before_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+        def review(*args, **kwargs):  # another process lands a commit while the review reads
+            (repo / "moved.py").write_text("x = 1\n", encoding="utf-8")
+            _git(repo, "add", "-A")
+            _git(repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "moved")
+            return "REPORT", {"resolved_model": "openai/main-model"}
+
+        monkeypatch.setenv("OUROBOROS_MODEL", "openai/main-model")
+        monkeypatch.setattr(dsr, "run_deep_self_review", review)
+        result = run_system_review(system_ctx)
+        after_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+        assert after_head != before_head
+        record = load_record(system_ctx.drive_root, result["record_id"])
+        assert (record["subject"]["tree_sha"], record["subject"]["head"], record["subject"]["base"]) == (
+            before_tree, before_head, before_head)
+        [moved] = [r for r in record["verdict"]["degraded_reasons"] if r.startswith("system_tree_moved_during_review")]
+        assert before_head[:12] in moved and after_head[:12] in moved
+
+    @pytest.mark.parametrize("args, fragment", [
+        ({"subject": "system", "surface": "change"}, "subject=system goes with surface=system"),
+        ({"subject": "worktree", "surface": "system"}, "subject=system goes with surface=system"),
+        ({"subject": "system", "surface": "system", "reviewers": ["a", "b"]}, "seats exactly one reviewer"),
+    ])
+    def test_the_system_surface_is_one_seat_over_the_whole_system(self, system_ctx, monkeypatch, args, fragment):
+        from ouroboros.tools.review_change import ReviewChangeArgumentError, run_review_change
+
+        self._stub(monkeypatch, ("unused", {}))
+        with pytest.raises(ReviewChangeArgumentError, match=fragment):
+            run_review_change(system_ctx, **args)
 
 
 class TestIsProbablyBinary:
@@ -304,7 +449,7 @@ class TestIsProbablyBinary:
 
     def test_only_first_sniff_bytes_read(self, tmp_path):
         """_is_probably_binary only reads _BINARY_SNIFF_BYTES bytes, not the whole file."""
-        from ouroboros.deep_self_review import _BINARY_SNIFF_BYTES
+        from ouroboros.tools.review_helpers import _BINARY_SNIFF_BYTES
         # File is mostly text but has NUL in the first 8KB window
         payload = b"text data\x00more" + b"a" * (_BINARY_SNIFF_BYTES * 2)
         f = tmp_path / "big.bin"
@@ -322,88 +467,6 @@ class TestIsProbablyBinary:
         """Missing file returns False (let caller handle read failure)."""
         f = tmp_path / "does_not_exist.bin"
         assert _is_probably_binary(f) is False
-
-    def test_unlisted_extension_binary_excluded_from_pack(self, tmp_repo, tmp_drive):
-        """Binary file with unlisted extension (.bin) is excluded via content sniffer."""
-        (tmp_repo / "model.bin").write_bytes(b"GGUF\x00" + b"\x00\xff" * 100)
-        with mock.patch("dulwich.repo.Repo", _make_dulwich_mock(["main.py", "model.bin"])):
-            pack, stats = build_review_pack(tmp_repo, tmp_drive)
-
-        assert "## FILE: model.bin" not in pack
-        assert any("model.bin" in s for s in stats["skipped"])
-
-
-class TestBinaryFilesExcluded:
-    def test_png_skipped(self, tmp_repo, tmp_drive):
-        """PNG images are excluded — reading them produces garbage replacement chars."""
-        (tmp_repo / "screenshot.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
-        with mock.patch("dulwich.repo.Repo", _make_dulwich_mock(["main.py", "screenshot.png"])):
-            pack, stats = build_review_pack(tmp_repo, tmp_drive)
-
-        assert "## FILE: screenshot.png" not in pack
-        assert any("screenshot.png" in s for s in stats["skipped"])
-
-    def test_jpg_skipped(self, tmp_repo, tmp_drive):
-        """JPEG images are excluded."""
-        (tmp_repo / "logo.jpg").write_bytes(b"\xff\xd8\xff" + b"\x00" * 50)
-        with mock.patch("dulwich.repo.Repo", _make_dulwich_mock(["main.py", "logo.jpg"])):
-            pack, stats = build_review_pack(tmp_repo, tmp_drive)
-
-        assert "## FILE: logo.jpg" not in pack
-        assert any("logo.jpg" in s for s in stats["skipped"])
-
-    def test_svg_skipped(self, tmp_repo, tmp_drive):
-        """SVG files are excluded (provider icons can be large XML)."""
-        (tmp_repo / "icon.svg").write_text("<svg><circle r='10'/></svg>\n")
-        with mock.patch("dulwich.repo.Repo", _make_dulwich_mock(["main.py", "icon.svg"])):
-            pack, stats = build_review_pack(tmp_repo, tmp_drive)
-
-        assert "## FILE: icon.svg" not in pack
-        assert any("icon.svg" in s for s in stats["skipped"])
-
-    def test_ico_skipped(self, tmp_repo, tmp_drive):
-        """ICO files are excluded."""
-        (tmp_repo / "favicon.ico").write_bytes(b"\x00\x00\x01\x00" + b"\x00" * 50)
-        with mock.patch("dulwich.repo.Repo", _make_dulwich_mock(["main.py", "favicon.ico"])):
-            pack, stats = build_review_pack(tmp_repo, tmp_drive)
-
-        assert "## FILE: favicon.ico" not in pack
-        assert any("favicon.ico" in s for s in stats["skipped"])
-
-    def test_python_source_not_skipped(self, tmp_repo, tmp_drive):
-        """Python source files (.py) are NOT excluded by the binary filter."""
-        with mock.patch("dulwich.repo.Repo", _make_dulwich_mock(["main.py"])):
-            pack, stats = build_review_pack(tmp_repo, tmp_drive)
-
-        assert "### main.py" in pack
-
-
-class TestSkipDirPrefixes:
-    def test_assets_dir_excluded(self, tmp_repo, tmp_drive):
-        """Files under assets/ are excluded (README screenshots, app icons)."""
-        assets = tmp_repo / "assets"
-        assets.mkdir()
-        (assets / "chat.png").write_bytes(b"\x89PNG\r\n" + b"\x00" * 100)
-        (assets / "logo.jpg").write_bytes(b"\xff\xd8\xff" + b"\x00" * 50)
-        with mock.patch("dulwich.repo.Repo", _make_dulwich_mock(["main.py", "assets/chat.png", "assets/logo.jpg"])):
-            pack, stats = build_review_pack(tmp_repo, tmp_drive)
-
-        assert "## FILE: assets/chat.png" not in pack
-        assert "## FILE: assets/logo.jpg" not in pack
-        assert any("assets/chat.png" in s for s in stats["skipped"])
-        assert any("assets/logo.jpg" in s for s in stats["skipped"])
-        assert "### main.py" in pack  # non-assets file still present
-
-    def test_web_dir_not_excluded(self, tmp_repo, tmp_drive):
-        """Files under web/ (SPA modules) are NOT excluded."""
-        web = tmp_repo / "web" / "modules"
-        web.mkdir(parents=True)
-        (web / "chat.js").write_text("// chat module\n")
-        with mock.patch("dulwich.repo.Repo", _make_dulwich_mock(["main.py", "web/modules/chat.js"])):
-            pack, stats = build_review_pack(tmp_repo, tmp_drive)
-
-        assert "### web/modules/chat.js" in pack
-        assert not any("web/modules/chat.js" in s for s in stats["skipped"])
 
 
 class TestNoProxyLlmChat:
@@ -430,8 +493,9 @@ class TestNoProxyLlmChat:
             "usage": {"prompt_tokens": 1, "completion_tokens": 1},
         }
 
-        with mock.patch("httpx.Client", side_effect=capturing_httpx_client):
-            with mock.patch("openai.OpenAI") as mock_openai_cls:
+        # Resolve the SDK before mocking the HTTP class it inherits on import.
+        with mock.patch("openai.OpenAI") as mock_openai_cls:
+            with mock.patch("httpx.Client", side_effect=capturing_httpx_client):
                 mock_oa = mock.Mock()
                 mock_oa.chat.completions.create.return_value = mock_resp
                 mock_openai_cls.return_value = mock_oa
@@ -440,6 +504,7 @@ class TestNoProxyLlmChat:
                     llm.chat(
                         messages=[{"role": "user", "content": "hi"}],
                         model="openai/gpt-5.5-pro",
+                        max_tokens=8,
                         no_proxy=True,
                     )
 
@@ -469,8 +534,8 @@ class TestNoProxyLlmChat:
             "usage": {"prompt_tokens": 1, "completion_tokens": 1},
         }
 
-        with mock.patch("httpx.Client", TrackingClient):
-            with mock.patch("openai.OpenAI") as mock_openai_cls:
+        with mock.patch("openai.OpenAI") as mock_openai_cls:
+            with mock.patch("httpx.Client", TrackingClient):
                 mock_oa = mock.Mock()
                 mock_oa.chat.completions.create.return_value = mock_resp
                 mock_openai_cls.return_value = mock_oa
@@ -479,6 +544,7 @@ class TestNoProxyLlmChat:
                     llm.chat(
                         messages=[{"role": "user", "content": "hi"}],
                         model="openai/gpt-5.5-pro",
+                        max_tokens=8,
                         no_proxy=True,
                     )
 
@@ -499,8 +565,8 @@ class TestNoProxyLlmChat:
 
         llm = LLMClient()
 
-        with mock.patch("httpx.Client", TrackingClient):
-            with mock.patch("openai.OpenAI") as mock_openai_cls:
+        with mock.patch("openai.OpenAI") as mock_openai_cls:
+            with mock.patch("httpx.Client", TrackingClient):
                 mock_oa = mock.Mock()
                 mock_oa.chat.completions.create.side_effect = RuntimeError("boom")
                 mock_openai_cls.return_value = mock_oa
@@ -510,38 +576,40 @@ class TestNoProxyLlmChat:
                         llm.chat(
                             messages=[{"role": "user", "content": "hi"}],
                             model="openai/gpt-5.5-pro",
+                            max_tokens=8,
                             no_proxy=True,
                         )
 
         assert len(closed_clients) >= 1, "httpx.Client must be closed even after exception"
 
-    def test_chat_no_proxy_skips_generation_cost_fetch(self):
-        """chat(no_proxy=True) does not call _fetch_generation_cost (proxy/OS path)."""
+    def test_chat_no_proxy_makes_no_metadata_get(self):
+        """chat(no_proxy=True) normalizes the received usage without metadata HTTP."""
         from ouroboros.llm import LLMClient
 
         llm = LLMClient()
         mock_resp = mock.Mock()
         mock_resp.model_dump.return_value = {
-            "id": "gen-abc123",  # has a generation id — would trigger cost fetch normally
+            "id": "gen-abc123",
             "choices": [{"message": {"role": "assistant", "content": "ok"}}],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5},
         }
 
-        with mock.patch("httpx.Client") as mock_httpx_cls:
-            mock_http = mock.Mock()
-            mock_httpx_cls.return_value = mock_http
-            with mock.patch("openai.OpenAI") as mock_openai_cls:
+        with mock.patch("openai.OpenAI") as mock_openai_cls:
+            with mock.patch("httpx.Client") as mock_httpx_cls:
+                mock_http = mock.Mock()
+                mock_httpx_cls.return_value = mock_http
                 mock_oa = mock.Mock()
                 mock_oa.chat.completions.create.return_value = mock_resp
                 mock_openai_cls.return_value = mock_oa
-                with mock.patch.object(llm, "_fetch_generation_cost") as mock_cost:
+                with mock.patch("requests.get") as metadata_get:
                     with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test"}, clear=False):
                         llm.chat(
                             messages=[{"role": "user", "content": "hi"}],
                             model="openai/gpt-5.5-pro",
+                            max_tokens=8,
                             no_proxy=True,
                         )
-                    mock_cost.assert_not_called()
+                    metadata_get.assert_not_called()
 
     def test_chat_no_proxy_false_uses_cached_client(self):
         """chat(no_proxy=False, default) uses the shared cached client, not a new one."""
@@ -572,6 +640,7 @@ class TestNoProxyLlmChat:
                     llm.chat(
                         messages=[{"role": "user", "content": "hi"}],
                         model="openai/gpt-5.5-pro",
+                        max_tokens=8,
                         no_proxy=False,
                     )
                     mock_get.assert_called_once()
@@ -579,68 +648,76 @@ class TestNoProxyLlmChat:
         # no_proxy=False must not construct a new httpx.Client
         assert len(new_clients) == 0
 
-    def test_run_deep_self_review_calls_llm_with_no_proxy_and_configured_effort(self, tmp_repo, tmp_drive, monkeypatch):
-        """run_deep_self_review passes no_proxy=True to llm.chat."""
-        from ouroboros.deep_self_review import run_deep_self_review
-        small_pack = "x" * 100
-        manifest = {"status": "ok", "selected_count": 1}
-        mock_llm = mock.Mock()
-        mock_llm.chat.return_value = ({"content": "Review result."}, {"cost": 0.01})
-        monkeypatch.setenv("OUROBOROS_EFFORT_DEEP_SELF_REVIEW", "medium")
 
-        with mock.patch(
-            "ouroboros.deep_self_review.build_review_pack",
-            return_value=(
-                small_pack,
-                {
-                    "file_count": 1,
-                    "total_chars": len(small_pack),
-                    "skipped": [],
-                    "context_manifest": manifest,
-                },
-            ),
-        ):
-            result, usage = run_deep_self_review(
-                repo_dir=tmp_repo,
-                drive_root=tmp_drive,
-                llm=mock_llm,
-                emit_progress=lambda x: None,
-                event_queue=None,
-                model="openai/gpt-5.5-pro",
+def test_direct_openai_deep_review_sends_a_real_openai_model_id():
+    """PHYSICAL-PAYLOAD proof, not a defaults-table assertion.
+
+    An owner may pin the slug `openai/gpt-5.6-sol-pro`. That `-pro`
+    suffix is an OpenRouter routing slug, NOT an OpenAI model id: live-probed
+    2026-07-29, `gpt-5.6-sol-pro` on api.openai.com /v1/chat/completions returns
+    404, while pro reasoning exists only on /v1/responses as
+    `reasoning.mode="pro"` (200) — and /v1/chat/completions rejects a `reasoning`
+    parameter outright (400 "Unknown parameter"). Every LLM call in llm.py is a
+    chat.completions call, so the direct-OpenAI deep-review slot ships plain Sol
+    and this test pins what actually reaches the wire.
+    """
+    import os
+    from unittest import mock
+
+    from ouroboros.llm import LLMClient
+    from ouroboros.provider_models import OPENAI_DIRECT_DEFAULTS
+
+    slot = OPENAI_DIRECT_DEFAULTS["deep_self_review"]
+    assert slot.startswith("openai::"), slot
+
+    mock_resp = mock.Mock()
+    mock_resp.model_dump.return_value = {
+        "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+    with mock.patch("openai.OpenAI") as mock_openai_cls:
+        mock_oa = mock.Mock()
+        mock_oa.chat.completions.create.return_value = mock_resp
+        mock_openai_cls.return_value = mock_oa
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "sk-direct-test"}, clear=False):
+            LLMClient().chat(
+                messages=[{"role": "user", "content": "hi"}],
+                model=slot, max_tokens=8, no_proxy=True,
             )
+        assert mock_oa.chat.completions.create.called
+        payload = mock_oa.chat.completions.create.call_args.kwargs
 
-        assert result == "Review result."
-        mock_llm.chat.assert_called_once()
-        _, kwargs = mock_llm.chat.call_args
-        assert kwargs.get("no_proxy") is True, "llm.chat must be called with no_proxy=True"
-        assert kwargs.get("reasoning_effort") == "medium"
-        sidecar = tmp_drive / "state" / "deep_self_review_context.json"
-        assert sidecar.is_file()
-        assert '"context_manifest"' in sidecar.read_text(encoding="utf-8")
-        assert '"selected_count": 1' in sidecar.read_text(encoding="utf-8")
+    # The id on the wire is a REAL OpenAI model, never the OpenRouter slug.
+    assert payload["model"] == "gpt-5.6-sol"
+    assert not payload["model"].endswith("-pro")
+    # ...and no `reasoning` object is smuggled onto a chat.completions call, which
+    # the live API rejects with 400 (the only pro carrier is the Responses API).
+    assert "reasoning" not in payload
+    assert "reasoning" not in (payload.get("extra_body") or {})
 
 
-class TestReviewPackOverflow:
-    def test_explicit_error_on_overflow(self, tmp_repo, tmp_drive):
-        """When pack exceeds ~920K tokens, run_deep_self_review returns an error."""
-        # Create a pack that's way too large (> 3.68M chars ≈ 920K tokens)
-        huge_pack = "x" * 4_000_000
-        mock_llm = mock.Mock()
+def test_direct_fallback_preserves_an_explicit_real_model_pin():
+    """Only router-only `-pro` slugs are substituted by the provider default; an
+    owner's explicit pin of a REAL OpenAI model keeps the mechanical rewrite."""
+    import os
+    from unittest import mock
 
-        with mock.patch(
-            "ouroboros.deep_self_review.build_review_pack",
-            return_value=(huge_pack, {"file_count": 100, "total_chars": 4_000_000, "skipped": []}),
-        ):
-            result, usage = run_deep_self_review(
-                repo_dir=tmp_repo,
-                drive_root=tmp_drive,
-                llm=mock_llm,
-                emit_progress=lambda x: None,
-                event_queue=None,
-                model="test-model",
-            )
+    from ouroboros.provider_models import OPENAI_DIRECT_DEFAULTS
 
-        assert "too large" in result
-        assert "920,000" in result
-        assert usage == {}
-        mock_llm.chat.assert_not_called()
+    env = {"OPENAI_API_KEY": "sk-test"}
+    with mock.patch.dict(os.environ, env, clear=False):
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        os.environ.pop("OPENAI_BASE_URL", None)
+        os.environ.pop("USE_LOCAL_MAIN", None)
+        with mock.patch.dict(os.environ, {"OUROBOROS_MODEL": "openai/gpt-5.5"}):
+            reason, model = deep_review_route()
+            available = not reason
+        assert available is True
+        assert model == "openai::gpt-5.5", "an explicit real-model pin survives"
+        with mock.patch.dict(os.environ, {"OUROBOROS_MODEL": "openai/gpt-5.5-pro"}):
+            reason, model = deep_review_route()
+            available = not reason
+        assert available is True
+        assert model == OPENAI_DIRECT_DEFAULTS["deep_self_review"], (
+            "a router-only -pro slug lands on the provider default"
+        )

@@ -8,28 +8,42 @@ import hmac
 import html
 import ipaddress
 import os
+import pathlib
+import secrets
+import time
 from http.cookies import SimpleCookie
-from urllib.parse import parse_qs
+from typing import TYPE_CHECKING
+from urllib.parse import parse_qs, urlencode
 
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ouroboros.config import load_settings
 
+if TYPE_CHECKING:
+    from ouroboros.server_web import ServedUI
+
 NETWORK_PASSWORD_KEY = "OUROBOROS_NETWORK_PASSWORD"
 AUTH_COOKIE_NAME = "ouroboros_auth"
 _PUBLIC_HTTP_PATHS = {"/api/health", "/auth/login", "/auth/logout"}
+_NO_STORE = {"Cache-Control": "no-store"}
 
 
-def get_configured_network_password() -> str:
-    raw = (os.environ.get(NETWORK_PASSWORD_KEY, "") or "").strip()
+def resolve_network_password(env_value: str | None, settings_loader) -> str:
+    """The resolution order, pure: a non-blank environment value wins, else the settings value,
+    else the empty password (a missing, blank or unreadable settings file included)."""
+    raw = (env_value or "").strip()
     if raw:
         return raw
     try:
-        return str(load_settings().get(NETWORK_PASSWORD_KEY, "") or "").strip()
+        return str(settings_loader().get(NETWORK_PASSWORD_KEY, "") or "").strip()
     except Exception:
         return ""
+
+
+def get_configured_network_password() -> str:
+    return resolve_network_password(os.environ.get(NETWORK_PASSWORD_KEY, ""), load_settings)
 
 
 def is_loopback_host(host: str | None) -> bool:
@@ -69,8 +83,67 @@ def _headers_map(scope: Scope) -> dict[str, str]:
     }
 
 
-def _session_value(password: str) -> str:
-    return hashlib.sha256(f"ouroboros-auth\0{password}".encode("utf-8")).hexdigest()
+# Sessions expire; a leaked cookie is no longer a permanent credential.
+_AUTH_SESSION_TTL_SEC = 30 * 24 * 3600
+_auth_secret_cache: bytes | None = None
+
+
+def _auth_secret() -> bytes:
+    """Server-side random HMAC key, persisted across restarts (0600).
+
+    The old cookie was a bare ``sha256(password)`` — deterministic, never
+    expiring, and forgeable by anyone who ever saw it. Sessions are now
+    HMAC-signed with this key, so they cannot be minted without server state
+    and they die with the key file (one re-login after key loss is accepted).
+    """
+    global _auth_secret_cache
+    if _auth_secret_cache:
+        return _auth_secret_cache
+    try:
+        from ouroboros import config as _cfg
+
+        path = pathlib.Path(_cfg.DATA_DIR) / "state" / "auth_secret.key"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            text = path.read_text(encoding="utf-8").strip()
+            if text:
+                _auth_secret_cache = bytes.fromhex(text)
+                return _auth_secret_cache
+        secret = secrets.token_hex(32)
+        path.write_text(secret + "\n", encoding="utf-8")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        _auth_secret_cache = bytes.fromhex(secret)
+    except Exception:
+        # No durable key (read-only data dir): fall back to a process-lifetime
+        # key — sessions survive within the run and re-login after restart.
+        _auth_secret_cache = secrets.token_bytes(32)
+    return _auth_secret_cache
+
+
+def _session_value(password: str, issued_at: int | None = None) -> str:
+    issued = int(issued_at if issued_at is not None else time.time())
+    pw_digest = hashlib.sha256(f"ouroboros-auth\0{password}".encode("utf-8")).hexdigest()
+    signature = hmac.new(
+        _auth_secret(), f"{issued}\0{pw_digest}".encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return f"{issued}.{signature}"
+
+
+def _cookie_session_valid(cookie_val: str, password: str) -> bool:
+    issued_text, sep, _signature = (cookie_val or "").partition(".")
+    if not sep:
+        return False
+    try:
+        issued = int(issued_text)
+    except (TypeError, ValueError):
+        return False
+    now = time.time()
+    if issued > now + 300 or now - issued > _AUTH_SESSION_TTL_SEC:
+        return False
+    return hmac.compare_digest(cookie_val, _session_value(password, issued))
 
 
 def _cookie_value(scope: Scope, cookie_name: str) -> str:
@@ -107,7 +180,7 @@ def _candidate_password(scope: Scope) -> str:
 
 def _is_authenticated(scope: Scope, password: str) -> bool:
     cookie_val = _cookie_value(scope, AUTH_COOKIE_NAME)
-    if cookie_val and hmac.compare_digest(cookie_val, _session_value(password)):
+    if cookie_val and _cookie_session_valid(cookie_val, password):
         return True
     candidate = _candidate_password(scope)
     return bool(candidate) and hmac.compare_digest(candidate, password)
@@ -138,12 +211,13 @@ def _build_next_url(scope: Scope) -> str:
 
 
 def _sanitize_next_url(value: str) -> str:
+    """The same-origin path a login returns to, else ``/``. A separately hosted interface sends
+    its own page here; browsers read a backslash as a slash and drop tabs and newlines, so
+    ``/\\host`` or ``/<TAB>/host`` would otherwise leave the origin once the session exists."""
     text = (value or "").strip()
-    if not text.startswith("/"):
+    if not text.startswith("/") or text.startswith("//") or "\\" in text:
         return "/"
-    if text.startswith("//"):
-        return "/"
-    if any(ch in text for ch in ('"', "'", "<", ">", "\r", "\n", "\x00")):
+    if any(ch in text for ch in ('"', "'", "<", ">")) or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
         return "/"
     return text
 
@@ -162,24 +236,28 @@ def _login_page(next_url: str, error: str = "") -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Ouroboros Login</title>
 </head>
-<body style="margin:0;background:#0d0b0f;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;">
+<body style="margin:0;background:#0f0f11;color:#efeff2;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;">
   <form method="post" action="/auth/login" style="width:min(360px,calc(100% - 32px));padding:24px;border:1px solid rgba(255,255,255,0.08);border-radius:18px;background:rgba(255,255,255,0.04);box-shadow:0 24px 60px rgba(0,0,0,0.35);">
     <h1 style="margin:0 0 8px;font-size:22px;">Ouroboros</h1>
     <p style="margin:0 0 16px;color:rgba(255,255,255,0.65);line-height:1.5;">This server is exposed beyond localhost. Enter the network password to continue.</p>
     <input type="hidden" name="next" value="{safe_next}">
     <label for="password" style="display:block;margin-bottom:8px;font-size:14px;">Password</label>
-    <input id="password" name="password" type="password" autofocus required style="width:100%;box-sizing:border-box;padding:12px 14px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);background:#15121a;color:#e2e8f0;">
-    <button type="submit" style="margin-top:16px;width:100%;padding:12px 14px;border:none;border-radius:12px;background:#c93545;color:white;font-weight:600;cursor:pointer;">Unlock</button>
+    <input id="password" name="password" type="password" autofocus required style="width:100%;box-sizing:border-box;padding:12px 14px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);background:#1a1b1c;color:#efeff2;">
+    <button type="submit" style="margin-top:16px;width:100%;padding:12px 14px;border:none;border-radius:12px;background:#d32d43;color:white;font-weight:600;cursor:pointer;">Unlock</button>
     {error_html}
   </form>
 </body>
 </html>"""
 
 
-async def _handle_login(scope: Scope, receive: Receive, send: Send, password: str) -> None:
+async def _handle_login(scope: Scope, receive: Receive, send: Send, password: str,
+                        served_ui: ServedUI | None = None) -> None:
     request = Request(scope, receive)
     if request.method == "GET":
-        response = HTMLResponse(_login_page(request.query_params.get("next", "/")), status_code=200)
+        page = (served_ui.custom_page("auth/index.html")
+                if served_ui is not None and request.query_params.get("builtin") != "1" else None)
+        response = HTMLResponse(page if page is not None else _login_page(request.query_params.get("next", "/")),
+                                headers=_NO_STORE)
         await response(scope, receive, send)
         return
     if request.method != "POST":
@@ -204,7 +282,7 @@ async def _handle_login(scope: Scope, receive: Receive, send: Send, password: st
         if is_json:
             response = JSONResponse({"error": "Invalid password."}, status_code=401)
         else:
-            response = HTMLResponse(_login_page(next_url, "Invalid password."), status_code=401)
+            response = HTMLResponse(_login_page(next_url, "Invalid password."), status_code=401, headers=_NO_STORE)
         await response(scope, receive, send)
         return
 
@@ -212,7 +290,16 @@ async def _handle_login(scope: Scope, receive: Receive, send: Send, password: st
         response = JSONResponse({"ok": True, "next": next_url}, status_code=200)
     else:
         response = RedirectResponse(next_url, status_code=303)
-    response.set_cookie(AUTH_COOKIE_NAME, _session_value(password), httponly=True, samesite="lax")
+    # Secure only when actually served over TLS: setting it on plain-http LAN
+    # would make the browser drop the cookie and lock the user in a login loop.
+    response.set_cookie(
+        AUTH_COOKIE_NAME,
+        _session_value(password),
+        max_age=_AUTH_SESSION_TTL_SEC,
+        httponly=True,
+        samesite="lax",
+        secure=str(scope.get("scheme") or "").lower() in {"https", "wss"},
+    )
     await response(scope, receive, send)
 
 
@@ -239,8 +326,9 @@ async def _handle_logout(scope: Scope, receive: Receive, send: Send) -> None:
 class NetworkAuthGate:
     """Require a password for non-localhost access only when configured."""
 
-    def __init__(self, app: ASGIApp):
+    def __init__(self, app: ASGIApp, *, served_ui: ServedUI | None = None):
         self.app = app
+        self.served_ui = served_ui
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] not in {"http", "websocket"}:
@@ -248,23 +336,25 @@ class NetworkAuthGate:
             return
 
         password = get_configured_network_password()
-        if not password:
-            await self.app(scope, receive, send)
-            return
-
-        if is_loopback_host(_scope_client_host(scope)):
-            await self.app(scope, receive, send)
-            return
-
+        active = bool(password) and not is_loopback_host(_scope_client_host(scope))
         path = scope.get("path", "") or "/"
-        if scope["type"] == "http" and path == "/auth/login":
-            await _handle_login(scope, receive, send, password)
-            return
-        if scope["type"] == "http" and path == "/auth/logout":
-            await _handle_logout(scope, receive, send)
+        if scope["type"] == "http" and path in {"/auth/login", "/auth/logout"}:
+            # These names belong to the gate even when it is inactive: a selected
+            # asset named login/logout must not become a different operation.
+            if not active:
+                await PlainTextResponse("Not Found", status_code=404)(scope, receive, send)
+            elif path == "/auth/login":
+                await _handle_login(scope, receive, send, password, self.served_ui)
+            else:
+                await _handle_logout(scope, receive, send)
             return
 
-        if scope["type"] == "http" and path in _PUBLIC_HTTP_PATHS:
+        if not active:
+            await self.app(scope, receive, send)
+            return
+
+        if scope["type"] == "http" and (path in _PUBLIC_HTTP_PATHS or (
+                (path == "/auth" or path.startswith("/auth/")) and scope.get("method") in {"GET", "HEAD"})):
             await self.app(scope, receive, send)
             return
 
@@ -277,7 +367,15 @@ class NetworkAuthGate:
             return
 
         if _request_wants_html(scope):
-            response = HTMLResponse(_login_page(_build_next_url(scope)), status_code=401)
+            builtin_setup = path == "/onboarding" and Request(scope).query_params.get("builtin") == "1"
+            custom = (self.served_ui.custom_page("auth/index.html")
+                      if self.served_ui is not None and not builtin_setup else None)
+            next_url = _sanitize_next_url(_build_next_url(scope))
+            if custom is not None:
+                response = RedirectResponse("/auth/login?" + urlencode({"next": next_url}), status_code=303,
+                                            headers=_NO_STORE)
+            else:
+                response = HTMLResponse(_login_page(next_url), status_code=401, headers=_NO_STORE)
         else:
             response = JSONResponse({"error": "Authentication required."}, status_code=401)
         await response(scope, receive, send)

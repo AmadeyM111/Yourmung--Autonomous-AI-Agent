@@ -174,7 +174,8 @@ def test_normalize_text_response():
     assert usage["cached_tokens"] == 4
     assert usage["provider"] == "gigachat"
     assert usage["resolved_model"] == "gigachat/GigaChat-3-Ultra"
-    assert "cost" in usage
+    assert usage["cost"] is None
+    assert usage["cost_final"] is False
 
 
 def test_normalize_function_call_response():
@@ -225,7 +226,7 @@ def test_gigachat_payload_omits_reasoning_effort(monkeypatch):
                 object="chat.completion",
             )
 
-    monkeypatch.setattr(LLMClient, "_get_gigachat_client", lambda self, target: FakeClient())
+    monkeypatch.setattr(LLMClient, "_get_gigachat_client", lambda self, target, timeout=None: FakeClient())
 
     client = LLMClient()
     message, _ = client._chat_gigachat(

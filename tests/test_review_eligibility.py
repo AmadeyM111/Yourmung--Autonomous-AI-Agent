@@ -1,20 +1,21 @@
-"""Effect-gated task-acceptance review eligibility + cognitive recovery + persistence.
+"""Observed effects, cognitive recovery and the persisted review decision.
 
-Covers v6.6.0 changes: `required` mode reviews only turns with observable
-reviewable effects (or non-direct tasks); cognitive-memory updates are not
-effects; cognitive/root redirect blocks recover via the correct tool; the
-review decision surfaces into loop_outcome; and the draft-final invariant holds.
+Reviewable effects are observed production, never requests, declarations or queue
+membership. Cognitive memory keeps its separate meaning, a direct cognitive turn gets
+no owner-source selector, and the review decision stays observable in the outcome.
 """
 from __future__ import annotations
 
 import pathlib
+from types import SimpleNamespace
+
+import pytest
 
 from ouroboros.outcomes import (
     derive_loop_outcome,
     turn_has_reviewable_effects,
     _unresolved_tool_errors,
 )
-from ouroboros.loop import _task_acceptance_eligible
 
 
 def _call(tool, *, is_error=False, status="ok", root=None):
@@ -81,6 +82,33 @@ def test_cognitive_updates_are_not_effects():
     ]})
 
 
+def test_direct_cognitive_turn_does_not_receive_acceptance_selector(monkeypatch, tmp_path):
+    """A direct identity update must continue as natural conversation.
+
+    Owner-source observations are internal protocol text. Injecting one after a
+    cognitive-only tool call makes Main answer the selector instead of the
+    owner's introduction; no delivery control asks for a selection on this turn.
+    """
+    import queue
+
+    from ouroboros import loop
+    from ouroboros.loop_messages import prepare_acceptance_observation
+
+    monkeypatch.setattr(loop, "get_task_review_mode", lambda: "required")
+    ctx = SimpleNamespace(
+        task_id="direct-cognitive", task_attempt=1, drive_root=tmp_path,
+        task_metadata={}, task_contract={}, is_direct_chat=True,
+        _loop_mailbox_seen_ids=set(), _owner_directives=[],
+    )
+    messages = [{"role": "user", "content": "Please remember my name."}]
+    trace = {"tool_calls": [_call("update_identity")], "reasoning_notes": []}
+
+    prepare_acceptance_observation(ctx, trace, queue.Queue(), messages)
+
+    assert not any(row.get("acceptance_observation") for row in messages)
+    assert "ACCEPTANCE_SUBJECT_OBSERVATION" not in str(messages)
+
+
 def test_errored_write_is_not_an_effect():
     assert not turn_has_reviewable_effects({"tool_calls": [
         _call("write_file", is_error=True, status="light_mode_blocked", root="user_files"),
@@ -92,16 +120,14 @@ def test_empty_trace_has_no_effects():
     assert not turn_has_reviewable_effects({})
 
 
-def test_process_outputs_are_reviewable_effects():
-    # run_command / run_script that declare deliverable outputs produce artifacts.
+@pytest.mark.parametrize("tool", ["run_command", "run_script"])
+@pytest.mark.parametrize("registered", [False, True])
+def test_process_outputs_require_observed_production(tool, registered):
+    # Declared paths are intentions; successful registration is the produced fact.
     assert turn_has_reviewable_effects({"tool_calls": [
-        {"tool": "run_command", "is_error": False, "status": "ok",
-         "args": {"cmd": ["python", "build.py"], "outputs": ["Desktop/deck.pptx"]}},
-    ]})
-    assert turn_has_reviewable_effects({"tool_calls": [
-        {"tool": "run_script", "is_error": False, "status": "ok",
-         "args": {"outputs": ["report.html"]}},
-    ]})
+        {"tool": tool, "is_error": False, "status": "ok",
+         "args": {"outputs": ["report.html"]}, "artifact_registered": registered},
+    ]}) is registered
 
 
 def test_registered_artifact_flag_is_an_effect():
@@ -121,44 +147,22 @@ def test_process_without_outputs_is_not_an_effect():
     ]})
 
 
-def test_claude_code_edit_is_an_effect():
-    # Substantial coding tool (cwd-based, no root): any successful run is reviewable
-    # work. Over-counting a rare scratch edit is the safe immune-gate direction.
-    assert turn_has_reviewable_effects({"tool_calls": [
+def test_cwd_coding_effect_class_is_empty_since_d10():
+    # D10 retired the one cwd-based coding tool; the effect CLASS stays wired
+    # (an empty set), so a successor lands as one entry, not a new mechanism.
+    from ouroboros.outcomes import _EFFECT_CODING_TOOLS
+
+    assert _EFFECT_CODING_TOOLS == frozenset()
+    assert not turn_has_reviewable_effects({"tool_calls": [
         {"tool": "claude_code_edit", "is_error": False, "status": "ok", "args": {"cwd": "Desktop"}},
     ]})
 
 
-def test_start_service_with_outputs_is_an_effect():
-    assert turn_has_reviewable_effects({"tool_calls": [
+def test_start_service_declared_outputs_are_not_produced_artifacts():
+    assert not turn_has_reviewable_effects({"tool_calls": [
         {"tool": "start_service", "is_error": False, "status": "ok",
          "args": {"cmd": ["serve"], "outputs": ["report.html"]}},
     ]})
-
-
-# ----- _task_acceptance_eligible (mode, llm_trace, is_direct_chat) -----
-
-def test_off_never_eligible():
-    assert _task_acceptance_eligible("off", {"tool_calls": [_call("commit_reviewed")]}, False) == (False, "off")
-
-
-def test_auto_never_host_eligible():
-    assert _task_acceptance_eligible("auto", {"tool_calls": [_call("commit_reviewed")]}, True) == (False, "skipped_auto")
-
-
-def test_required_direct_chat_no_effect_is_skipped():
-    # "Привет" / "2+7" case: direct chat, zero effects -> no review even in required.
-    assert _task_acceptance_eligible("required", {"tool_calls": []}, True) == (False, "skipped_conversation")
-
-
-def test_required_with_effect_is_eligible():
-    assert _task_acceptance_eligible(
-        "required", {"tool_calls": [_call("write_file", root="user_files")]}, True
-    ) == (True, "required_effect")
-
-
-def test_required_nondirect_is_eligible_even_without_effect():
-    assert _task_acceptance_eligible("required", {"tool_calls": []}, False) == (True, "required_nondirect")
 
 
 # ----- cognitive / root redirect recovery -----
@@ -229,6 +233,52 @@ def test_root_required_recovers_via_user_files_batch_files():
     assert _unresolved_tool_errors(trace) == []
 
 
+def test_root_required_active_workspace_recovers_via_active_workspace_write():
+    # Parity with the user_files contract (cumulative review r2): the
+    # ACTIVE_WORKSPACE redirect is recovered only by a later write of the SAME
+    # file via root=active_workspace.
+    trace = {"tool_calls": [
+        {"tool": "write_file", "is_error": True, "status": "root_required_active_workspace",
+         "args": {"path": "/app/src/main.py"}},
+        {"tool": "write_file", "is_error": False, "status": "ok",
+         "args": {"root": "active_workspace", "path": "src/main.py"}},
+    ]}
+    assert _unresolved_tool_errors(trace) == []
+
+
+def test_root_required_active_workspace_recovers_via_default_root_write():
+    # active_workspace is the DEFAULT root for write_file/edit_text (scope r2
+    # finding): a retry that simply omits root writes to the demanded place and
+    # must earn the recovery credit — no false execution-axis degradation.
+    # user_files stays explicit-only (it is never a default root).
+    trace = {"tool_calls": [
+        {"tool": "write_file", "is_error": True, "status": "root_required_active_workspace",
+         "args": {"path": "/app/src/main.py"}},
+        {"tool": "write_file", "is_error": False, "status": "ok",
+         "args": {"path": "src/main.py"}},
+    ]}
+    assert _unresolved_tool_errors(trace) == []
+    trace_uf = {"tool_calls": [
+        {"tool": "write_file", "is_error": True, "status": "root_required_user_files",
+         "args": {"path": "/home/x/Desktop/a.html"}},
+        {"tool": "write_file", "is_error": False, "status": "ok",
+         "args": {"path": "Desktop/a.html"}},  # rootless != user_files
+    ]}
+    assert len(_unresolved_tool_errors(trace_uf)) == 1
+
+
+def test_root_required_active_workspace_not_recovered_by_user_files_write():
+    trace = {"tool_calls": [
+        {"tool": "write_file", "is_error": True, "status": "root_required_active_workspace",
+         "args": {"path": "/app/src/main.py"}},
+        {"tool": "write_file", "is_error": False, "status": "ok",
+         "args": {"root": "user_files", "path": "main.py"}},
+    ]}
+    unresolved = _unresolved_tool_errors(trace)
+    assert len(unresolved) == 1
+    assert unresolved[0]["status"] == "root_required_active_workspace"
+
+
 def test_root_required_terminal_not_recovered_by_artifact_output():
     # Terminal branch: a run_command with ARTIFACT_OUTPUTS must NOT clear a
     # ROOT_REQUIRED block via the generic recovery path — only a real user_files
@@ -263,12 +313,23 @@ def test_loop_outcome_defaults_when_no_decision():
     assert outcome["review_trigger"] == "not_evaluated"
 
 
-# ----- draft-final invariant (DEVELOPMENT.md: audit rounds must not silently
-# replace the normal final answer; verified at the source level) -----
+# ----- label-only invariant (v6.35.0): host-forced `required` review must NOT
+# inject a draft assistant turn or a review payload that replaces the deliverable —
+# the old re-loop that rewrote the deliverable into a meta-essay is removed. A
+# result review's findings reach the mind as one host note before delivery
+# (tools/review_result.py); the mind's own answer stays the deliverable. -----
 
-def test_acceptance_review_preserves_user_answer_and_draft():
-    src = (pathlib.Path(__file__).resolve().parents[1] / "ouroboros" / "loop.py").read_text(encoding="utf-8")
-    # Draft is committed to history before the review payload is injected.
-    assert 'messages.append({"role": "assistant", "content": content or ""})' in src
-    # Injection instructs the agent to keep its user-facing answer.
-    assert "Do NOT replace your user-facing answer with a status report" in src
+def test_acceptance_review_is_label_only_no_transcript_injection():
+    # v7 L-B split: the negatives sweep the whole loop family so no leaf can
+    # revive the injection; the verdict recording lives with the result review,
+    # which binds a settled review of the delivered result into review_runs.
+    loop_dir = pathlib.Path(__file__).resolve().parents[1] / "ouroboros"
+    src = "".join(
+        path.read_text(encoding="utf-8")
+        for path in [loop_dir / "loop.py", *sorted(loop_dir.glob("loop_*.py"))]
+    )
+    # The old injection strings are gone (no draft re-commit, no review payload).
+    assert "Do NOT replace your user-facing answer with a status report" not in src
+    assert "[TASK ACCEPTANCE REVIEW]" not in src
+    # The verdict is still recorded on the objective axis (immune signal kept).
+    assert "review_runs" in (loop_dir / "tools" / "review_result.py").read_text(encoding="utf-8")

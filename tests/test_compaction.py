@@ -1,159 +1,222 @@
-"""Tests for tool-history compaction protection (context_compaction.py)."""
-from ouroboros.context_compaction import compact_tool_history, _COMPACTION_PROTECTED_TOOLS
+"""Focused contract tests for the unit reader and the mind's authored fold."""
+
+from __future__ import annotations
+
+import copy
+import json
+from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
+
+from ouroboros import context_compaction as cc
+from ouroboros.context_budget import ContextReclaimRequest
 
 
-def _make_messages(tool_name: str, result_content: str, num_rounds: int = 8):
-    """Build a message list with num_rounds of tool calls, all using the same tool."""
-    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}]
-    for i in range(num_rounds):
-        tc_id = f"call_{i}"
-        messages.append({
+def _unit(call_id: str, *, argument: str = "a", result: str = "r") -> list[dict]:
+    return [
+        {
             "role": "assistant",
-            "content": f"Round {i}",
+            "content": f"reasoning-{call_id}",
             "tool_calls": [{
-                "id": tc_id,
-                "function": {"name": tool_name, "arguments": "{}"},
+                "id": call_id,
+                "function": {"name": "read_file", "arguments": argument},
             }],
-        })
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tc_id,
-            "content": result_content,
-        })
-    return messages
-
-
-def _make_large_arg_messages(tool_name: str, num_rounds: int = 8):
-    """Build messages whose old assistant tool-call payloads should compact."""
-    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}]
-    large_args = '{"content": "' + ("x" * 1000) + '"}'
-    for i in range(num_rounds):
-        tc_id = f"call_{i}"
-        messages.append({
-            "role": "assistant",
-            "content": f"Round {i}",
-            "tool_calls": [{
-                "id": tc_id,
-                "function": {"name": tool_name, "arguments": large_args},
-            }],
-        })
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tc_id,
-            "content": "ok",
-        })
-    return messages
-
-
-def test_protected_tool_results_survive_compaction():
-    """repo_commit results must not be truncated even in old rounds."""
-    original_result = "OK: committed to ouroboros: v3.19.0 review feedback applied"
-    msgs = _make_messages("commit_reviewed", original_result, num_rounds=10)
-    compacted = compact_tool_history(msgs, keep_recent=3)
-
-    commit_results = [
-        m["content"] for m in compacted
-        if m.get("role") == "tool" and m["content"] == original_result
+        },
+        {"role": "tool", "tool_call_id": call_id, "content": result},
     ]
-    assert len(commit_results) == 10, "All repo_commit results must survive compaction"
 
 
-def test_warning_results_survive_compaction():
-    """Results starting with warning emoji must not be truncated."""
-    warn_result = "\u26a0\ufe0f REVIEW_BLOCKED: tests failed, commit rejected. Fix errors first."
-    msgs = _make_messages("run_command", warn_result, num_rounds=10)
-    compacted = compact_tool_history(msgs, keep_recent=3)
-
-    warning_results = [
-        m["content"] for m in compacted
-        if m.get("role") == "tool" and m["content"] == warn_result
-    ]
-    assert len(warning_results) == 10, "Warning-prefixed results must survive compaction"
+def _large_unit(call_id: str, marker: str = "x") -> list[dict]:
+    return _unit(
+        call_id,
+        argument=json.dumps({"content": marker * 4_000 + f"-arg-tail-{call_id}"}),
+        result=marker * 4_000 + f"-result-tail-{call_id}",
+    )
 
 
-def test_old_assistant_tool_payloads_are_compacted():
-    """Fallback compaction should compact oversized old assistant tool-call payloads."""
-    msgs = _make_large_arg_messages("write_file", num_rounds=10)
-    compacted = compact_tool_history(msgs, keep_recent=3)
-
-    compacted_assistants = [
-        m for m in compacted
-        if m.get("role") == "assistant"
-        and m.get("tool_calls")
-        and "<<CONTENT_OMITTED len=" in m["tool_calls"][0]["function"]["arguments"]
-    ]
-    assert len(compacted_assistants) >= 4, "Old oversized assistant tool-call payloads should be compacted"
+def _stamp_trace(messages, ref):
+    from ouroboros.tool_result_record import TOOL_RESULT_RECORD_KEY, make_tool_result_record
+    row = messages[-1]
+    row[TOOL_RESULT_RECORD_KEY] = make_tool_result_record(
+        {"tool_call_id": row["tool_call_id"], "invocation_id": "fixture-invocation", "trace_ref": ref}, row["content"])
 
 
-# ── Protected-content detection ──────────────────────────────────────────────
-#
-# v4.34.0: the structured-reflection checkpoint ceremony was retired, so
-# assistant messages with `CHECKPOINT_REFLECTION` / `CHECKPOINT_ANOMALY`
-# text no longer need compaction protection — they no longer exist. The
-# remaining protected-content rule covers tool-result messages for
-# critical tools and explicit error markers (`⚠️`-prefixed tool output).
+def _request(messages: list[dict], *, goal: int = 1_000_000) -> ContextReclaimRequest:
+    return ContextReclaimRequest(
+        route_fp="main-route",
+        round_id="round-7",
+        transcript_sha256=cc.context_reclaim_transcript_sha256(messages),
+        measurement_basis="fresh_route_usage",
+        measurement_density=1.0,
+        reclaim_goal_tokens=goal,
+        allow_partial_shrink=True,
+    )
 
 
-def test_round_has_protected_content_ignores_normal_assistant_text():
-    """Normal assistant messages (no tool role, no error marker) must not be protected.
+def _authored(messages: list[dict], *, note: str = "I read the evidence; the conclusion holds.", keep=()) -> ContextReclaimRequest:
+    """The mind's own fold of the observed view: a note, the units it keeps raw."""
+    return replace(_request(messages), working_note=note,
+                   expected_view_revision=cc.context_reclaim_transcript_sha256(messages), keep_unit_ids=keep)
 
-    Previously the function also protected `CHECKPOINT_REFLECTION` /
-    `CHECKPOINT_ANOMALY` markers; that branch was removed in v4.34.0 along
-    with the audit-only checkpoint ceremony. This test guards against a
-    regression that would re-introduce any checkpoint-text protection.
-    """
-    from ouroboros.context_compaction import _round_has_protected_content
 
+def _fold(messages: list[dict], request: ContextReclaimRequest, tmp_path):
+    return cc.compact_tool_history_llm(
+        messages, request=request, observed_messages=messages, tool_schemas=[],
+        fit_candidate=lambda *_: {"accepted": True}, drive_root=tmp_path, task_id="compaction")
+
+
+def test_atomic_units_require_all_and_only_contiguous_matching_results():
+    complete = _unit("ok", argument="{}", result="done")
+    missing = _unit("missing", argument="{}", result="never")[:1]
+    delayed = _unit("late", argument="{}", result="late-result")
+    duplicate = [{
+        "role": "assistant",
+        "tool_calls": [
+            {"id": "dup", "function": {"name": "x", "arguments": "{}"}},
+            {"id": "dup", "function": {"name": "y", "arguments": "{}"}},
+        ],
+    }, {"role": "tool", "tool_call_id": "dup", "content": "one"}]
     messages = [
-        {
-            "role": "assistant",
-            "content": "Normal reasoning without any reflection marker",
-            "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}],
-        },
-        {
-            "role": "tool",
-            "tool_call_id": "c1",
-            "content": "file content",
-        },
+        *complete,
+        {"role": "user", "content": "hard boundary"},
+        *missing,
+        {"role": "user", "content": "interrupt"},
+        delayed[1],
+        *duplicate,
+        *_unit("final", argument="{}", result="done"),
     ]
-    assert _round_has_protected_content(messages, 0, 1) is False
+
+    units = cc._atomic_units(messages)
+
+    assert [(unit.start, unit.end) for unit in units] == [(0, 1), (8, 9)]
+    assert all(messages[unit.start]["role"] == "assistant" for unit in units)
+    assert messages[2] == {"role": "user", "content": "hard boundary"}
 
 
-def test_round_has_protected_content_does_not_protect_checkpoint_text():
-    """v4.34.0 regression guard: legacy CHECKPOINT_REFLECTION text is no longer
-    protected. A future edit that accidentally re-adds the assistant-content
-    detection would silently bloat transcripts with stale audit artifacts.
-    """
-    from ouroboros.context_compaction import _round_has_protected_content
-
+@pytest.mark.parametrize(
+    "malformed_call",
+    ["not-a-tool-call", {"id": "bad", "function": "not-a-function"}],
+)
+def test_malformed_tool_call_set_stays_raw_without_crashing(malformed_call):
     messages = [
-        {
-            "role": "assistant",
-            "content": "CHECKPOINT_REFLECTION:\n- Known: x\n- Blocker: none",
-            "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}],
-        },
-        {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        {"role": "assistant", "tool_calls": [malformed_call]},
+        {"role": "tool", "tool_call_id": "bad", "content": "result"},
     ]
-    assert _round_has_protected_content(messages, 0, 1) is False
+
+    assert cc._atomic_units(messages) == ()
 
 
-def test_round_has_protected_content_protects_error_tool_results():
-    """Tool-result messages prefixed with ⚠️ remain protected from compaction —
-    this was the other half of the pre-v4.34.0 rule and is unaffected by the
-    checkpoint refactor.
-    """
-    from ouroboros.context_compaction import _round_has_protected_content
+def test_atomic_source_keeps_complete_arguments_results_and_trace_ref():
+    messages = _large_unit("call-complete", "z")
+    trace_ref = {"path": "calls/tool.json", "sha256": "d" * 64}
+    _stamp_trace(messages, trace_ref)
 
-    messages = [
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}],
-        },
-        {
-            "role": "tool",
-            "tool_call_id": "c1",
-            "content": "⚠️ failed to read path: permission denied",
-        },
-    ]
-    assert _round_has_protected_content(messages, 0, 1) is True
+    unit = cc._atomic_units(
+        messages,
+        trace_refs_by_tool_call_id={"call-complete": trace_ref},
+    )[0]
+
+    assert "-arg-tail-call-complete" in unit.source_text
+    assert "-result-tail-call-complete" in unit.source_text
+    assert "CONTENT_OMITTED" not in unit.source_text
+    assert "LONG_STRING" not in unit.source_text
+    assert unit.source_refs == (trace_ref,)
+
+
+def test_a_request_without_a_note_is_refused_before_any_checkpoint(monkeypatch, tmp_path):
+    """Both directions: no helper writes the note, so a note-less request changes nothing and
+    writes no checkpoint; the same selection with the mind's note is materialized."""
+    messages = _large_unit("note-less")
+    before = copy.deepcopy(messages)
+    monkeypatch.setattr(cc, "_persist_reclaim_checkpoint",
+                        lambda *_a, **_k: pytest.fail("a refused request must not checkpoint"))
+
+    rebuilt, receipt = _fold(messages, _request(messages), tmp_path)
+
+    assert rebuilt is messages and messages == before
+    assert receipt.status == "authored_note_required"
+    assert receipt.before_transcript_sha256 == receipt.after_transcript_sha256
+    monkeypatch.setattr(cc, "_persist_reclaim_checkpoint",
+                        lambda *_a, **_k: {"path": "calls/checkpoint.json", "sha256": "c" * 64})
+    folded, applied = _fold(messages, _authored(messages), tmp_path)
+    assert applied.status == "applied" and len(folded) == 1 and messages == before
+
+
+def test_an_authored_fold_checkpoints_the_exact_source_before_its_capsule(monkeypatch, tmp_path):
+    events: list[str] = []
+    messages = _large_unit("ordered")
+    _stamp_trace(messages, {"path": "calls/ordered.json", "sha256": "d" * 64})
+
+    def checkpoint(*_args, **_kwargs):
+        events.append("checkpoint")
+        return {"path": "calls/checkpoint.json", "sha256": "c" * 64}
+
+    monkeypatch.setattr(cc, "_persist_reclaim_checkpoint", checkpoint)
+    rebuilt, receipt = _fold(messages, _authored(messages), tmp_path)
+
+    assert events == ["checkpoint"]
+    assert receipt.status == "applied"
+    assert len(rebuilt) == 1 and rebuilt[0]["role"] == "assistant"
+    capsule = rebuilt[0]["content"][0]["_context_capsule"]
+    assert rebuilt[0]["content"][0]["text"].startswith("[Actor-authored working view; exact source retained by checkpoint]\n")
+    assert capsule["authorship"] == "actor" and capsule["generation"] == 1
+    assert capsule["retention"] == "summarized"
+    assert capsule["checkpoint_ref"]["sha256"] == "c" * 64
+    assert {"path": "calls/ordered.json", "sha256": "d" * 64} in capsule["source_refs"]
+    assert capsule["parts"][0]["start_char"] == 0
+    assert capsule["parts"][-1]["end_char"] == capsule["source_length_chars"]
+    assert receipt.capsule_refs[0]["generation"] == 1
+
+
+def test_checkpoint_failure_keeps_the_source_raw(monkeypatch, tmp_path):
+    messages = _large_unit("checkpoint-fail")
+    monkeypatch.setattr(cc, "_persist_reclaim_checkpoint", lambda *_a, **_k: None)
+
+    rebuilt, receipt = _fold(messages, _authored(messages), tmp_path)
+
+    assert rebuilt is messages
+    assert receipt.status == "checkpoint_failed"
+
+
+def test_a_second_fold_over_an_actor_note_keeps_its_lineage_and_a_corrupt_capsule_stays_raw(tmp_path):
+    messages = _large_unit("generation", "g")
+    first, first_receipt = _fold(messages, _authored(messages, note="First account. " * 200), tmp_path)
+    second, second_receipt = _fold(first, _authored(first, note="Merged account."), tmp_path)
+
+    first_meta = first[0]["content"][0]["_context_capsule"]
+    second_meta = second[0]["content"][0]["_context_capsule"]
+    assert first_receipt.status == second_receipt.status == "applied"
+    assert second_meta["generation"] == 2
+    assert set(first_meta["source_hashes"]) < set(second_meta["source_hashes"])
+    assert all(ref in second_meta["source_refs"] for ref in first_meta["source_refs"])
+
+    corrupt = copy.deepcopy(second)
+    corrupt[0]["content"][0]["_context_capsule"]["source_length_chars"] += 1
+    assert cc._atomic_units(corrupt) == ()
+
+    corrupt_hash = copy.deepcopy(second)
+    corrupt_hash[0]["content"][0]["_context_capsule"]["source_hashes"][0] = "broken"
+    assert cc._atomic_units(corrupt_hash) == ()
+
+
+def test_count_only_compact_context_answers_authored_note_required_and_advertises_no_helper():
+    """Both directions: a count without a note queues nothing and names what is missing; the
+    same count beside the mind's note queues the authored view."""
+    from ouroboros.tools.compact_context import _compact_context, get_tools, record_context_view
+
+    ctx = SimpleNamespace(active_context_mode="max", _active_builtin_tool_result=None)
+    record_context_view(ctx, _unit("seen"), [])
+    result = _compact_context(ctx, keep_last_n=4)
+    description = get_tools()[0].schema["description"]
+
+    assert getattr(ctx, "_pending_compaction", None) is None
+    assert "authored_note_required" in result and "working_note" in result
+    assert ctx._active_builtin_tool_result.status == "error"
+    assert ctx._active_builtin_tool_result.code == "TOOL_ARG_ERROR"
+    assert "no helper summarizes for you" in description.lower()
+    assert "summaries without a note" not in description.lower()
+    assert "raw evidence remains retrievable" in description.lower()
+    assert "no information is lost" not in description.lower()
+    assert "requested" in _compact_context(ctx, keep_last_n=4, working_note="Four units stay raw.")
+    assert isinstance(ctx._pending_compaction, dict) and ctx._pending_compaction["working_note"] == "Four units stay raw."

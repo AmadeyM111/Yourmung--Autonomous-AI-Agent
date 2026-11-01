@@ -1,0 +1,1465 @@
+"""Streaming, resumable local audio transcription pipeline.
+
+The module deliberately keeps transcript text out of return values and logs.
+Callers receive only metadata and artifact paths; segment text lives in the
+checkpoint and generated task artifacts.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import math
+import os
+import pathlib
+import re
+import tempfile
+import threading
+import wave
+from dataclasses import dataclass
+from difflib import SequenceMatcher
+from typing import Any, Callable, Iterable, Iterator, Sequence
+
+log = logging.getLogger(__name__)
+
+SUPPORTED_EXTENSIONS = frozenset({".m4a", ".mp4", ".mp3", ".wav", ".flac", ".ogg", ".opus"})
+SUPPORTED_MIME_TYPES = frozenset({
+    "audio/mp4", "audio/x-m4a", "application/mp4", "audio/mpeg", "audio/wav",
+    "audio/x-wav", "audio/flac", "audio/x-flac", "audio/ogg", "audio/opus",
+})
+SUPPORTED_MODELS = frozenset({"large-v3", "turbo", "medium", "small"})
+SUPPORTED_PROVIDERS = frozenset({"local", "gemini", "deepgram", "whisperx"})
+SUPPORTED_DIARIZATION = frozenset({"off", "pyannote", "provider"})
+DEFAULT_GPU_ROUTES = "1800:large-v3,*:turbo"
+DEFAULT_CPU_ROUTES = "900:medium,*:small"
+ROUTING_VERSION = 1
+SAMPLE_RATE = 16_000
+_MODEL_FALLBACKS: dict[str, tuple[str, ...]] = {
+    "large-v3": ("turbo", "small"),
+    "turbo": ("small",),
+    "medium": ("small",),
+    "small": (),
+}
+
+
+def transcription_setting(name: str, default: Any = None) -> Any:
+    """Read an operator setting with environment taking precedence."""
+    if name in os.environ:
+        return os.environ[name]
+    try:
+        from ouroboros.config import load_settings
+
+        value = load_settings().get(name)
+        if value is not None and str(value).strip() != "":
+            return value
+    except Exception:
+        pass
+    return default
+
+
+def resolve_transcription_provider(requested: str = "auto") -> str:
+    """Resolve an STT provider without ever silently opting into cloud upload."""
+    clean = str(requested or "auto").strip().lower()
+    if clean == "google":
+        clean = "gemini"
+    if clean == "auto":
+        clean = str(transcription_setting("TRANSCRIPTION_PROVIDER", "local") or "local").strip().lower()
+        if clean == "google":
+            clean = "gemini"
+    if clean not in SUPPORTED_PROVIDERS:
+        raise TranscriptionError(f"Unsupported transcription provider: {clean}")
+    return clean
+
+
+def resolve_diarization(requested: str = "auto") -> str:
+    clean = str(requested or "auto").strip().lower()
+    if clean in {"none", "false", "disabled"}:
+        clean = "off"
+    if clean == "auto":
+        clean = str(transcription_setting("TRANSCRIPTION_DIARIZATION", "off") or "off").strip().lower()
+    if clean not in SUPPORTED_DIARIZATION:
+        raise TranscriptionError(f"Unsupported diarization mode: {clean}")
+    return clean
+
+
+class TranscriptionError(RuntimeError):
+    """User-facing transcription failure."""
+
+
+class InvalidAudioError(TranscriptionError):
+    """The uploaded object is not a supported, decodable audio file."""
+
+
+@dataclass(frozen=True)
+class AudioMetadata:
+    path: pathlib.Path
+    size: int
+    duration_sec: float
+    codec: str
+    sample_rate: int
+    channels: int
+
+
+@dataclass(frozen=True)
+class ModelRoute:
+    max_duration_sec: float | None
+    model: str
+
+    @property
+    def rule(self) -> str:
+        maximum = "*" if self.max_duration_sec is None else str(int(self.max_duration_sec))
+        return f"{maximum}:{self.model}"
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    try:
+        value = int(str(transcription_setting(name, default)).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value >= minimum else default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = str(transcription_setting(name, "true" if default else "false")).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def parse_model_routes(value: str, *, default: str) -> tuple[ModelRoute, ...]:
+    """Parse ``seconds:model,*:model`` or safely fall back to built-ins."""
+
+    def parse(raw: str) -> tuple[ModelRoute, ...]:
+        routes: list[ModelRoute] = []
+        last_max = -1.0
+        for index, item in enumerate(str(raw or "").split(",")):
+            pair = item.strip().split(":", 1)
+            if len(pair) != 2 or pair[1].strip() not in SUPPORTED_MODELS:
+                raise ValueError("invalid model route")
+            limit_text, model = pair[0].strip(), pair[1].strip()
+            if limit_text == "*":
+                if index != len(str(raw).split(",")) - 1:
+                    raise ValueError("wildcard route must be last")
+                routes.append(ModelRoute(None, model))
+                continue
+            limit = float(limit_text)
+            if not math.isfinite(limit) or limit <= last_max or limit <= 0:
+                raise ValueError("route limits must be positive and increasing")
+            last_max = limit
+            routes.append(ModelRoute(limit, model))
+        if not routes or routes[-1].max_duration_sec is not None:
+            raise ValueError("model routes require a terminal wildcard")
+        return tuple(routes)
+
+    try:
+        return parse(value)
+    except (TypeError, ValueError):
+        if str(value or "").strip() and str(value or "").strip() != default:
+            log.warning("Invalid transcription model routing configuration; using built-in routes")
+        return parse(default)
+
+
+def configured_model_routes(*, cpu: bool) -> tuple[ModelRoute, ...]:
+    env_name = "TRANSCRIPTION_CPU_MODEL_ROUTES" if cpu else "TRANSCRIPTION_MODEL_ROUTES"
+    default = DEFAULT_CPU_ROUTES if cpu else DEFAULT_GPU_ROUTES
+    return parse_model_routes(str(transcription_setting(env_name, default)), default=default)
+
+
+def route_model(duration_sec: float, *, device: str, model: str = "auto") -> tuple[str, str]:
+    requested = str(model or "auto").strip().lower()
+    if requested != "auto":
+        if requested not in SUPPORTED_MODELS:
+            raise TranscriptionError(f"Unsupported transcription model: {requested}")
+        return requested, "manual"
+    strategy = str(transcription_setting("TRANSCRIPTION_MODEL_ROUTING", "duration") or "duration").strip().lower()
+    if strategy != "duration":
+        log.warning("Unsupported transcription routing strategy %r; using duration", strategy)
+    routes = configured_model_routes(cpu=str(device or "unknown").lower() == "cpu")
+    for route in routes:
+        if route.max_duration_sec is None or duration_sec <= route.max_duration_sec:
+            return route.model, route.rule
+    raise AssertionError("terminal wildcard route missing")
+
+
+def detect_device(requested: str = "auto") -> str:
+    clean = str(requested or "auto").strip().lower()
+    if clean in {"cpu", "cuda"}:
+        return clean
+    try:
+        import ctranslate2
+
+        return "cuda" if int(ctranslate2.get_cuda_device_count()) > 0 else "cpu"
+    except Exception:
+        # The specification assigns unknown hardware to the GPU/general policy.
+        return "unknown"
+
+
+def calculate_chunk_windows(duration_sec: float, chunk_duration_sec: int = 900, overlap_sec: int = 2) -> list[tuple[float, float]]:
+    validate_chunk_parameters(chunk_duration_sec, overlap_sec)
+    duration = max(0.0, float(duration_sec))
+    if duration == 0:
+        return []
+    step = chunk_duration_sec - overlap_sec
+    windows: list[tuple[float, float]] = []
+    start = 0.0
+    while start < duration:
+        windows.append((start, min(duration, start + chunk_duration_sec)))
+        if start + chunk_duration_sec >= duration:
+            break
+        start += step
+    return windows
+
+
+def validate_chunk_parameters(chunk_duration_sec: int, overlap_sec: int) -> None:
+    if not 60 <= int(chunk_duration_sec) <= 3600:
+        raise TranscriptionError("Chunk duration must be between 60 and 3600 seconds")
+    if not 0 <= int(overlap_sec) <= 10:
+        raise TranscriptionError("Chunk overlap must be between 0 and 10 seconds")
+    if int(overlap_sec) >= int(chunk_duration_sec):
+        raise TranscriptionError("Chunk overlap must be shorter than the chunk")
+
+
+def validate_audio_file(
+    path: pathlib.Path | str,
+    *,
+    max_bytes: int | None = None,
+    max_duration_sec: int | None = None,
+) -> AudioMetadata:
+    """Open a container with PyAV and return trusted audio stream metadata."""
+    source = pathlib.Path(path).expanduser().resolve(strict=False)
+    if not source.is_file():
+        raise FileNotFoundError(f"Audio file not found: {source.name}")
+    if source.suffix.lower() not in SUPPORTED_EXTENSIONS:
+        raise InvalidAudioError(f"Unsupported audio format: {source.suffix or 'unknown'}")
+    size = int(source.stat().st_size)
+    size_limit = max_bytes if max_bytes is not None else _env_int(
+        "OUROBOROS_AUDIO_UPLOAD_MAX_BYTES", 1024 * 1024 * 1024, minimum=1,
+    )
+    if size > size_limit:
+        raise InvalidAudioError(f"Audio file exceeds the {size_limit}-byte limit")
+    try:
+        import av
+    except Exception as exc:  # pragma: no cover - dependency/build failure
+        raise TranscriptionError("PyAV is not installed") from exc
+    try:
+        with av.open(str(source), mode="r") as container:
+            stream = next((item for item in container.streams if item.type == "audio"), None)
+            if stream is None:
+                raise InvalidAudioError("Container has no audio stream")
+            codec = str(getattr(getattr(stream, "codec_context", None), "name", "") or "unknown")
+            duration = 0.0
+            if getattr(stream, "duration", None) is not None and getattr(stream, "time_base", None) is not None:
+                duration = float(stream.duration * stream.time_base)
+            elif getattr(container, "duration", None) is not None:
+                duration = float(container.duration) / float(getattr(av, "time_base", 1_000_000))
+            if not math.isfinite(duration) or duration <= 0:
+                # Scan timestamps/samples without retaining PCM when a streaming
+                # container omits duration from its header.
+                decoded_any = False
+                decoded_samples = 0
+                timestamp_end = 0.0
+                for frame in container.decode(stream):
+                    decoded_any = True
+                    frame_time = float(getattr(frame, "time", 0.0) or 0.0)
+                    frame_samples = int(getattr(frame, "samples", 0) or 0)
+                    frame_rate = int(getattr(frame, "sample_rate", 0) or 0)
+                    decoded_samples += frame_samples
+                    timestamp_end = max(timestamp_end, frame_time + (frame_samples / frame_rate if frame_rate else 0.0))
+                if not decoded_any:
+                    raise InvalidAudioError("Audio stream contains no decodable frames")
+                duration = timestamp_end or (decoded_samples / int(getattr(stream, "sample_rate", 0) or 1))
+            codec_context = getattr(stream, "codec_context", None)
+            sample_rate = int(getattr(stream, "sample_rate", 0) or getattr(codec_context, "sample_rate", 0) or 0)
+            channels = int(getattr(stream, "channels", 0) or getattr(codec_context, "channels", 0) or 0)
+    except InvalidAudioError:
+        raise
+    except Exception as exc:
+        raise InvalidAudioError(f"Damaged or unsupported audio container: {type(exc).__name__}") from exc
+    duration_limit = max_duration_sec if max_duration_sec is not None else _env_int(
+        "TRANSCRIPTION_MAX_DURATION_SEC", 12 * 60 * 60, minimum=1,
+    )
+    if duration > duration_limit:
+        raise InvalidAudioError(f"Audio duration exceeds the {duration_limit}-second limit")
+    return AudioMetadata(source, size, duration, codec, sample_rate, channels)
+
+
+def sha256_file(path: pathlib.Path, block_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with pathlib.Path(path).open("rb") as handle:
+        while True:
+            block = handle.read(block_size)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def build_job_id(
+    *,
+    source_sha256: str,
+    source_size: int,
+    requested_model: str,
+    selected_model: str,
+    language: str,
+    chunk_duration_sec: int,
+    overlap_sec: int,
+    provider: str = "local",
+    provider_model: str = "",
+    diarization: str = "off",
+    diarization_model: str = "",
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
+    custom_vocabulary: Sequence[str] = (),
+) -> str:
+    identity = {
+        "schema_version": 1,
+        "source_sha256": source_sha256,
+        "source_size": int(source_size),
+        "requested_model": requested_model,
+        "selected_model": selected_model,
+        "routing_version": ROUTING_VERSION,
+        "language": language,
+        "chunk_duration_sec": int(chunk_duration_sec),
+        "overlap_sec": int(overlap_sec),
+        "whisper": {
+            "vad_filter": True,
+            "word_timestamps": True,
+            "condition_on_previous_text": False,
+            "beam_size": 5,
+        },
+    }
+    # Preserve identifiers of existing local/off jobs while separating every
+    # cloud/provider-specific configuration from them.
+    if provider != "local" or diarization != "off" or provider_model or custom_vocabulary:
+        identity["provider"] = {
+            "name": provider,
+            "model": provider_model,
+            "diarization": diarization,
+            "diarization_model": diarization_model,
+            "min_speakers": min_speakers,
+            "max_speakers": max_speakers,
+            "custom_vocabulary_sha256": hashlib.sha256(
+                json.dumps(list(custom_vocabulary), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+        }
+    raw = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def atomic_write_json(path: pathlib.Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+
+
+def load_checkpoint(path: pathlib.Path, *, job_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    if not path.exists():
+        return None, None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1 or payload.get("job_id") != job_id:
+            raise ValueError("checkpoint schema or job id mismatch")
+        if not isinstance(payload.get("segments", []), list):
+            raise ValueError("checkpoint segments are invalid")
+        return payload, None
+    except Exception:
+        backup = path.with_name(f"checkpoint.corrupt.{os.getpid()}.json")
+        try:
+            os.replace(path, backup)
+        except OSError:
+            backup = path
+        warning = f"Damaged checkpoint moved to {backup.name}; transcription restarted"
+        log.warning("Damaged transcription checkpoint for job %s was backed up", job_id)
+        return None, warning
+
+
+def _normalized_text(text: str) -> str:
+    return re.sub(r"[^\w]+", " ", str(text or "").casefold(), flags=re.UNICODE).strip()
+
+
+def merge_segments(existing: Sequence[dict[str, Any]], incoming: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge chunk output with overlap de-duplication and monotonic timestamps."""
+    combined = [dict(item) for item in existing if str(item.get("text") or "").strip()]
+    candidates = sorted(
+        (dict(item) for item in incoming if str(item.get("text") or "").strip()),
+        key=lambda item: (float(item.get("start", 0.0)), float(item.get("end", 0.0))),
+    )
+    for candidate in candidates:
+        start = max(0.0, float(candidate.get("start", 0.0)))
+        end = max(start, float(candidate.get("end", start)))
+        text = str(candidate.get("text") or "").strip()
+        duplicate = False
+        norm = _normalized_text(text)
+        for previous in reversed(combined[-4:]):
+            p_start = float(previous.get("start", 0.0))
+            p_end = float(previous.get("end", p_start))
+            temporal_overlap = min(end, p_end) - max(start, p_start)
+            near = abs(start - p_start) <= 3.0 and abs(end - p_end) <= 3.0
+            p_norm = _normalized_text(str(previous.get("text") or ""))
+            similar = bool(norm and p_norm) and (norm == p_norm or SequenceMatcher(None, norm, p_norm).ratio() >= 0.88)
+            if similar and (temporal_overlap >= 0 or near):
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        if combined:
+            previous_end = float(combined[-1].get("end", 0.0))
+            start = max(start, previous_end)
+            end = max(start, end)
+        candidate.update({"start": round(start, 3), "end": round(end, 3), "text": text})
+        combined.append(candidate)
+    return combined
+
+
+def _iter_pcm_chunks(path: pathlib.Path, chunk_duration_sec: int, overlap_sec: int) -> Iterator[Any]:
+    """Yield float32 mono 16 kHz numpy arrays while retaining only one chunk."""
+    try:
+        import av
+        import numpy as np
+    except Exception as exc:  # pragma: no cover - dependency/build failure
+        raise TranscriptionError("PyAV and NumPy are required for transcription") from exc
+    chunk_samples = int(chunk_duration_sec * SAMPLE_RATE)
+    overlap_samples = int(overlap_sec * SAMPLE_RATE)
+    resampler = av.audio.resampler.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
+    buffers: list[Any] = []
+    buffered = 0
+    yielded = False
+    fresh_after_yield = 0
+
+    def append_frame(frame: Any) -> None:
+        nonlocal buffered, fresh_after_yield
+        array = frame.to_ndarray().reshape(-1).astype(np.float32) / 32768.0
+        if array.size:
+            buffers.append(array)
+            buffered += int(array.size)
+            if yielded:
+                fresh_after_yield += int(array.size)
+
+    with av.open(str(path), mode="r") as container:
+        stream = next((item for item in container.streams if item.type == "audio"), None)
+        if stream is None:
+            raise InvalidAudioError("Container has no audio stream")
+        for decoded in container.decode(stream):
+            converted = resampler.resample(decoded)
+            for frame in converted if isinstance(converted, list) else [converted]:
+                if frame is not None:
+                    append_frame(frame)
+            while buffered >= chunk_samples:
+                joined = np.concatenate(buffers) if len(buffers) > 1 else buffers[0]
+                current = joined[:chunk_samples]
+                remainder = joined[chunk_samples:]
+                yield current
+                yielded = True
+                prefix = current[-overlap_samples:].copy() if overlap_samples else np.empty(0, dtype=np.float32)
+                buffers = [part for part in (prefix, remainder) if part.size]
+                buffered = int(prefix.size + remainder.size)
+                fresh_after_yield = int(remainder.size)
+        flushed = resampler.resample(None)
+        for frame in flushed if isinstance(flushed, list) else [flushed]:
+            if frame is not None:
+                append_frame(frame)
+        if buffered and (not yielded or fresh_after_yield > 0):
+            yield np.concatenate(buffers) if len(buffers) > 1 else buffers[0]
+
+
+def _model_compute_type(device: str, requested: str) -> str:
+    clean = str(requested or "auto").strip()
+    if clean and clean != "auto":
+        return clean
+    return "float16" if device == "cuda" else "int8"
+
+
+def load_whisper_model(
+    selected_model: str,
+    *,
+    device: str,
+    compute_type: str = "auto",
+    model_dir: pathlib.Path | None = None,
+    allow_fallback: bool | None = None,
+    model_factory: Callable[..., Any] | None = None,
+) -> tuple[Any, str, str | None, str]:
+    """Load one model, falling back only while model initialization fails."""
+    if model_factory is None:
+        try:
+            from faster_whisper import WhisperModel
+        except Exception as exc:  # pragma: no cover - dependency/build failure
+            raise TranscriptionError("faster-whisper is not installed") from exc
+        model_factory = WhisperModel
+    allow = _env_bool("TRANSCRIPTION_ALLOW_MODEL_FALLBACK", True) if allow_fallback is None else allow_fallback
+    candidates = (selected_model,) + (_MODEL_FALLBACKS.get(selected_model, ()) if allow else ())
+    first_error: Exception | None = None
+    clean_device = "auto" if device == "unknown" else device
+    clean_compute = _model_compute_type(device, compute_type)
+    for candidate in candidates:
+        kwargs: dict[str, Any] = {"device": clean_device, "compute_type": clean_compute}
+        if model_dir is not None:
+            model_dir.mkdir(parents=True, exist_ok=True)
+            kwargs["download_root"] = str(model_dir)
+        try:
+            return model_factory(candidate, **kwargs), candidate, (selected_model if candidate != selected_model else None), clean_compute
+        except ValueError as exc:
+            if clean_compute == "float16" and "float16" in str(exc).lower():
+                clean_compute = "int8"
+                kwargs["compute_type"] = clean_compute
+                try:
+                    return model_factory(candidate, **kwargs), candidate, (selected_model if candidate != selected_model else None), clean_compute
+                except Exception as retry_exc:
+                    exc = retry_exc
+            if first_error is None:
+                first_error = exc
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+        if candidate != candidates[-1]:
+            log.warning("Transcription model %s failed to load; attempting configured fallback", candidate)
+    detail = type(first_error).__name__ if first_error is not None else "unknown error"
+    raise TranscriptionError(f"Could not load transcription model ({detail})") from first_error
+
+
+def transcribe_short_audio(
+    path: pathlib.Path | str,
+    *,
+    model: str = "small",
+    language: str = "ru",
+    device: str = "auto",
+    compute_type: str = "auto",
+    model_dir: pathlib.Path | None = None,
+    provider: str = "local",
+    deepgram_client: Any | None = None,
+) -> dict[str, Any]:
+    """Compatibility path for short Telegram voice messages."""
+    source = pathlib.Path(path)
+    if not source.is_file():
+        raise FileNotFoundError(str(source))
+    if str(provider or "local").strip().lower() == "deepgram":
+        return _transcribe_short_audio_deepgram(source, language=language, client=deepgram_client)
+    whisper, actual_model, _fallback_from, used_compute = load_whisper_model(
+        str(model or "small"), device=device, compute_type=compute_type,
+        model_dir=model_dir, allow_fallback=False,
+    )
+    segments, info = whisper.transcribe(
+        str(source),
+        language=str(language or "ru").strip() or None,
+        vad_filter=True,
+        beam_size=5,
+    )
+    text = " ".join(str(segment.text or "").strip() for segment in segments).strip()
+    return {
+        "ok": True,
+        "text": text,
+        "language": getattr(info, "language", "") or language,
+        "duration": float(getattr(info, "duration", 0.0) or 0.0),
+        "model": actual_model,
+        "device": device,
+        "compute_type": used_compute,
+    }
+
+
+def _transcribe_short_audio_deepgram(
+    source: pathlib.Path,
+    *,
+    language: str,
+    client: Any | None = None,
+) -> dict[str, Any]:
+    from ouroboros.transcription_deepgram import DEFAULT_MODEL, DeepgramTranscriptionClient
+
+    if client is None:
+        api_key = str(transcription_setting("DEEPGRAM_API_KEY", "") or "").strip()
+        if not api_key:
+            raise TranscriptionError("DEEPGRAM_API_KEY is required for the Deepgram STT backend")
+        model = str(transcription_setting("TRANSCRIPTION_DEEPGRAM_MODEL", DEFAULT_MODEL) or DEFAULT_MODEL).strip()
+        client = DeepgramTranscriptionClient(api_key=api_key, model=model)
+    payload = client.transcribe_file(source, language=str(language or "auto").strip() or "auto")
+    segments = payload.get("segments", [])
+    text = " ".join(str(item.get("text") or "").strip() for item in segments).strip()
+    duration = max((float(item.get("end") or 0.0) for item in segments), default=0.0)
+    return {
+        "ok": True,
+        "text": text,
+        "language": payload.get("language") or language,
+        "duration": duration,
+        "model": payload.get("model") or client.model,
+        "provider": "deepgram",
+    }
+
+
+def _segment_dict(segment: Any, chunk_start: float) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "start": chunk_start + float(getattr(segment, "start", 0.0) or 0.0),
+        "end": chunk_start + float(getattr(segment, "end", 0.0) or 0.0),
+        "text": str(getattr(segment, "text", "") or "").strip(),
+    }
+    words = []
+    for word in getattr(segment, "words", None) or []:
+        words.append({
+            "start": chunk_start + float(getattr(word, "start", 0.0) or 0.0),
+            "end": chunk_start + float(getattr(word, "end", 0.0) or 0.0),
+            "word": str(getattr(word, "word", "") or ""),
+        })
+    if words:
+        result["words"] = words
+    return result
+
+
+def _is_memory_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return isinstance(exc, MemoryError) or any(token in text for token in (
+        "out of memory", "cuda_error_out_of_memory", "failed to allocate", "cublas_status_alloc_failed",
+    ))
+
+
+def _transcribe_chunk_with_heartbeat(
+    whisper: Any,
+    waveform: Any,
+    *,
+    transcribe_kwargs: dict[str, Any],
+    heartbeat: Callable[[], None],
+    heartbeat_sec: float = 60.0,
+) -> tuple[list[Any], Any]:
+    stop = threading.Event()
+
+    def run_heartbeat() -> None:
+        while not stop.wait(heartbeat_sec):
+            heartbeat()
+
+    thread = threading.Thread(target=run_heartbeat, name="transcription-progress", daemon=True)
+    thread.start()
+    try:
+        segments, info = whisper.transcribe(waveform, **transcribe_kwargs)
+        return list(segments), info
+    finally:
+        stop.set()
+        thread.join(timeout=1.0)
+
+
+def _call_with_heartbeat(
+    callback: Callable[[], Any],
+    *,
+    heartbeat: Callable[[], None],
+    heartbeat_sec: float = 60.0,
+) -> Any:
+    stop = threading.Event()
+
+    def run_heartbeat() -> None:
+        while not stop.wait(heartbeat_sec):
+            heartbeat()
+
+    thread = threading.Thread(target=run_heartbeat, name="transcription-provider-progress", daemon=True)
+    thread.start()
+    try:
+        return callback()
+    finally:
+        stop.set()
+        thread.join(timeout=1.0)
+
+
+def _write_waveform_wav(path: pathlib.Path, waveform: Any) -> None:
+    """Write one normalized float32 chunk as mono 16 kHz PCM without ffmpeg."""
+    try:
+        import numpy as np
+    except Exception as exc:  # pragma: no cover - dependency/build failure
+        raise TranscriptionError("NumPy is required for cloud transcription") from exc
+    pcm = (np.clip(waveform, -1.0, 1.0) * 32767.0).astype(np.int16)
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(SAMPLE_RATE)
+        handle.writeframes(pcm.tobytes())
+
+
+def _offset_provider_segments(segments: Sequence[dict[str, Any]], offset: float) -> list[dict[str, Any]]:
+    shifted: list[dict[str, Any]] = []
+    for raw in segments:
+        item = dict(raw)
+        raw_start = float(item.get("start", 0.0) or 0.0)
+        raw_end_value = item.get("end")
+        raw_end = float(raw_end_value) if raw_end_value is not None else raw_start
+        item["start"] = raw_start + offset
+        item["end"] = raw_end + offset
+        if isinstance(item.get("words"), list):
+            shifted_words = []
+            for raw_word in item["words"]:
+                word = dict(raw_word)
+                word_start = float(word.get("start", 0.0) or 0.0)
+                word_end_value = word.get("end")
+                word_end = float(word_end_value) if word_end_value is not None else word_start
+                word["start"] = word_start + offset
+                word["end"] = word_end + offset
+                shifted_words.append(word)
+            item["words"] = shifted_words
+        shifted.append(item)
+    return shifted
+
+
+def _prefix_chunk_speakers(segments: Sequence[dict[str, Any]], index: int) -> list[dict[str, Any]]:
+    prefix = f"CHUNK_{index + 1:03d}_"
+    output: list[dict[str, Any]] = []
+    for raw in segments:
+        item = dict(raw)
+        if item.get("speaker"):
+            item["speaker"] = prefix + str(item["speaker"])
+        if isinstance(item.get("words"), list):
+            words = []
+            for raw_word in item["words"]:
+                word = dict(raw_word)
+                if word.get("speaker"):
+                    word["speaker"] = prefix + str(word["speaker"])
+                words.append(word)
+            item["words"] = words
+        output.append(item)
+    return output
+
+
+def _accept_for_chunk(segment: dict[str, Any], *, index: int, total: int, start: float, chunk_sec: int, overlap_sec: int) -> bool:
+    midpoint = (float(segment["start"]) + float(segment["end"])) / 2.0
+    left = start + (overlap_sec / 2.0 if index > 0 else 0.0)
+    right = start + chunk_sec - overlap_sec / 2.0 if index < total - 1 else math.inf
+    return left <= midpoint < right
+
+
+def _format_timestamp(seconds: float) -> str:
+    total = max(0, int(float(seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _display_filename(path: pathlib.Path) -> str:
+    return re.sub(r"^[0-9a-f]{32}_", "", path.name, flags=re.IGNORECASE) or path.name
+
+
+def write_transcript_artifacts(
+    output_dir: pathlib.Path,
+    *,
+    source: AudioMetadata,
+    source_sha256: str,
+    language: str,
+    requested_model: str,
+    selected_model: str,
+    routing_rule: str,
+    segments: Sequence[dict[str, Any]],
+    output_formats: Sequence[str],
+    provider: str = "local",
+    diarization: str = "off",
+    diarization_status: str = "off",
+    speaker_scope: str = "none",
+) -> list[pathlib.Path]:
+    formats = tuple(dict.fromkeys(str(item).strip().lower() for item in output_formats))
+    if not formats or any(item not in {"md", "txt", "json"} for item in formats):
+        raise TranscriptionError("Output formats must contain md, txt, and/or json")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    display_name = _display_filename(source.path)
+    stem = pathlib.Path(display_name).stem or "recording"
+    base = output_dir / f"{stem}.transcript"
+    lines = []
+    for item in segments:
+        speaker = f"{item['speaker']}: " if item.get("speaker") else ""
+        lines.append(
+            f"[{_format_timestamp(float(item.get('start', 0.0)))} — "
+            f"{_format_timestamp(float(item.get('end', 0.0)))}] {speaker}{str(item.get('text') or '').strip()}"
+        )
+    written: list[pathlib.Path] = []
+    for fmt in formats:
+        target = base.with_suffix(f".transcript.{fmt}") if base.suffix != ".transcript" else pathlib.Path(f"{base}.{fmt}")
+        if fmt == "md":
+            body = (
+                f"# Стенограмма: {display_name}\n\n"
+                f"- Продолжительность: {_format_timestamp(source.duration_sec)}\n"
+                f"- Язык: {language}\n"
+                f"- Модель: {selected_model}\n\n"
+                + "\n\n".join(lines)
+                + "\n"
+            )
+            target.write_text(body, encoding="utf-8")
+        elif fmt == "txt":
+            target.write_text("\n\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        else:
+            atomic_write_json(target, {
+                "schema_version": 1,
+                "source": {
+                    "filename": display_name,
+                    "duration_sec": source.duration_sec,
+                    "sha256": source_sha256,
+                },
+                "transcription": {
+                    "language": language,
+                    "requested_model": requested_model,
+                    "selected_model": selected_model,
+                    "routing_rule": routing_rule,
+                    "provider": provider,
+                    "diarization": diarization,
+                    "diarization_status": diarization_status,
+                    "speaker_scope": speaker_scope,
+                },
+                "segments": list(segments),
+            })
+        written.append(target)
+    return written
+
+
+def _validated_extended_options(
+    *,
+    provider: str,
+    diarization: str,
+    min_speakers: int | None,
+    max_speakers: int | None,
+    custom_vocabulary: Sequence[str],
+) -> tuple[str, str, tuple[str, ...]]:
+    resolved_provider = resolve_transcription_provider(provider)
+    resolved_diarization = resolve_diarization(diarization)
+    if resolved_diarization == "provider" and resolved_provider not in {"gemini", "deepgram"}:
+        raise TranscriptionError("Provider diarization is available only with provider=gemini or provider=deepgram")
+    if resolved_provider == "whisperx" and resolved_diarization == "provider":
+        raise TranscriptionError("WhisperX uses diarization=pyannote, not provider")
+    if min_speakers is not None and int(min_speakers) < 1:
+        raise TranscriptionError("min_speakers must be at least 1")
+    if max_speakers is not None and int(max_speakers) < 1:
+        raise TranscriptionError("max_speakers must be at least 1")
+    if min_speakers is not None and max_speakers is not None and int(min_speakers) > int(max_speakers):
+        raise TranscriptionError("min_speakers cannot exceed max_speakers")
+    vocabulary = tuple(dict.fromkeys(str(item).strip() for item in custom_vocabulary if str(item).strip()))
+    if len(vocabulary) > 1000:
+        raise TranscriptionError("custom_vocabulary cannot contain more than 1000 terms")
+    phrase_limit = _env_int("TRANSCRIPTION_GEMINI_VOCAB_PHRASE_MAX_CHARS", 200, minimum=1)
+    if any(len(item) > phrase_limit for item in vocabulary):
+        raise TranscriptionError(f"custom_vocabulary phrases cannot exceed {phrase_limit} characters")
+    byte_limit = _env_int("TRANSCRIPTION_GEMINI_VOCAB_MAX_BYTES", 32 * 1024, minimum=1)
+    if sum(len(item.encode("utf-8")) for item in vocabulary) > byte_limit:
+        raise TranscriptionError(f"custom_vocabulary cannot exceed {byte_limit} UTF-8 bytes")
+    return resolved_provider, resolved_diarization, vocabulary
+
+
+def _run_whisperx_profile(
+    *,
+    source: AudioMetadata,
+    source_hash: str,
+    state_dir: pathlib.Path,
+    output_dir: pathlib.Path,
+    checkpoint_path: pathlib.Path,
+    job_id: str,
+    requested_model: str,
+    selected_model: str,
+    requested_language: str,
+    device: str,
+    compute_type: str,
+    model_dir: pathlib.Path | None,
+    output_formats: Sequence[str],
+    diarization: str,
+    diarization_model: str,
+    min_speakers: int | None,
+    max_speakers: int | None,
+    diarization_factory: Callable[..., Any] | None,
+    whisperx_client: Callable[..., dict[str, Any]] | None,
+    emit: Callable[[str], None],
+) -> dict[str, Any]:
+    """Run whole-file WhisperX, then reconcile it with Community-1 turns."""
+    checkpoint, checkpoint_warning = load_checkpoint(checkpoint_path, job_id=job_id)
+    warnings: list[str] = [checkpoint_warning] if checkpoint_warning else []
+    resumed = bool(checkpoint and checkpoint.get("status") == "completed")
+    if resumed:
+        collected = list(checkpoint.get("segments", []))
+        final_language = str(checkpoint.get("language") or "unknown")
+    else:
+        emit("Запускаю WhisperX large-v3 с принудительным выравниванием слов…")
+        if whisperx_client is None:
+            from ouroboros.transcription_whisperx import transcribe_with_whisperx
+
+            whisperx_client = transcribe_with_whisperx
+        payload = whisperx_client(
+            source.path,
+            model=selected_model,
+            language=requested_language,
+            device=str(transcription_setting("TRANSCRIPTION_WHISPERX_DEVICE", device) or device),
+            compute_type=str(transcription_setting("TRANSCRIPTION_WHISPERX_COMPUTE_TYPE", compute_type) or compute_type),
+            batch_size=int(transcription_setting("TRANSCRIPTION_WHISPERX_BATCH_SIZE", 8) or 8),
+            model_dir=model_dir,
+            progress=emit,
+        )
+        collected = list(payload.get("segments", []))
+        final_language = str(payload.get("language") or requested_language or "unknown")
+        warnings.extend(str(item) for item in payload.get("warnings", []) or [])
+        atomic_write_json(checkpoint_path, {
+            "schema_version": 1,
+            "job_id": job_id,
+            "status": "completed",
+            "source": {"path": str(source.path), "sha256": source_hash, "size": source.size, "duration_sec": source.duration_sec},
+            "requested_model": requested_model,
+            "selected_model": selected_model,
+            "provider": "whisperx",
+            "diarization": diarization,
+            "language": final_language,
+            "completed_chunks": 1,
+            "total_chunks": 1,
+            "segments": collected,
+        })
+    artifact_segments = collected
+    diarization_status = "off"
+    speaker_scope = "none"
+    if diarization == "pyannote":
+        try:
+            artifact_segments = _apply_pyannote_postprocessing(
+                source=source, source_hash=source_hash, checkpoint_path=checkpoint_path,
+                segments=collected, model=diarization_model, min_speakers=min_speakers,
+                max_speakers=max_speakers, pipeline_factory=diarization_factory, emit=emit,
+            )
+            diarization_status, speaker_scope = "completed", "recording"
+        except Exception as exc:
+            diarization_status = "failed"
+            warnings.append(f"Diarization failed; transcript was preserved ({type(exc).__name__})")
+            emit(warnings[-1])
+    artifacts = write_transcript_artifacts(
+        pathlib.Path(output_dir), source=source, source_sha256=source_hash,
+        language=final_language, requested_model=requested_model, selected_model=selected_model,
+        routing_rule="provider:whisperx", segments=artifact_segments, output_formats=output_formats,
+        provider="whisperx", diarization=diarization, diarization_status=diarization_status,
+        speaker_scope=speaker_scope,
+    )
+    return {
+        "ok": True, "job_id": job_id, "duration_sec": source.duration_sec,
+        "language": final_language, "requested_model": requested_model,
+        "selected_model": selected_model, "provider": "whisperx",
+        "diarization": {"mode": diarization, "status": diarization_status, "speaker_scope": speaker_scope,
+                         "speakers_count": len({item.get("speaker") for item in artifact_segments if item.get("speaker")})},
+        "fallback_from": None, "routing": {"strategy": "manual", "matched_rule": "provider:whisperx"},
+        "resumed": resumed, "segments_count": len(artifact_segments), "artifacts": artifacts,
+        "warnings": warnings,
+    }
+
+
+def _apply_pyannote_postprocessing(
+    *,
+    source: AudioMetadata,
+    source_hash: str,
+    checkpoint_path: pathlib.Path,
+    segments: Sequence[dict[str, Any]],
+    model: str,
+    min_speakers: int | None,
+    max_speakers: int | None,
+    pipeline_factory: Callable[..., Any] | None,
+    emit: Callable[[str], None],
+) -> list[dict[str, Any]]:
+    emit("Определяю спикеров с pyannote…")
+    identity = {
+        "source_sha256": source_hash,
+        "model": model,
+        "min_speakers": min_speakers,
+        "max_speakers": max_speakers,
+    }
+    diarization_id = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    diarization_path = checkpoint_path.parent / "diarization" / f"{diarization_id}.json"
+    if diarization_path.is_file():
+        turns = json.loads(diarization_path.read_text(encoding="utf-8"))["turns"]
+    else:
+        from ouroboros.diarization import run_pyannote_diarization
+
+        turns = run_pyannote_diarization(
+            source.path,
+            model=model,
+            token=str(transcription_setting("HF_TOKEN", "") or "").strip(),
+            device=str(transcription_setting("TRANSCRIPTION_PYANNOTE_DEVICE", "auto") or "auto"),
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            pipeline_factory=pipeline_factory,
+        )
+        atomic_write_json(diarization_path, {"schema_version": 1, "turns": turns})
+    from ouroboros.diarization import align_speakers
+
+    return align_speakers(segments, turns)
+
+
+def _recognize_local_chunk(
+    *,
+    whisper: Any,
+    waveform: Any,
+    chunk_start: float,
+    chunk_number: int,
+    total_chunks: int,
+    requested_language: str,
+    fixed_language: str,
+    actual_model: str,
+    fallback_from: str | None,
+    effective_device: str,
+    compute_type: str,
+    model_dir: pathlib.Path | None,
+    model_factory: Callable[..., Any] | None,
+    emit: Callable[[str], None],
+    warnings: list[str],
+) -> tuple[list[dict[str, Any]], str, float, Any, str, str | None]:
+    transcribe_kwargs = {
+        "language": (requested_language if requested_language != "auto" else (fixed_language or None)),
+        "vad_filter": True,
+        "word_timestamps": True,
+        "condition_on_previous_text": False,
+        "beam_size": 5,
+    }
+    try:
+        transcribed, info = _transcribe_chunk_with_heartbeat(
+            whisper,
+            waveform,
+            transcribe_kwargs=transcribe_kwargs,
+            heartbeat=lambda: emit(f"Обрабатываю чанк {chunk_number} из {total_chunks}…"),
+        )
+    except Exception as exc:
+        fallback_candidates = (
+            _MODEL_FALLBACKS.get(actual_model, ())
+            if _env_bool("TRANSCRIPTION_ALLOW_MODEL_FALLBACK", True)
+            else ()
+        )
+        if chunk_number != 1 or not fallback_candidates or not _is_memory_error(exc):
+            raise TranscriptionError(f"Audio recognition failed ({type(exc).__name__})") from exc
+        previous_model = actual_model
+        whisper, actual_model, _load_from, _used_compute = load_whisper_model(
+            fallback_candidates[0],
+            device=effective_device,
+            compute_type=compute_type,
+            model_dir=model_dir,
+            model_factory=model_factory,
+        )
+        fallback_from = fallback_from or previous_model
+        warning = f"Недостаточно RAM/VRAM для {previous_model}; используется {actual_model}."
+        warnings.append(warning)
+        emit(warning)
+        transcribed, info = _transcribe_chunk_with_heartbeat(
+            whisper,
+            waveform,
+            transcribe_kwargs=transcribe_kwargs,
+            heartbeat=lambda: emit(f"Обрабатываю чанк {chunk_number} из {total_chunks}…"),
+        )
+    segments = [_segment_dict(segment, chunk_start) for segment in transcribed]
+    detected = str(getattr(info, "language", "") or "").strip()
+    confidence = float(getattr(info, "language_probability", 1.0) or 0.0)
+    return segments, detected, confidence, whisper, actual_model, fallback_from
+
+
+def _load_local_job_model(
+    *,
+    actual_model: str,
+    effective_device: str,
+    requested_model: str,
+    requested_device: str,
+    duration_sec: float,
+    compute_type: str,
+    model_dir: pathlib.Path | None,
+    model_factory: Callable[..., Any] | None,
+    matched_rule: str,
+    fallback_from: str | None,
+    warnings: list[str],
+    emit: Callable[[str], None],
+) -> tuple[Any, str, str, str, str | None]:
+    emit("Загружаю модель…")
+    try:
+        whisper, loaded_model, load_fallback_from, _used_compute = load_whisper_model(
+            actual_model,
+            device=effective_device,
+            compute_type=compute_type,
+            model_dir=model_dir,
+            model_factory=model_factory,
+        )
+    except TranscriptionError:
+        if requested_model != "auto" or str(requested_device or "auto").lower() != "auto" or effective_device == "cpu":
+            raise
+        cpu_model, matched_rule = route_model(duration_sec, device="cpu", model="auto")
+        whisper, loaded_model, load_fallback_from, _used_compute = load_whisper_model(
+            cpu_model,
+            device="cpu",
+            compute_type=compute_type,
+            model_dir=model_dir,
+            model_factory=model_factory,
+        )
+        effective_device = "cpu"
+        warning = f"CUDA недоступна; применён CPU routing и выбрана модель {loaded_model}."
+        warnings.append(warning)
+        emit(warning)
+    actual_model = loaded_model
+    if load_fallback_from:
+        fallback_from = load_fallback_from
+        warning = f"Модель {load_fallback_from} недоступна; используется {loaded_model}."
+        warnings.append(warning)
+        emit(warning)
+    return whisper, actual_model, effective_device, matched_rule, fallback_from
+
+
+def transcribe_audio(
+    path: pathlib.Path | str,
+    *,
+    state_dir: pathlib.Path,
+    output_dir: pathlib.Path,
+    model: str = "auto",
+    language: str = "auto",
+    chunk_duration_sec: int = 900,
+    overlap_sec: int = 2,
+    output_formats: Sequence[str] = ("md", "txt", "json"),
+    device: str = "auto",
+    compute_type: str = "auto",
+    model_dir: pathlib.Path | None = None,
+    progress: Callable[[str], None] | None = None,
+    model_factory: Callable[..., Any] | None = None,
+    provider: str = "auto",
+    diarization: str = "auto",
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
+    custom_vocabulary: Sequence[str] = (),
+    gemini_client: Any | None = None,
+    deepgram_client: Any | None = None,
+    whisperx_client: Callable[..., dict[str, Any]] | None = None,
+    diarization_factory: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Run the full pipeline and return metadata without transcript text."""
+    emit = progress or (lambda _message: None)
+    validate_chunk_parameters(chunk_duration_sec, overlap_sec)
+    resolved_provider, resolved_diarization, vocabulary = _validated_extended_options(
+        provider=provider,
+        diarization=diarization,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+        custom_vocabulary=custom_vocabulary,
+    )
+    requested_model = str(model or "auto").strip().lower()
+    requested_language = str(language or "auto").strip().lower()
+    if requested_language in {"", "auto"}:
+        requested_language = "auto"
+    emit("Проверяю аудиофайл…")
+    source = validate_audio_file(path)
+    source_stat = source.path.stat()
+    effective_chunk_sec = int(chunk_duration_sec)
+    if resolved_provider == "gemini":
+        if requested_model not in {"auto", "gemini-3.5-transcribe"}:
+            raise TranscriptionError("Local Whisper models cannot be selected with provider=gemini")
+        selected_model = str(
+            transcription_setting("TRANSCRIPTION_GEMINI_MODEL", "gemini-3.5-transcribe")
+            or "gemini-3.5-transcribe"
+        ).strip()
+        matched_rule = "provider:gemini"
+        device_class = "cloud"
+        effective_chunk_sec = min(effective_chunk_sec, 1800)
+        if effective_chunk_sec != chunk_duration_sec:
+            emit("Gemini word timestamps are limited to 30-minute requests; using 1800-second chunks.")
+    elif resolved_provider == "deepgram":
+        from ouroboros.transcription_deepgram import DEFAULT_MODEL as deepgram_default
+
+        selected_model = str(
+            transcription_setting("TRANSCRIPTION_DEEPGRAM_MODEL", deepgram_default) or deepgram_default
+        ).strip()
+        if requested_model not in {"auto", selected_model}:
+            raise TranscriptionError("Local Whisper models cannot be selected with provider=deepgram")
+        matched_rule = "provider:deepgram"
+        device_class = "cloud"
+    elif resolved_provider == "whisperx":
+        if requested_model not in {"auto", "large-v3"}:
+            raise TranscriptionError("WhisperX profile requires model=large-v3 or auto")
+        selected_model = str(
+            transcription_setting("TRANSCRIPTION_WHISPERX_MODEL", "large-v3") or "large-v3"
+        ).strip()
+        matched_rule = "provider:whisperx"
+        device_class = detect_device(device)
+        effective_chunk_sec = int(source.duration_sec) or 1
+        if resolved_diarization == "off":
+            resolved_diarization = "pyannote"
+            emit("Профиль WhisperX включает diarization Community-1.")
+    else:
+        device_class = detect_device(device)
+        selected_model, matched_rule = route_model(source.duration_sec, device=device_class, model=requested_model)
+    if resolved_provider in {"gemini", "deepgram"}:
+        env_prefix = f"TRANSCRIPTION_{resolved_provider.upper()}"
+        provider_label = resolved_provider.capitalize()
+        cloud_size_limit = _env_int(f"{env_prefix}_MAX_BYTES", 256 * 1024 * 1024, minimum=1)
+        cloud_duration_limit = _env_int(f"{env_prefix}_MAX_DURATION_SEC", 2 * 60 * 60, minimum=1)
+        if source.size > cloud_size_limit:
+            raise TranscriptionError(f"{provider_label} audio exceeds the {cloud_size_limit}-byte cloud limit")
+        if source.duration_sec > cloud_duration_limit:
+            raise TranscriptionError(f"{provider_label} audio exceeds the {cloud_duration_limit}-second cloud limit")
+        cloud_chunk_limit = _env_int(f"{env_prefix}_MAX_CHUNKS", 8, minimum=1)
+        if len(calculate_chunk_windows(source.duration_sec, effective_chunk_sec, overlap_sec)) > cloud_chunk_limit:
+            raise TranscriptionError(f"{provider_label} audio exceeds the {cloud_chunk_limit}-chunk cloud limit")
+    if resolved_diarization == "pyannote":
+        diarization_duration_limit = _env_int(
+            "TRANSCRIPTION_PYANNOTE_MAX_DURATION_SEC", 4 * 60 * 60, minimum=1,
+        )
+        if source.duration_sec > diarization_duration_limit:
+            raise TranscriptionError(
+                f"pyannote audio exceeds the {diarization_duration_limit}-second diarization limit"
+            )
+    emit(
+        f"Продолжительность: {_format_timestamp(source.duration_sec)}. "
+        f"Провайдер: {resolved_provider}; модель: {selected_model}."
+    )
+    source_hash = sha256_file(source.path)
+    diarization_model = (
+        str(transcription_setting("TRANSCRIPTION_PYANNOTE_MODEL", "pyannote/speaker-diarization-community-1") or "").strip()
+        if resolved_diarization == "pyannote"
+        else ""
+    )
+    # pyannote is a post-processing pass and must not invalidate completed STT.
+    # Native provider diarization changes the provider request and therefore is
+    # part of the STT checkpoint identity.
+    stt_diarization = "provider" if resolved_diarization == "provider" else "off"
+    job_id = build_job_id(
+        source_sha256=source_hash,
+        source_size=source.size,
+        requested_model=requested_model,
+        selected_model=selected_model,
+        language=requested_language,
+        chunk_duration_sec=effective_chunk_sec,
+        overlap_sec=overlap_sec,
+        provider=resolved_provider,
+        provider_model=selected_model if resolved_provider != "local" else "",
+        diarization=stt_diarization,
+        diarization_model="",
+        min_speakers=None,
+        max_speakers=None,
+        custom_vocabulary=vocabulary,
+    )
+    checkpoint_path = pathlib.Path(state_dir).joinpath(job_id, "checkpoint.json")
+    if resolved_provider == "whisperx":
+        return _run_whisperx_profile(
+            source=source, source_hash=source_hash, state_dir=pathlib.Path(state_dir),
+            output_dir=pathlib.Path(output_dir), checkpoint_path=checkpoint_path, job_id=job_id,
+            requested_model=requested_model, selected_model=selected_model,
+            requested_language=requested_language, device=device_class, compute_type=compute_type,
+            model_dir=model_dir, output_formats=output_formats, diarization=resolved_diarization,
+            diarization_model=diarization_model, min_speakers=min_speakers, max_speakers=max_speakers,
+            diarization_factory=diarization_factory, whisperx_client=whisperx_client, emit=emit,
+        )
+    checkpoint, checkpoint_warning = load_checkpoint(checkpoint_path, job_id=job_id)
+    resumed = bool(checkpoint and int(checkpoint.get("completed_chunks", 0)) > 0)
+    windows = calculate_chunk_windows(source.duration_sec, effective_chunk_sec, overlap_sec)
+    total_chunks = len(windows)
+    completed_chunks = min(int((checkpoint or {}).get("completed_chunks", 0) or 0), total_chunks)
+    collected: list[dict[str, Any]] = list((checkpoint or {}).get("segments", []))
+    fixed_language = str((checkpoint or {}).get("language") or "")
+    if fixed_language == "auto":
+        fixed_language = ""
+    actual_model = str((checkpoint or {}).get("selected_model") or selected_model)
+    effective_device = str((checkpoint or {}).get("device") or device_class)
+    fallback_from = (checkpoint or {}).get("fallback_from")
+    warnings: list[str] = [checkpoint_warning] if checkpoint_warning else []
+
+    whisper: Any | None = None
+    provider_client = deepgram_client if resolved_provider == "deepgram" else gemini_client
+    if completed_chunks < total_chunks and resolved_provider == "local":
+        whisper, actual_model, effective_device, matched_rule, fallback_from = _load_local_job_model(
+            actual_model=actual_model,
+            effective_device=effective_device,
+            requested_model=requested_model,
+            requested_device=device,
+            duration_sec=source.duration_sec,
+            compute_type=compute_type,
+            model_dir=model_dir,
+            model_factory=model_factory,
+            matched_rule=matched_rule,
+            fallback_from=fallback_from,
+            warnings=warnings,
+            emit=emit,
+        )
+    elif completed_chunks < total_chunks:
+        provider_label = resolved_provider.capitalize()
+        key_name = f"{resolved_provider.upper()}_API_KEY"
+        api_key = str(transcription_setting(key_name, "") or "").strip()
+        if provider_client is None:
+            if not api_key:
+                raise TranscriptionError(f"{key_name} is required for provider={resolved_provider}")
+            if resolved_provider == "deepgram":
+                from ouroboros.transcription_deepgram import DeepgramTranscriptionClient
+
+                provider_client = DeepgramTranscriptionClient(api_key=api_key, model=selected_model)
+            else:
+                from ouroboros.transcription_gemini import GeminiTranscriptionClient
+
+                provider_client = GeminiTranscriptionClient(api_key=api_key, model=selected_model)
+        emit(f"Подготавливаю защищённую отправку аудиочанков в {provider_label}…")
+
+    if completed_chunks < total_chunks:
+        for index, waveform in enumerate(_iter_pcm_chunks(source.path, effective_chunk_sec, overlap_sec)):
+            if index >= total_chunks:
+                break
+            if index < completed_chunks:
+                continue
+            chunk_start = windows[index][0]
+            chunk_segments: list[dict[str, Any]] = []
+            if resolved_provider == "local":
+                provider_segments, detected, confidence, whisper, actual_model, fallback_from = _recognize_local_chunk(
+                    whisper=whisper,
+                    waveform=waveform,
+                    chunk_start=chunk_start,
+                    chunk_number=index + 1,
+                    total_chunks=total_chunks,
+                    requested_language=requested_language,
+                    fixed_language=fixed_language,
+                    actual_model=actual_model,
+                    fallback_from=fallback_from,
+                    effective_device=effective_device,
+                    compute_type=compute_type,
+                    model_dir=model_dir,
+                    model_factory=model_factory,
+                    emit=emit,
+                    warnings=warnings,
+                )
+            else:
+                with tempfile.TemporaryDirectory(prefix=f"ouroboros-{resolved_provider}-stt-") as tmp_dir:
+                    chunk_path = pathlib.Path(tmp_dir) / f"chunk-{index + 1:04d}.wav"
+                    _write_waveform_wav(chunk_path, waveform)
+                    payload = _call_with_heartbeat(
+                        lambda: provider_client.transcribe_file(
+                            chunk_path,
+                            language=(requested_language if requested_language != "auto" else (fixed_language or "auto")),
+                            diarization=resolved_diarization == "provider",
+                            custom_vocabulary=vocabulary,
+                        ),
+                        heartbeat=lambda: emit(f"Обрабатываю чанк {index + 1} из {total_chunks} в {provider_label}…"),
+                    )
+                provider_segments = _offset_provider_segments(payload.get("segments", []), chunk_start)
+                for item in provider_segments:
+                    if float(item.get("end", 0.0) or 0.0) <= float(item.get("start", 0.0) or 0.0):
+                        try:
+                            item["end"] = chunk_start + (len(waveform) / SAMPLE_RATE)
+                        except TypeError:
+                            item["end"] = windows[index][1]
+                if resolved_diarization == "provider" and total_chunks > 1:
+                    provider_segments = _prefix_chunk_speakers(provider_segments, index)
+                detected = str(payload.get("language") or "").strip()
+                confidence = 1.0 if detected else 0.0
+                for warning in payload.get("warnings", []) or []:
+                    clean_warning = str(warning)
+                    warnings.append(clean_warning)
+                    emit(clean_warning)
+            for item in provider_segments:
+                if item["text"] and _accept_for_chunk(
+                    item, index=index, total=total_chunks, start=chunk_start,
+                    chunk_sec=effective_chunk_sec, overlap_sec=overlap_sec,
+                ):
+                    chunk_segments.append(item)
+            if requested_language != "auto":
+                fixed_language = requested_language
+            elif not fixed_language:
+                if detected and confidence >= 0.5 and chunk_segments:
+                    fixed_language = detected
+            collected = merge_segments(collected, chunk_segments)
+            completed_chunks = index + 1
+            checkpoint = {
+                "schema_version": 1,
+                "job_id": job_id,
+                "status": "running",
+                "source": {
+                    "path": str(source.path), "sha256": source_hash, "size": source.size,
+                    "duration_sec": source.duration_sec,
+                },
+                "requested_model": requested_model,
+                "selected_model": actual_model,
+                "fallback_from": fallback_from,
+                "device": effective_device,
+                "provider": resolved_provider,
+                "diarization": resolved_diarization,
+                "language": fixed_language or "auto",
+                "completed_chunks": completed_chunks,
+                "total_chunks": total_chunks,
+                "segments": collected,
+            }
+            atomic_write_json(checkpoint_path, checkpoint)
+            pct = int(round((completed_chunks / max(total_chunks, 1)) * 100))
+            emit(f"Обрабатываю чанк {completed_chunks} из {total_chunks} — {pct}%.")
+        if whisper is not None:
+            del whisper
+    if completed_chunks < total_chunks:
+        raise TranscriptionError("Audio ended before all expected chunks were decoded")
+    final_stat = source.path.stat()
+    if final_stat.st_size != source_stat.st_size or final_stat.st_mtime_ns != source_stat.st_mtime_ns:
+        raise TranscriptionError("Source audio file changed during transcription")
+    final_language = fixed_language or (requested_language if requested_language != "auto" else "unknown")
+    artifact_segments = collected
+    diarization_status = "off"
+    speaker_scope = "none"
+    if resolved_diarization == "provider":
+        diarization_status = "completed"
+        speaker_scope = "recording" if total_chunks <= 1 else "chunk"
+    elif resolved_diarization == "pyannote":
+        try:
+            artifact_segments = _apply_pyannote_postprocessing(
+                source=source,
+                source_hash=source_hash,
+                checkpoint_path=checkpoint_path,
+                segments=collected,
+                model=diarization_model,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+                pipeline_factory=diarization_factory,
+                emit=emit,
+            )
+            diarization_status = "completed"
+            speaker_scope = "recording"
+        except Exception as exc:
+            diarization_status = "failed"
+            warning = f"Diarization failed; transcript was preserved ({type(exc).__name__}: {exc})"
+            warnings.append(warning)
+            emit(warning)
+    emit("Формирую стенограмму…")
+    artifacts = write_transcript_artifacts(
+        pathlib.Path(output_dir), source=source, source_sha256=source_hash,
+        language=final_language, requested_model=requested_model, selected_model=actual_model,
+        routing_rule=matched_rule, segments=artifact_segments, output_formats=output_formats,
+        provider=resolved_provider, diarization=resolved_diarization,
+        diarization_status=diarization_status, speaker_scope=speaker_scope,
+    )
+    final_checkpoint = dict(checkpoint or {})
+    final_checkpoint.update({
+        "schema_version": 1, "job_id": job_id, "status": "completed",
+        "requested_model": requested_model, "selected_model": actual_model,
+        "fallback_from": fallback_from, "language": final_language,
+        "device": effective_device,
+        "provider": resolved_provider, "diarization": resolved_diarization,
+        "completed_chunks": total_chunks, "total_chunks": total_chunks,
+        "segments": collected,
+    })
+    final_checkpoint.setdefault("source", {
+        "path": str(source.path), "sha256": source_hash, "size": source.size,
+        "duration_sec": source.duration_sec,
+    })
+    atomic_write_json(checkpoint_path, final_checkpoint)
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "duration_sec": source.duration_sec,
+        "language": final_language,
+        "requested_model": requested_model,
+        "selected_model": actual_model,
+        "provider": resolved_provider,
+        "diarization": {
+            "mode": resolved_diarization,
+            "status": diarization_status,
+            "speaker_scope": speaker_scope,
+            "speakers_count": len({item.get("speaker") for item in artifact_segments if item.get("speaker")}),
+        },
+        "fallback_from": fallback_from,
+        "routing": {"strategy": "duration" if requested_model == "auto" else "manual", "matched_rule": matched_rule},
+        "resumed": resumed,
+        "segments_count": len(artifact_segments),
+        "artifacts": artifacts,
+        "warnings": warnings,
+    }
+
+
+__all__ = [
+    "AudioMetadata", "InvalidAudioError", "ModelRoute", "SUPPORTED_EXTENSIONS",
+    "SUPPORTED_DIARIZATION", "SUPPORTED_MIME_TYPES", "SUPPORTED_MODELS", "SUPPORTED_PROVIDERS",
+    "TranscriptionError", "atomic_write_json",
+    "build_job_id", "calculate_chunk_windows", "configured_model_routes", "detect_device",
+    "load_checkpoint", "load_whisper_model", "merge_segments", "parse_model_routes", "route_model",
+    "resolve_diarization", "resolve_transcription_provider", "sha256_file", "transcribe_audio",
+    "transcribe_short_audio", "validate_audio_file", "validate_chunk_parameters",
+    "transcription_setting", "write_transcript_artifacts",
+]

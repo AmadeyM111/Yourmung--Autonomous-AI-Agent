@@ -10,12 +10,16 @@ import subprocess
 from typing import List, Optional
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.tools.commit_gate import _invalidate_advisory
 from ouroboros.tools.git import _acquire_git_lock, _release_git_lock, _sanitize_git_error
 
 log = logging.getLogger(__name__)
 
 _PR_BRANCH_PREFIX = "integrate/pr-"
+# The verbs that check out, commit or stage in the body's own worktree: an ordinary
+# author runs them in its body candidate (``body_candidate.authoring_seam``).
+BODY_WORKTREE_TOOLS = frozenset({
+    "create_integration_branch", "cherry_pick_pr_commits", "stage_adaptations", "stage_pr_merge",
+})
 
 
 def _g(args: List[str], cwd: pathlib.Path,
@@ -145,10 +149,12 @@ def _fetch_pr_ref(ctx: ToolContext, pr_number: int, remote: str = "origin") -> s
 def _create_integration_branch(
     ctx: ToolContext,
     pr_number: int,
-    base_branch: str = "ouroboros",
+    base_branch: str = "",
 ) -> str:
     if pr_number <= 0:
         return "⚠️ PR_BRANCH_ERROR: pr_number must be a positive integer."
+    # The body's working branch: ouroboros, or the bound candidate's branch.
+    base_branch = str(base_branch or getattr(ctx, "branch_dev", "") or "ouroboros").strip()
     err = _validate_git_ref_arg(base_branch, "base_branch")
     if err:
         return f"⚠️ PR_BRANCH_ERROR: {err}"
@@ -201,7 +207,7 @@ def _create_integration_branch(
         f"                                              original author attribution\n"
         f"  2. stage_adaptations()                   ← optional: stage Ouroboros\n"
         f"                                              adaptation changes (no commit)\n"
-        f"  3. stage_pr_merge(branch='{branch_name}') → advisory_review → commit_reviewed\n"
+        f"  3. stage_pr_merge(branch='{branch_name}') → commit_reviewed\n"
         f"     (staged adaptations from step 2 land in the final merge commit)"
     )
 
@@ -216,11 +222,6 @@ def _rollback_failed_amend(
     amend_err = (amend_r.stderr or amend_r.stdout or "").strip()
     _g(["reset", "--hard", "HEAD~1"], repo_dir)
     applied.pop()
-    if applied:
-        _invalidate_advisory(
-            ctx, changed_paths=[], mutation_root=repo_dir,
-            source_tool="cherry_pick_pr_commits",
-        )
     return (
         f"⚠️ CHERRY_PICK_ERROR: author amend failed on {sha[:12]} "
         f"(rolled back to pre-commit state):\n{amend_err[:500]}\n\n"
@@ -327,11 +328,6 @@ def _cherry_pick_pr_commits(
             if override_author is not None:
                 date_r = _g(["log", "-1", "--format=%aI", sha], repo_dir)
                 if date_r.returncode != 0 or not date_r.stdout.strip():
-                    if applied:
-                        _invalidate_advisory(
-                            ctx, changed_paths=[], mutation_root=repo_dir,
-                            source_tool="cherry_pick_pr_commits",
-                        )
                     return (
                         f"⚠️ CHERRY_PICK_ERROR: Cannot read author date for {sha[:12]} "
                         f"(git log returned {date_r.returncode}). Aborting before "
@@ -346,11 +342,6 @@ def _cherry_pick_pr_commits(
                 err = (result.stderr or result.stdout or "").strip()
                 _g(["cherry-pick", "--abort"], repo_dir)
                 if stop_on_conflict:
-                    if applied:
-                        _invalidate_advisory(
-                            ctx, changed_paths=[], mutation_root=repo_dir,
-                            source_tool="cherry_pick_pr_commits",
-                        )
                     return (
                         f"⚠️ CHERRY_PICK_CONFLICT on {sha[:12]}:\n{err[:500]}\n\n"
                         f"Applied before conflict: {[s[:12] for s in applied] or 'none'}\n"
@@ -383,9 +374,6 @@ def _cherry_pick_pr_commits(
             f"⚠️ CHERRY_PICK_ERROR: No commits were successfully applied.\n"
             f"Skipped (conflict): {skipped}"
         )
-
-    _invalidate_advisory(ctx, changed_paths=[], mutation_root=repo_dir,
-                         source_tool="cherry_pick_pr_commits")
 
     override_note = ""
     if override_author is not None:
@@ -432,7 +420,7 @@ def _cherry_pick_pr_commits(
         + f"\n\nNext:\n"
           f"  stage_adaptations()                      ← optional: stage Ouroboros\n"
           f"                                              adaptation changes (no commit)\n"
-          f"  stage_pr_merge(branch='{current_branch}') → advisory_review → commit_reviewed\n"
+          f"  stage_pr_merge(branch='{current_branch}') → commit_reviewed\n"
           f"  (staged adaptations land in the merge commit — no intermediate commit needed)"
         + override_note
         + author_hint
@@ -460,16 +448,13 @@ def _stage_adaptations(ctx: ToolContext) -> str:
     finally:
         _release_git_lock(lock)
 
-    _invalidate_advisory(ctx, changed_paths=[], mutation_root=repo_dir,
-                         source_tool="stage_adaptations")
-
     files = staged.splitlines()
     return (
         f"✅ Staged {len(files)} file(s) on '{current_branch}' (NOT committed):\n"
         + "\n".join(f"  {f}" for f in files[:20])
         + (f"\n  ... and {len(files)-20} more" if len(files) > 20 else "")
         + f"\n\nNext: stage_pr_merge(branch='{current_branch}') — do NOT commit here;\n"
-          f"  adaptation changes land in the merge commit on ouroboros."
+          f"  adaptation changes land in the merge commit on {ctx.branch_dev}."
     )
 
 
@@ -519,7 +504,6 @@ def _stage_pr_merge(
             )
 
         adaptation_patch: bytes = b""
-        adapt_paths: list = []
         staged_before = _g(["diff", "--cached", "--name-only"], repo_dir).stdout.strip()
         if staged_before:
             diff_r = subprocess.run(
@@ -533,7 +517,7 @@ def _stage_pr_merge(
                     f"Staged changes are preserved. Fix the repo state and retry."
                 )
             adaptation_patch = diff_r.stdout
-            adapt_paths = staged_before.splitlines()
+            staged_before.splitlines()
             _g(["reset", "--hard", "HEAD"], repo_dir)
 
         def _restore_on_error() -> None:
@@ -609,9 +593,6 @@ def _stage_pr_merge(
         if log_r.returncode == 0:
             authors = sorted(set(log_r.stdout.strip().splitlines()))
 
-    _invalidate_advisory(ctx, changed_paths=[], mutation_root=repo_dir,
-                         source_tool="stage_pr_merge")
-
     co_authored = "\n".join(f"Co-authored-by: {a}" for a in authors) if authors else ""
     author_hint = (
         f"\n\nAttribution — include in commit_reviewed message:\n{co_authored}"
@@ -624,7 +605,6 @@ def _stage_pr_merge(
         f"  with both parents, preserving integration branch history.\n"
         f"  Branch '{branch}' left intact.\n\n"
         f"Next:\n"
-        f"  advisory_review(commit_message='...')\n"
         f"  commit_reviewed(commit_message='...')"
         + author_hint
     )
@@ -645,21 +625,21 @@ def get_tools() -> List[ToolEntry]:
                 "remote": {"type": "string", "default": "origin",
                            "description": "Git remote name (default: origin)"},
             }, "required": ["pr_number"]},
-        }, _fetch_pr_ref, is_code_tool=True),
+        }, _fetch_pr_ref, is_code_tool=True, mutates_worktree=True),
 
         ToolEntry("create_integration_branch", {
             "name": "create_integration_branch",
             "description": (
-                "Create a fresh integration branch (integrate/pr-N) from ouroboros. "
+                "Create a fresh integration branch (integrate/pr-N) from the body's working branch. "
                 "External cherry-picked commits and Ouroboros adaptation changes are "
                 "kept separate here before merging."
             ),
             "parameters": {"type": "object", "properties": {
                 "pr_number": {"type": "integer", "description": "GitHub PR number"},
-                "base_branch": {"type": "string", "default": "ouroboros",
-                                "description": "Branch to create from"},
+                "base_branch": {"type": "string", "description": (
+                    "Branch to create from (default: ouroboros, or this task's candidate branch)")},
             }, "required": ["pr_number"]},
-        }, _create_integration_branch, is_code_tool=True),
+        }, _create_integration_branch, is_code_tool=True, mutates_worktree=True),
 
         ToolEntry("cherry_pick_pr_commits", {
             "name": "cherry_pick_pr_commits",
@@ -703,34 +683,34 @@ def get_tools() -> List[ToolEntry]:
                     "additionalProperties": False,
                 },
             }, "required": ["shas"]},
-        }, _cherry_pick_pr_commits, is_code_tool=True),
+        }, _cherry_pick_pr_commits, is_code_tool=True, mutates_worktree=True),
 
         ToolEntry("stage_adaptations", {
             "name": "stage_adaptations",
             "description": (
                 "Stage all current working-tree changes on the integration branch WITHOUT "
                 "committing (git add -A only). Use after cherry_pick_pr_commits to prepare "
-                "Ouroboros adaptation/fixup changes. Finalize via advisory_review + "
-                "commit_reviewed to comply with BIBLE.md P3 (all commits must pass review). "
+                "Ouroboros adaptation/fixup changes. Finalize via commit_reviewed "
+                "to comply with BIBLE.md P3 (all commits must pass review). "
                 "Must be on an integrate/pr-N branch."
             ),
             "parameters": {"type": "object", "properties": {}},
-        }, _stage_adaptations, is_code_tool=True),
+        }, _stage_adaptations, is_code_tool=True, mutates_worktree=True),
 
         ToolEntry("stage_pr_merge", {
             "name": "stage_pr_merge",
             "description": (
-                "Stage a no-fast-forward merge of an integration branch into ouroboros "
+                "Stage a no-fast-forward merge of an integration branch into the body's working branch "
                 "WITHOUT committing (git merge --no-ff --no-commit). Sets MERGE_HEAD so "
                 "commit_reviewed creates a proper merge commit with both parents. Target is "
-                "always ouroboros (commit_reviewed always checks out branch_dev before "
+                "branch_dev (the bound candidate branch during self-development; commit_reviewed checks it out before "
                 "committing — any other target would lose MERGE_HEAD). The "
                 "integration-branch history (with original author commits) is permanently "
-                "linked. Finalize via advisory_review + commit_reviewed."
+                "linked. Finalize via commit_reviewed."
             ),
             "parameters": {"type": "object", "properties": {
                 "branch": {"type": "string",
                            "description": "Integration branch to merge (e.g. integrate/pr-17)"},
             }, "required": ["branch"]},
-        }, _stage_pr_merge, is_code_tool=True),
+        }, _stage_pr_merge, is_code_tool=True, mutates_worktree=True),
     ]
