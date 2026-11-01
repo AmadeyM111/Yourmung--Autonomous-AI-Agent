@@ -480,30 +480,21 @@ def ensure_telegram_bridge_live(
     # keys; if an owner turned it off, the enable step below surfaces the missing
     # grants instead of silently overriding the owner's policy.
 
-    # 2. Install from the live catalog. This synchronously runs tri-model skill
-    #    review, which can take minutes, so use a review-scale timeout rather
-    #    than the default 60s (otherwise a slow review looks like an install
-    #    failure even though the server is still working).
-    try:
-        _code, payload = call("POST", "/api/marketplace/ouroboroshub/install", {"slug": slug}, timeout=1800.0)
-    except Exception as exc:
-        status["error"] = f"install request failed: {exc}"
-        return status
-    err = str((payload or {}).get("error") or "") if isinstance(payload, dict) else ""
-    already = "already installed" in err.lower()
-    # The upstream catalog can rename or drop a skill that is already installed
-    # locally; keep using the installed copy instead of failing the whole boot.
-    if (
-        not already
-        and "skill not found" in err.lower()
-        and data_dir is not None
-        and (pathlib.Path(data_dir) / "skills" / "ouroboroshub" / slug).is_dir()
-    ):
-        already = True
-        status["warning"] = f"{slug} is missing from the OuroborosHub catalog; using the installed copy"
-    if err and not already:
-        status["error"] = f"install failed: {err}"
-        return status
+    # 2. The hub install route was retired in 7.8. A bridge already installed
+    #    locally is used as is; only a missing copy needs the (legacy) install call.
+    installed_locally = data_dir is not None and (pathlib.Path(data_dir) / "skills" / "ouroboroshub" / slug).is_dir()
+    already = installed_locally
+    if not installed_locally:
+        try:
+            _code, payload = call("POST", "/api/marketplace/ouroboroshub/install", {"slug": slug}, timeout=1800.0)
+        except Exception as exc:
+            status["error"] = f"install request failed: {exc}"
+            return status
+        err = str((payload or {}).get("error") or "") if isinstance(payload, dict) else ""
+        already = "already installed" in err.lower()
+        if err and not already:
+            status["error"] = f"install failed: {err}"
+            return status
     status["steps"].append("already_installed" if already else "installed")
 
     patch_result = patch_telegram_bridge_multi_user(data_dir, slug)
@@ -538,54 +529,68 @@ def ensure_telegram_bridge_live(
     else:
         status["audio_attachment_patch"] = audio_patch
 
-    # 3. Install can return before the executable-review state is fresh enough
-    #    for enable, and already-installed Drive state can be stale. Always run
-    #    an explicit review here; auto-grant is governed by persisted settings.
-    prefix = "re-review" if already else "review"
-    max_attempts = max(1, int(review_retries) + 1)
-    for attempt in range(max_attempts):
+    # An installed bridge whose executable review is current and that is already
+    # enabled needs neither a new review panel nor a toggle.
+    live_ok = False
+    if already:
         try:
-            _code, payload = call("POST", f"/api/skills/{quoted}/review", timeout=1800.0)
-        except Exception as exc:
-            rerr = str(exc)
+            _code, listing = call("GET", "/api/extensions")
+            for item in (listing or {}).get("skills", []) if isinstance(listing, dict) else []:
+                if item.get("name") == slug:
+                    live_ok = bool(item.get("enabled")) and item.get("review_status") == "clean" and not item.get("review_stale")
+        except Exception:
+            live_ok = False
+    if live_ok:
+        status["steps"].append("already_live")
+    else:
+        # 3. Install can return before the executable-review state is fresh enough
+        #    for enable, and already-installed Drive state can be stale. Always run
+        #    an explicit review here; auto-grant is governed by persisted settings.
+        prefix = "re-review" if already else "review"
+        max_attempts = max(1, int(review_retries) + 1)
+        for attempt in range(max_attempts):
+            try:
+                _code, payload = call("POST", f"/api/skills/{quoted}/review", timeout=1800.0)
+            except Exception as exc:
+                rerr = str(exc)
+                if attempt < max_attempts - 1 and _retryable_review_error(rerr):
+                    status["steps"].append(f"review_retry:{attempt + 1}")
+                    sleeper(review_retry_delay)
+                    continue
+                status["error"] = f"{prefix} request failed: {exc}"
+                return status
+
+            rerr = str((payload or {}).get("error") or "") if isinstance(payload, dict) else ""
+            if not rerr and _review_payload_executable(payload):
+                status["steps"].append("reviewed")
+                break
             if attempt < max_attempts - 1 and _retryable_review_error(rerr):
                 status["steps"].append(f"review_retry:{attempt + 1}")
                 sleeper(review_retry_delay)
                 continue
-            status["error"] = f"{prefix} request failed: {exc}"
+            if not rerr:
+                rerr = "review did not produce an executable verdict"
+            if _retryable_review_error(rerr) or "executable verdict" in rerr:
+                fallback = _bootstrap_review_official_telegram_bridge(data_dir, slug)
+                if fallback.get("ok"):
+                    status["steps"].append("review_bootstrap_fallback")
+                    status["bootstrap_review"] = fallback
+                    break
+                status["bootstrap_review"] = fallback
+            status["error"] = f"{prefix} failed: {rerr}"
             return status
 
-        rerr = str((payload or {}).get("error") or "") if isinstance(payload, dict) else ""
-        if not rerr and _review_payload_executable(payload):
-            status["steps"].append("reviewed")
-            break
-        if attempt < max_attempts - 1 and _retryable_review_error(rerr):
-            status["steps"].append(f"review_retry:{attempt + 1}")
-            sleeper(review_retry_delay)
-            continue
-        if not rerr:
-            rerr = "review did not produce an executable verdict"
-        if _retryable_review_error(rerr) or "executable verdict" in rerr:
-            fallback = _bootstrap_review_official_telegram_bridge(data_dir, slug)
-            if fallback.get("ok"):
-                status["steps"].append("review_bootstrap_fallback")
-                status["bootstrap_review"] = fallback
-                break
-            status["bootstrap_review"] = fallback
-        status["error"] = f"{prefix} failed: {rerr}"
-        return status
-
-    # 4. Enable (gateway enforces fresh executable review + all grants).
-    try:
-        _code, payload = call("POST", f"/api/skills/{quoted}/toggle", {"enabled": True})
-    except Exception as exc:
-        status["error"] = f"enable request failed: {exc}"
-        return status
-    err = str((payload or {}).get("error") or "") if isinstance(payload, dict) else ""
-    if err:
-        status["error"] = f"enable failed: {err}"
-        return status
-    status["steps"].append("enabled")
+        # 4. Enable (gateway enforces fresh executable review + all grants).
+        try:
+            _code, payload = call("POST", f"/api/skills/{quoted}/toggle", {"enabled": True})
+        except Exception as exc:
+            status["error"] = f"enable request failed: {exc}"
+            return status
+        err = str((payload or {}).get("error") or "") if isinstance(payload, dict) else ""
+        if err:
+            status["error"] = f"enable failed: {err}"
+            return status
+        status["steps"].append("enabled")
 
     # 5. Set the bridge command mode so owner slash commands are allowed. Without
     #    this the bridge defaults to `strict` and rejects every slash command.
