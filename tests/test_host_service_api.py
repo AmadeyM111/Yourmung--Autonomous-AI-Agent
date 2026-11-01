@@ -792,6 +792,17 @@ def test_chat_inject_wait_for_response_unsubscribes(tmp_path: pathlib.Path) -> N
     assert "A2A-allocated" in refused.json()["error"]
     assert bridge._subs == {}
 
+    # A caller that names its own transport task id gets a task-scoped
+    # subscription, so a human chat's unrelated frames cannot resolve it.
+    scoped = client.post(
+        "/chat/inject",
+        headers={"X-Skill-Token": "token"},
+        json={"text": "hello", "chat_id": 1234, "wait_for_response": True, "timeout_sec": 5,
+              "task_metadata": {"transport_task_id": "tg_1", "origin_message_ref": {"chat_id": 999}}},
+    )
+    assert scoped.status_code == 200
+    assert bridge._subs == {}
+
 
 def test_allocate_internal_chat_ids_are_distinct(tmp_path: pathlib.Path) -> None:
     _seed_token(tmp_path, skill="a2a", token="token", permissions=["inject_chat"])

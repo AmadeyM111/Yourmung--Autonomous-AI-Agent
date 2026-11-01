@@ -520,7 +520,10 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
         if _inline_image_too_large(payload):  # refused on its encoded length, before any decode or queue
             return _json_error(f"image_base64: at most {_INLINE_IMAGE_MAX // (1024 * 1024)} MiB per image", 413)
         wait_for_response = bool(payload.get("wait_for_response", False))
-        if wait_for_response and not is_a2a_chat_id(chat_id):
+        scoped_task = payload.get("task_metadata") if isinstance(payload.get("task_metadata"), dict) else {}
+        # A caller that names its own transport task id gets a subscription scoped to that task,
+        # so a human chat's unrelated frames cannot resolve it.
+        if wait_for_response and not is_a2a_chat_id(chat_id) and not str(scoped_task.get("transport_task_id") or ""):
             # A response subscription resolves on the FIRST non-progress frame
             # in the chat. On a human/project chat that frame can be any
             # concurrent task's answer — and, now that owner sends deliver
