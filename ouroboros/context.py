@@ -1194,7 +1194,7 @@ def _capture_context_core(
     supplementary_messages: List[Dict[str, Any]] = []
     base_prompt = safe_read(
         env.repo_path("prompts/SYSTEM.md"),
-        fallback="You are Jormung. Your base prompt could not be loaded."
+        fallback="You are Yourmung. Your base prompt could not be loaded."
     )
     bible_md = safe_read(env.repo_path("BIBLE.md"))
     from ouroboros.reference_books import BOOK_ENTRYPOINTS, compose_book, load_reference_book

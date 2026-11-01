@@ -1,4 +1,4 @@
-# Jormung fork additions
+# Yourmung fork additions
 
 These sections describe components that exist only in the yourmung fork.
 

@@ -184,7 +184,7 @@ def _maybe_answer_model_question_direct(messages: List[Dict[str, Any]], active_m
     if not _looks_like_model_question(user_text):
         return ""
     return (
-        "Я Jormung. Конкретные provider/model IDs являются внутренней "
+        "Я Yourmung. Конкретные provider/model IDs являются внутренней "
         "конфигурацией runtime и не выводятся в обычном Telegram-чате."
     )
 

@@ -1,4 +1,4 @@
-# Jormung (yourmung) Telegram + local runtime on top of the upstream single
+# Yourmung Telegram + local runtime on top of the upstream single
 # self-contained image (Dockerfile target "runtime", code in /app, venv /app/.venv).
 #   docker compose up -d --build
 # Optional transcription stack (build args, all default 0):

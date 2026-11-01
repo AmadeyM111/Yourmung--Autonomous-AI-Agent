@@ -46,7 +46,7 @@ env/
 /.devcontainer
 /graphify-out
 
-# Jormung fork additions
+# Yourmung fork additions
 .DS_Store
 *.log
 /.knowledge/

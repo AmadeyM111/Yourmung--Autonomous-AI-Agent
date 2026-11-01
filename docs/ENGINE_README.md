@@ -1,8 +1,8 @@
 # Ouroboros
 
-> ## Jormung fork
+> ## Yourmung fork
 >
-> This repository ("yourmung" / the **Jormung** agent persona) is a fork of
+> This repository ("yourmung" / the **Yourmung** agent persona) is a fork of
 > [razzant/ouroboros](https://github.com/razzant/ouroboros) rebased onto upstream **v7.8.0**,
 > aimed at a universal executive-assistant agent (Telegram + local/Docker).
 >

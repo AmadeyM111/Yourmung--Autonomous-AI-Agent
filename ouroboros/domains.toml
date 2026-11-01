@@ -940,7 +940,7 @@ D20 = "Presence"
 "ouroboros/tool_effects.py" = "D04"
 "ouroboros/icon_geometry.py" = "D14"
 
-# Fork (Jormung) additions
+# Fork (Yourmung) additions
 "ouroboros/diarization.py" = "D05"
 "ouroboros/local_stt.py" = "D05"
 "ouroboros/spreadsheets.py" = "D05"

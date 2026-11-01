@@ -79,7 +79,7 @@ COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --python /opt/python-standalone/bin/python3 --no-dev --extra browser --no-editable
 
-# Jormung fork: optional transcription stack, off by default (build args).
+# Yourmung fork: optional transcription stack, off by default (build args).
 #   --build-arg OUROBOROS_INSTALL_TRANSCRIPTION=1  faster-whisper (local STT)
 #   --build-arg OUROBOROS_INSTALL_DIARIZATION=1    pyannote speaker diarization (large: PyTorch)
 #   --build-arg OUROBOROS_INSTALL_WHISPERX=1       WhisperX forced alignment (large: PyTorch)

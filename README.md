@@ -4,7 +4,7 @@
 through Telegram and a web interface, reads your mail and calendar, prepares briefings and
 reply drafts, and transcribes voice messages and meeting recordings.
 
-App version: **3.0.0** (see `[tool.jormung]` in `pyproject.toml`).
+App version: **3.0.0** (see `[tool.yourmung]` in `pyproject.toml`).
 Core (agent engine): **7.8.0**.
 
 > Yourmung is a standalone project. It is built on an open-source agent engine

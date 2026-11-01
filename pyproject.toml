@@ -10,7 +10,7 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [
-    {name = "Jormung"},
+    {name = "Yourmung"},
 ]
 keywords = ["ai-agent", "self-modifying", "autonomous", "llm", "openrouter"]
 classifiers = [
@@ -91,7 +91,7 @@ linux-desktop = [
     "pycairo==1.26.1; sys_platform == 'linux'",
 ]
 local-model = ["llama-cpp-python"]
-# Jormung fork: optional audio transcription and tracing.
+# Yourmung fork: optional audio transcription and tracing.
 transcription = ["faster-whisper==1.2.1"]
 # diarization / WhisperX (PyTorch stack, pins huggingface_hub<1) are NOT extras:
 # install them from requirements-diarization.txt / requirements-whisperx.txt.
@@ -170,7 +170,7 @@ target-version = "py310"
 select = ["E", "F", "W", "I"]
 ignore = ["E501"]
 
-[tool.jormung]
-# Version of the Jormung application (executive assistant) built on core 7.8.0.
+[tool.yourmung]
+# Version of the Yourmung application (executive assistant) built on core 7.8.0.
 version = "3.0.0"
 core = "7.8.0"
