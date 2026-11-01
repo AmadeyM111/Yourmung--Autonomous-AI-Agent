@@ -142,7 +142,7 @@ def test_llms_file_is_a_small_absolute_navigation_map():
 
 
 def test_public_surfaces_explain_the_claudexor_relationship():
-    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    readme = (REPO / "docs" / "ENGINE_README.md").read_text(encoding="utf-8")
     homepage = (SITE / "index.html").read_text(encoding="utf-8")
     llms = (SITE / "public" / "llms.txt").read_text(encoding="utf-8")
     generated_homepage = (DOCS / "index.html").read_text(encoding="utf-8")
@@ -328,13 +328,13 @@ def test_russian_talk_is_secondary_and_explicitly_labelled():
         assert url in resources
         assert '<html lang="en">' in homepage
         assert homepage.index("Download the desktop app") < homepage.index('id="resources"')
-    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    readme = (REPO / "docs" / "ENGINE_README.md").read_text(encoding="utf-8")
     assert url in readme
     assert readme.index("Download for macOS") < readme.index(url)
 
 
 def test_readme_and_benchmark_page_keep_claim_values_in_sync():
-    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    readme = (REPO / "docs" / "ENGINE_README.md").read_text(encoding="utf-8")
     page = (SITE / "benchmarks" / "index.html").read_text(encoding="utf-8")
     claims = (
         "86.74%",
@@ -354,7 +354,7 @@ def test_readme_and_benchmark_page_keep_claim_values_in_sync():
 
 def test_terminal_bench_claim_applies_disclosed_reward_hack_correction():
     surfaces = [
-        (REPO / "README.md").read_text(encoding="utf-8"),
+        (REPO / "docs" / "ENGINE_README.md").read_text(encoding="utf-8"),
         (SITE / "index.html").read_text(encoding="utf-8"),
         (SITE / "benchmarks" / "index.html").read_text(encoding="utf-8"),
         (REPO / "assets" / "bench-terminal-bench.svg").read_text(encoding="utf-8"),

@@ -177,7 +177,7 @@ def test_the_guides_point_to_the_carrier_instead_of_repeating_it():
     assert "does not replace" in deployment
     assert "installing the app again" in deployment
     assert "boot.phase" in deployment and "no start deadline" in deployment
-    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    readme = (REPO / "docs" / "ENGINE_README.md").read_text(encoding="utf-8")
     assert "CPython 3.10.22 and SQLite 3.53.1" in readme
     assert "install the app again" in readme
     for page in (REPO / "site" / "install" / "index.html", REPO / "docs" / "install" / "index.html"):

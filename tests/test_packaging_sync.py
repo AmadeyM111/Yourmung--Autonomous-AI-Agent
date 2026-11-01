@@ -72,7 +72,7 @@ def test_push_to_remote_push_tags_compatibility(monkeypatch):
 
 def test_readme_version_history_contains_current_version_row():
     version = (REPO / "VERSION").read_text(encoding="utf-8").strip()
-    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    readme = (REPO / "docs" / "ENGINE_README.md").read_text(encoding="utf-8")
 
     assert f"| {version} |" in readme
 
@@ -99,7 +99,7 @@ def test_architecture_docs_describe_bundle_bootstrap_not_per_launch_core_sync():
 
 
 def test_readme_version_history_stays_within_minor_row_limit():
-    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    readme = (REPO / "docs" / "ENGINE_README.md").read_text(encoding="utf-8")
 
     warnings = check_history_limit(readme)
     assert not [w for w in warnings if "minor rows" in w]
@@ -112,7 +112,7 @@ def test_readme_version_history_rows_render_as_three_cells():
     DROPS everything after the third cell: the v6.78.0 row lost its whole disclosed-
     narrowing tail that way. Every Version History row must carry exactly the 4
     unescaped pipes of a 3-cell row."""
-    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    readme = (REPO / "docs" / "ENGINE_README.md").read_text(encoding="utf-8")
 
     rows = [
         line for line in readme.splitlines()
@@ -132,14 +132,14 @@ def test_readme_documents_release_tag_prerequisite_for_build_scripts():
     ``v$(cat VERSION)`` (see tests/test_build_scripts.py). The README must
     document that prerequisite alongside the macOS/Linux/Windows build
     sections so users are not surprised by the new failure mode."""
-    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    readme = (REPO / "docs" / "ENGINE_README.md").read_text(encoding="utf-8")
 
     assert "Release tag prerequisite" in readme
     assert "git tag -a" in readme
 
 
 def test_readme_documents_packaged_cli_installer_and_locked_source_env():
-    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    readme = (REPO / "docs" / "ENGINE_README.md").read_text(encoding="utf-8")
 
     assert "Install CLI.command" in readme
     assert "./Ouroboros/bin/install-ouroboros-cli" in readme
@@ -160,7 +160,7 @@ def test_legacy_requirements_file_is_only_a_runtime_lock_pointer():
 
 
 def test_readme_prioritizes_macos_dmg_install_and_model_access():
-    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    readme = (REPO / "docs" / "ENGINE_README.md").read_text(encoding="utf-8")
     version = (REPO / "VERSION").read_text(encoding="utf-8").strip()
 
     download_pos = readme.index("## Download Ouroboros")
