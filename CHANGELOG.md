@@ -3,6 +3,10 @@
 История изменений проекта. Старые подробные release rows также сохранены в
 `README.md`, git tags и GitHub Releases.
 
+## 3.0.1 - Core upgraded to upstream v7.9.0
+
+Ядро Ouroboros 7.8.0 → 7.9.0, форк-доработки сохранены. Детали, проверка и откат: [docs/ROLLOUT_LOG.md](docs/ROLLOUT_LOG.md).
+
 ## 2.3.0 - Rebased onto upstream v7.8.0
 
 The fork (previously a v6.18.1 snapshot with local changes) was re-based onto

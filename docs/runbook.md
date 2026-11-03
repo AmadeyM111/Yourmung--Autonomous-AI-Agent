@@ -222,6 +222,8 @@ data/state/extension_reconcile/
 
 ## Git/Release
 
+Журнал выкаток в прод: [ROLLOUT_LOG.md](ROLLOUT_LOG.md).
+
 Перед push/release:
 
 ```bash
