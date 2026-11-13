@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Auto-deploy: fast-forward the checkout to origin/main and restart only what changed.
+# Auto-deploy: fast-forward the checkout to origin/<checked-out branch> and restart only what changed.
 # Run by yourmung-deploy.timer every 2 minutes. Never touches .env or data/.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 exec 9>/tmp/yourmung-deploy.lock; flock -n 9 || exit 0
-BRANCH=main
+# Deploys the branch that is checked out on the server (normally `deploy`).
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
 git fetch --quiet origin "$BRANCH"
 OLD=$(git rev-parse HEAD); NEW=$(git rev-parse "origin/$BRANCH")
 [ "$OLD" = "$NEW" ] && exit 0
