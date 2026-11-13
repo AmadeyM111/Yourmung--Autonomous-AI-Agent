@@ -3,8 +3,10 @@
 services:
   ouroboros:
     # Voice-to-text patch for the Telegram bridge runs before the server starts (idempotent, never blocks).
-    entrypoint: ["sh", "-c", "python /opt/patch_voice.py; exec python -m ouroboros.cli \"$$@\"", "--"]
+    entrypoint: ["sh", "-c", "python /opt/patch_voice.py; python /opt/patch_tools.py; exec python -m ouroboros.cli \"$$@\"", "--"]
     environment:
+      # Tool schemas are paid input tokens on every call: withhold dev/evolution/multi-agent/media tools.
+      OUROBOROS_DISABLED_TOOLS: "schedule_subagent,delegate_start,delegate_wait,delegate_answer,delegate_message,delegate_cancel,inspect_subagent,integrate_delegated_patch,integrate_subagent_patch,compare_subagent_patches,resume_child_task,discard_child_result,review_change,commit_reviewed,preflight_review,prepare_self_change,apply_patch,cherry_pick_pr_commits,stage_pr_merge,fetch_pr_ref,create_integration_branch,vcs_read,vcs_revert,vcs_restore,vcs_rollback,vcs_pull_ff,maintain_harness,inspect_harness,request_deep_self_review,toggle_evolution,generate_evolution_stats,request_restart,skill_install,skill_update,skill_review,skill_preflight,skill_sources,skill_search,skill_owner_action,toggle_skill,pin_ui_translation,search_ui_translations,move_to_project,configure_presence,generate_image,list_image_models,vlm_query,recover_image,extract_video_frames,analyze_screenshot,switch_model"
       ALL_PROXY: socks5h://172.19.0.1:1080
       HTTPS_PROXY: socks5h://172.19.0.1:1080
       HTTP_PROXY: socks5h://172.19.0.1:1080
@@ -14,6 +16,7 @@ services:
       - ./ouroboros/telegram_bridge_setup.py:/app/ouroboros/telegram_bridge_setup.py:ro
       - ./prompts/SYSTEM.md:/app/prompts/SYSTEM.md:ro
       - ./deploy/server/patch_voice.py:/opt/patch_voice.py:ro
+      - ./deploy/server/patch_tools.py:/opt/patch_tools.py:ro
 
 networks:
   default:
