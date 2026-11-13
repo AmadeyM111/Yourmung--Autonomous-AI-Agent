@@ -2,6 +2,8 @@
 # Activated by COMPOSE_FILE in the server's .env: docker-compose.yml:docker-compose.server.yml
 services:
   ouroboros:
+    # Voice-to-text patch for the Telegram bridge runs before the server starts (idempotent, never blocks).
+    entrypoint: ["sh", "-c", "python /opt/patch_voice.py; exec python -m ouroboros.cli \"$$@\"", "--"]
     environment:
       ALL_PROXY: socks5h://172.19.0.1:1080
       HTTPS_PROXY: socks5h://172.19.0.1:1080
@@ -11,6 +13,7 @@ services:
       # Run the patched files without rebuilding the image.
       - ./ouroboros/telegram_bridge_setup.py:/app/ouroboros/telegram_bridge_setup.py:ro
       - ./prompts/SYSTEM.md:/app/prompts/SYSTEM.md:ro
+      - ./deploy/server/patch_voice.py:/opt/patch_voice.py:ro
 
 networks:
   default:
