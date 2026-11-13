@@ -1,0 +1,12 @@
+[Unit]
+Description=SSH SOCKS5 tunnel to proxy for Telegram
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ssh -N -i /root/.ssh/tg_tunnel -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o BatchMode=yes -D 172.19.0.1:1080 root@195.58.39.7
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+[Unit]
+Description=Yourmung auto-deploy from origin/main
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/root/amadey/ai-agents/Yourmung--Autonomous-AI-Agent/deploy/server/deploy.sh

@@ -74,10 +74,6 @@ services:
     volumes:
       - ./data:/data
       - ./.knowledge:/app/.knowledge:ro
-    # Phoenix is shared: it runs in the oil-ai-agent project, reachable as "phoenix".
-    networks:
-      - default
-      - phoenix
     restart: unless-stopped
     init: true
     # The image entrypoint is server.py; run the Telegram bridge via the CLI instead.
@@ -89,7 +85,9 @@ services:
       - --port
       - "8765"
 
-networks:
   phoenix:
-    name: oil-ai-agent_default
-    external: true
+    image: arizephoenix/phoenix:latest
+    container_name: phoenix
+    ports:
+      - "127.0.0.1:6006:6006"
+    restart: unless-stopped

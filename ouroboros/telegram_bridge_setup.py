@@ -412,6 +412,49 @@ def _bootstrap_review_official_telegram_bridge(
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def _owner_accepted_bytes(data_dir, slug: str) -> bool:
+    """True when a host-owned acceptance (owner_skip/trusted) binds the skill's current bytes."""
+    if data_dir is None:
+        return False
+    try:
+        from ouroboros.skill_acceptance import load_acceptance_facts
+        from ouroboros.skill_loader import find_skill
+        from ouroboros.skill_review_status import acceptance_in_force
+
+        root = pathlib.Path(data_dir)
+        skill = find_skill(root, slug)
+        if skill is None or not skill.content_hash:
+            return False
+        return bool(acceptance_in_force(load_acceptance_facts(root, slug), skill.content_hash))
+    except Exception:
+        return False
+
+
+def _grant_requested_for_owner_accepted(data_dir, slug: str) -> None:
+    """Grant exactly the keys/permissions the owner-accepted skill requests, bound to its current hash."""
+    try:
+        from ouroboros.skill_loader import (
+            find_skill,
+            requested_core_setting_keys,
+            requested_skill_permissions,
+            save_skill_grants,
+        )
+
+        root = pathlib.Path(data_dir)
+        skill = find_skill(root, slug)
+        if skill is None or not skill.content_hash:
+            return
+        keys = requested_core_setting_keys(list(skill.manifest.env_from_settings or []))
+        permissions = requested_skill_permissions(
+            list(skill.manifest.permissions or []), list(skill.manifest.subscribe_events or []),
+        )
+        save_skill_grants(root, skill.name, list(keys), content_hash=skill.content_hash,
+                          requested_keys=keys, granted_permissions=list(permissions),
+                          requested_permissions=permissions)
+    except Exception:
+        pass
+
+
 def _review_payload_executable(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -563,6 +606,10 @@ def ensure_telegram_bridge_live(
             rerr = str((payload or {}).get("error") or "") if isinstance(payload, dict) else ""
             if not rerr and _review_payload_executable(payload):
                 status["steps"].append("reviewed")
+                break
+            if rerr and _owner_accepted_bytes(data_dir, slug):
+                status["steps"].append("review_skipped_owner_accepted")
+                _grant_requested_for_owner_accepted(data_dir, slug)
                 break
             if attempt < max_attempts - 1 and _retryable_review_error(rerr):
                 status["steps"].append(f"review_retry:{attempt + 1}")
