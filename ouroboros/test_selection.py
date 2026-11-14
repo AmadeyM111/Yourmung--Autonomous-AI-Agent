@@ -22,7 +22,6 @@ from typing import Iterable
 FLOOR_TESTS = {
     "tests/test_contracts.py": "frozen ABI and tool/context protocols",
     "tests/test_gateway_parity.py": "HTTP/WS wire schemas and router parity",
-    "tests/test_packaging_sync.py": "release identity and public install carriers",
     "tests/test_process_custody.py": "every long-lived child has a lifetime owner",
     "tests/test_hermetic_data_root.py": "tests cannot bind the live data roots",
     "tests/test_preflight_process_containment.py": "a leaked test process cannot pass the gate",

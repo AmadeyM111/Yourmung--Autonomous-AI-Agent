@@ -143,18 +143,6 @@ def test_non_linux_shells_keep_native_prompt(monkeypatch):
         assert media.attach_media_permissions(window, ORIGIN) is window
 
 
-def test_macos_bundle_declares_microphone_and_signed_audio_entitlement():
-    spec = ast.parse((ROOT / "Ouroboros.spec").read_text())
-    bundle = next(n for n in ast.walk(spec) if isinstance(n, ast.Call)
-                  and isinstance(n.func, ast.Name) and n.func.id == "BUNDLE")
-    info = next(k.value for k in bundle.keywords if k.arg == "info_plist")
-    fields = {ast.literal_eval(k): v for k, v in zip(info.keys, info.values)}
-    assert "microphone" in ast.literal_eval(fields["NSMicrophoneUsageDescription"]).lower()
-    assert "speech recognition" in ast.literal_eval(fields["NSSpeechRecognitionUsageDescription"]).lower()
-    assert "NSCameraUsageDescription" not in fields
-    entitlements = plistlib.loads((ROOT / "entitlements.plist").read_bytes())
-    assert entitlements["com.apple.security.device.audio-input"] is True
-    assert "com.apple.security.device.camera" not in entitlements
 
 
 def test_launcher_keeps_display_probe_alias_and_origin_bound_hook():

@@ -941,7 +941,6 @@ def test_every_settings_writer_routes_through_the_shared_prologue():
     # `_owner_write_settings` is now one caller of.
     assert writers.get(("ouroboros/config.py", "save_settings")) is True
     assert writers.get(("ouroboros/gateway/owner_settings.py", "_owner_update_settings")) is True
-    assert writers.get(("ouroboros/packaged_cli.py", "_save_settings")) is True
 
 
 def test_generic_settings_post_does_not_author_a_mode_decision(isolated_settings, monkeypatch):

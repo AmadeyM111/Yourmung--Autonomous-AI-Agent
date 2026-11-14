@@ -145,7 +145,6 @@ JUSTIFIED = {
     "scripts/run_external_review.py": "operator wrapper: provisions the built-in keys from the operator's own secrets",
     "scripts/reconcile_openrouter_cost.py": "explicit reconciliation: the saved OpenRouter key whose fingerprint bought "
                                             "the row, built-in or added; any other refuses as credential_mismatch, unsent",
-    "scripts/qualify_linux_appimage.py": "packaging qualification: writes an endpoint into its own test settings",
 }
 
 

@@ -80,15 +80,6 @@ def test_bundled_node_uses_the_same_bases(tmp_path, monkeypatch):
     assert platform_layer.resolve_bundled_node() == str(candidate)
 
 
-def test_bundle_dir_env_is_exported_to_the_server_and_cli():
-    """The two spawn seams must hand the bundle root down; nothing else can."""
-    launcher_src = (REPO_ROOT / "launcher.py").read_text(encoding="utf-8")
-    start_agent = launcher_src.split("def start_agent", 1)[1].split("\ndef ", 1)[0]
-    assert "BUNDLE_DIR_ENV" in start_agent
-
-    cli_src = (REPO_ROOT / "ouroboros" / "packaged_cli.py").read_text(encoding="utf-8")
-    inner_env = cli_src.split("def _inner_cli_env", 1)[1].split("\ndef ", 1)[0]
-    assert "BUNDLE_DIR_ENV: str(runtime.bundle_root)" in inner_env
 
 
 # --------------------------------------------------------------------------

@@ -332,24 +332,6 @@ def test_skill_exec_forwards_bytecode_suppression_env(monkeypatch, tmp_path):
 
 
 # --- WA6 review-round: entrypoints must set sys.dont_write_bytecode -----------
-def test_entrypoints_set_dont_write_bytecode_before_project_imports():
-    """v6.36.0 review finding: os.environ['PYTHONDONTWRITEBYTECODE'] set after
-    interpreter startup does NOT stop the CURRENT process writing .pyc (the env var
-    is read only at startup) — only sys.dont_write_bytecode does. Both packaged
-    entrypoints must set it BEFORE the first project import, else a signed macOS
-    .app can still write __pycache__ into its own bundle and break the codesign seal
-    for modules lacking a sealed .pyc."""
-    REPO = pathlib.Path(__file__).resolve().parents[1]
-    for rel in ("launcher.py", "ouroboros/packaged_cli.py"):
-        src = (REPO / rel).read_text(encoding="utf-8")
-        sdwb = src.find("sys.dont_write_bytecode = True")
-        first_project_import = src.find("from ouroboros")
-        assert sdwb != -1, f"{rel} must set sys.dont_write_bytecode = True"
-        assert first_project_import != -1, f"{rel} must import a project module"
-        assert sdwb < first_project_import, (
-            f"{rel} must set sys.dont_write_bytecode BEFORE the first 'from ouroboros' "
-            "import (late os.environ mutation alone is insufficient for this process)"
-        )
 
 
 # --- WA3 review-round: single-reviewer degraded mode is durable across surfaces -

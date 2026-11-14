@@ -129,11 +129,6 @@ def test_cli_refuses_an_invalid_execution_duration_before_posting(monkeypatch, v
     assert cli.main(["run", "--detach", "--execution-timeout", value, "work"]) != 0
 
 
-def test_packaged_cli_start_scan_knows_the_execution_duration_option():
-    from ouroboros.packaged_cli import _run_start_index
-
-    assert _run_start_index(["run", "--execution-timeout", "30", "--start", "work"], 0) == 3
-    assert _run_start_index(["run", "--execution-timeout=30", "--start", "work"], 0) == 2
 
 
 def test_cybergym_request_is_admitted_as_an_execution_duration(gateway, tmp_path):
