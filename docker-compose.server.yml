@@ -17,6 +17,8 @@ services:
       - ./prompts/SYSTEM.md:/app/prompts/SYSTEM.md:ro
       - ./deploy/server/patch_voice.py:/opt/patch_voice.py:ro
       - ./deploy/server/patch_tools.py:/opt/patch_tools.py:ro
+      # Compact constitution (full text stays in the repo's BIBLE.md): ~8.6k fewer input tokens per call.
+      - ./deploy/server/BIBLE.compact.md:/app/BIBLE.md:ro
 
 networks:
   default:
