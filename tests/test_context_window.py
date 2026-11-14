@@ -148,54 +148,6 @@ def test_start_and_in_task_admission_share_the_input_bound(tmp_path, monkeypatch
         assert (refusal is not None) is (usable is not None and size > usable)
 
 
-@pytest.mark.parametrize("model,key", [
-    ("openai::model", "OPENAI_API_KEY"), ("anthropic::model", "ANTHROPIC_API_KEY"),
-    ("deepseek::model", "DEEPSEEK_API_KEY"), ("zai::model", "ZAI_API_KEY"),
-    ("minimax::model", "MINIMAX_API_KEY"), ("cloudru::model", "CLOUDRU_FOUNDATION_MODELS_API_KEY"),
-    ("gigachat::model", "GIGACHAT_CREDENTIALS"), ("openrouter::model", "OPENROUTER_API_KEY"),
-    ("openai-compatible::model", "OPENAI_COMPATIBLE_API_KEY"),
-])
-def test_direct_account_scope_survives_same_key_but_not_key_rotation(tmp_path, monkeypatch, model, key):
-    import json
-    from ouroboros import config, context_fit as cf, server_runtime
-    from ouroboros.context_anchor import record_input_anchor, main_input_anchor
-    from ouroboros.context_window import record_refusal
-    from ouroboros.usage_accounting import AttemptRequest
-
-    settings = {"OUROBOROS_MODEL": model, key: "fixture-account-A",
-                "OPENAI_COMPATIBLE_BASE_URL": "https://fixture.invalid/v1"}
-    monkeypatch.setattr(config, "runtime_settings", lambda: dict(settings))
-    monkeypatch.setattr(server_runtime, "apply_runtime_provider_defaults", lambda s: (s, False, []))
-    monkeypatch.setattr(ce, "canonical_evidence_root", lambda: tmp_path)
-    monkeypatch.setattr(cf, "_route_calibration_ratio", lambda *_a, **_kw: 1.0)
-    monkeypatch.setattr(ce, "probe", lambda _root, **kw: ce.CapabilityEvidence(600_000, "confirmed", "metadata",
-        ce.route_fingerprint(**{k: kw[k] for k in ("provider", "model", "base_url", "options")})))
-    core = cf.ContextCore("Core", "", "", "", "", "", '"Assignment"', False)
-    def start():
-        return cf.build_context_fit_plan(None, core, {}, preferred_mode="max", route_resolver=cf.resolve_context_fit_route)
-
-    first = start()
-    measured = cf.measure_main_fit(first, first.messages_for("max"), [], profile="owner_max", rendered_mode="max", round_id="r")
-    ce.observe_token_density(AttemptRequest(model=model, provider=first.provider, drive_root=tmp_path,
-        prompt_tokens_bounded_estimate=700_000, physical_context=cf._physical_context_for_fit(measured)),
-        {"prompt_tokens": 700_000}, drive_root_resolver=lambda root: root)
-    usage = {"_last_round_cache_usage": {"prompt_tokens": 700_000, "provider": first.provider},
-             "_context_raw_input_tokens": 700_000}
-    record_input_anchor(usage, first, round_idx=1)
-    same = start()
-    assert same.window_record.usable == 700_000
-    assert main_input_anchor(usage, same)[1] == 700_000
-    record_refusal({"_last_llm_provider_message": "maximum context length is 200000 tokens"}, first)
-    assert start().window_record.usable == 134_464
-    settings[key] = "fixture-account-B"
-    other = start()
-    assert other.route_fp == first.route_fp  # capability acknowledgement contract is unchanged
-    assert other.window_record.route_fp != first.window_record.route_fp
-    assert other.window_record.accepted == 0 and other.window_record.usable == 534_464
-    assert main_input_anchor(usage, other) == (None, None)
-    settings[key] = "fixture-account-A"
-    assert start().window_record.usable == 134_464
-    assert "fixture-account-" not in json.dumps(ce._load(tmp_path))
 
 
 def test_a_claudexor_account_reads_the_acceptances_its_receipts_wrote(tmp_path, monkeypatch):

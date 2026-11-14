@@ -130,72 +130,10 @@ def _valid_onboarding_payload() -> dict:
 # --------------------------------------------------------------------------
 
 
-def test_first_run_onboarding_is_presented_only_after_the_gateway_is_healthy():
-    """THE reordering (D-8). The old sequence rendered the wizard before
-    server.py existed, so it could not reach /api/* at all — which is why
-    connecting an agent subscription during first-run was impossible on desktop.
-    Every pre-server safety step is still pre-server: they are preconditions of
-    the server itself."""
-    import launcher
-
-    src = inspect.getsource(launcher.main)
-    order = [
-        "acquire_pid_lock()",
-        "check_git()",
-        "bootstrap_repo()",
-        "_prepare_first_run_settings()",
-        "_requested_server_port()",
-        "lifecycle_thread.start()",
-        "_await_server_ready(port, _abort, lifecycle_thread)",
-        "_present_first_run_onboarding(",
-    ]
-    positions = [src.index(marker) for marker in order]
-    assert positions == sorted(positions), f"startup order drifted: {order}"
-
-    # Presented against the AUTHORITATIVE bound port, and only once healthy.
-    call_at = src.index("_present_first_run_onboarding(")
-    call = src[call_at:call_at + 160]
-    assert "onboarding_settings, actual_port" in call
-    assert "headless=_headless" in call
-    assert "if server_ready and onboarding_required" in src
-    # The pre-server wizard window is gone for good.
-    assert "_run_first_run_wizard" not in src
 
 
-def test_launcher_restart_request_is_not_charged_to_the_crash_fuse():
-    """A launcher-requested recycle (adopting first-run configuration) must be
-    handled like the agent's own code-42 restart: no crash accounting, no crash
-    backoff — otherwise four first-run saves would trip the five-crash fuse."""
-    import launcher
-
-    loop_src = inspect.getsource(launcher.agent_lifecycle_loop)
-    restart_at = loop_src.index("_agent_restart_requested.is_set()")
-    crash_at = loop_src.index("crash_times.append(now)")
-    fuse_at = loop_src.index("len(crash_times) >= MAX_CRASH_RESTARTS")
-    assert restart_at < crash_at < fuse_at
-    assert "_agent_restart_requested.clear()" in loop_src
 
 
-def test_request_agent_restart_flags_intent_then_stops_the_child(monkeypatch):
-    import launcher
-
-    stopped = []
-    monkeypatch.setattr(launcher, "stop_agent", lambda: stopped.append(True))
-    launcher._agent_restart_requested.clear()
-    try:
-        # No live agent: the flag must NOT be left armed, or the next ordinary
-        # agent exit would masquerade as a requested restart and skip the fuse.
-        monkeypatch.setattr(launcher, "_agent_proc", None)
-        launcher._request_agent_restart()
-        assert launcher._agent_restart_requested.is_set() is False
-        assert stopped == []
-
-        monkeypatch.setattr(launcher, "_agent_proc", object())
-        launcher._request_agent_restart()
-        assert launcher._agent_restart_requested.is_set() is True
-        assert stopped == [True]
-    finally:
-        launcher._agent_restart_requested.clear()
 
 
 # --------------------------------------------------------------------------
@@ -203,145 +141,16 @@ def test_request_agent_restart_flags_intent_then_stops_the_child(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_setup_window_loads_the_live_onboarding_page(monkeypatch):
-    from ouroboros import launcher_onboarding
-
-    created, _fake = _install_fake_webview(monkeypatch)
-
-    opened = []
-    outcome = launcher_onboarding.present_first_run_onboarding(
-        {}, 8899, open_external_url=lambda url: opened.append(url) or {"ok": True},
-    )
-
-    assert created["url"] == "http://127.0.0.1:8899/onboarding"
-    assert created.get("html") is None
-    assert created["started"] is True
-    # Window lifecycle and external links, but no settings authority:
-    # completion is the same atomic endpoint a browser owner posts to, so a
-    # bridge method able to write settings.json would be a live authority with
-    # no caller and no audit.
-    api = created["js_api"]
-    assert callable(getattr(api, "onboarding_finished", None))
-    assert api.open_external_url("https://example.test/signin") == {"ok": True}
-    assert opened == ["https://example.test/signin"]
-    assert not hasattr(api, "save_wizard")
-    assert not hasattr(api, "claude_code_status")
-    assert not hasattr(api, "install_claude_code")
-    assert not hasattr(api, "fetch_compatible_models")
-    # Nothing was saved: a window that merely opened is not a completion.
-    assert outcome == {"saved": False, "restart_required": False}
 
 
-def test_closing_the_setup_window_without_saving_is_non_fatal(monkeypatch):
-    """Startup continues and the blocking overlay remains the owner's surface."""
-    import launcher
-    from ouroboros import launcher_onboarding
-
-    _install_fake_webview(monkeypatch)  # start() returns without any bridge call
-
-    assert launcher_onboarding.present_first_run_onboarding(
-        {}, 8765, open_external_url=launcher._open_external_url,
-    )["saved"] is False
-
-    src = inspect.getsource(launcher.main)
-    cancel_at = src.index('if not onboarding["saved"]')
-    next_at = src.index('if onboarding["restart_required"]')
-    # The cancel branch only logs; it never aborts startup or skips the UI.
-    cancel_branch = src[cancel_at:next_at]
-    assert "sys.exit" not in cancel_branch
-    assert "return" not in cancel_branch
-    assert "Launching anyway" in cancel_branch
 
 
-def test_completion_reporting_restart_required_recycles_the_managed_server(monkeypatch):
-    import launcher
-    from ouroboros import launcher_onboarding
-
-    def drive(created):
-        created["js_api"].onboarding_finished({"ok": True, "restart_required": True})
-
-    _created, fake = _install_fake_webview(monkeypatch, on_start=drive)
-
-    outcome = launcher_onboarding.present_first_run_onboarding(
-        {}, 8765, open_external_url=launcher._open_external_url,
-    )
-
-    assert outcome == {"saved": True, "restart_required": True}
-    assert all(window.destroyed for window in fake.windows)
-
-    src = inspect.getsource(launcher.main)
-    restart_at = src.index('if onboarding["restart_required"]')
-    assert "_request_agent_restart()" in src[restart_at:restart_at + 800]
-    assert "_await_server_ready(port, _abort, lifecycle_thread)" in src[restart_at:restart_at + 800]
 
 
-def test_macos_recovery_uses_the_live_window_and_current_gateway_after_setup(monkeypatch):
-    from ouroboros import launcher_onboarding as host
-
-    monkeypatch.setattr(sys, "platform", "darwin")
-    created, webview = _install_fake_webview(monkeypatch)
-    gateway = {"port": 8899}
-    read_port = lambda: gateway["port"]
-    outcome = host.present_first_run_onboarding(
-        {}, 8765, open_external_url=lambda url: {"ok": True}, read_port=read_port,
-    )
-    setup = created["window"]
-    assert webview.app_menu[0].title == "Help"
-    assert [item.title for item in webview.app_menu[0].items] == ["Open built-in setup"], (
-        "a hung web view commits no load, so the menu offers no reload that pretends to rescue one")
-    setup_action = webview.app_menu[0].items[0]
-    assert setup_action.title == "Open built-in setup"
-    setup_action.function()  # no page JavaScript or bridge receiver participates
-    assert setup.loaded_urls == ["http://127.0.0.1:8899/onboarding?builtin=1"]
-    assert outcome == {"saved": False, "restart_required": False}
-
-    gateway["port"] = 8900
-    setup_action.function()
-    assert setup.loaded_urls[-1] == "http://127.0.0.1:8900/onboarding?builtin=1"
-    gateway["port"] = None
-    setup_action.function()
-    assert len(setup.loaded_urls) == 2, "an unavailable generation has no recovery endpoint"
-
-    created["js_api"].onboarding_finished({"ok": True, "restart_required": True})
-    assert outcome == {"saved": True, "restart_required": True}
-    assert setup.destroyed and webview.active_window() is None
-    gateway["port"] = 8901
-    setup_action.function()  # retained native menu while no window exists
-    failed = webview.create_window("Ouroboros — Startup Failed", html="server unavailable")
-    webview.start(private_mode=False)  # retained menu, exactly like the failure path
-    assert webview.app_menu[0].items[0] is setup_action
-    setup_action.function()
-    assert not failed.loaded_urls and len(setup.loaded_urls) == 2
-    failed.destroy()
-
-    main = webview.create_window("Ouroboros", url="http://127.0.0.1:8901")
-    webview.start(menu=host.setup_recovery_menu(main, read_port))
-    (main_action,) = webview.app_menu[0].items
-    assert main_action is not setup_action, "the main GUI loop replaces the old binding"
-    main_action.function()
-    assert main.loaded_urls == ["http://127.0.0.1:8901/onboarding?builtin=1"]
-    setup_action.function()
-    assert len(setup.loaded_urls) == 2
-    webview.windows.remove(main)
-    main_action.function()
-    assert len(main.loaded_urls) == 1, "a retired window is no longer a navigation target"
 
 
-@pytest.mark.parametrize("platform", ["win32", "linux"])
-def test_recovery_adds_no_menu_chrome_on_other_platforms(monkeypatch, platform):
-    from ouroboros import launcher_onboarding as host
-
-    monkeypatch.setattr(sys, "platform", platform)
-    monkeypatch.setitem(sys.modules, "webview", None)
-    assert host.setup_recovery_menu(object(), lambda: pytest.fail("must not read a port")) == []
 
 
-def test_launcher_binds_both_recovery_menus_to_its_generation_endpoint():
-    import launcher
-
-    source = inspect.getsource(launcher.main)
-    assert "open_external_url=_open_external_url, read_port=lambda: _generation_port" in source
-    assert "menu=setup_recovery_menu(window, lambda: _generation_port)" in source
 
 
 # --------------------------------------------------------------------------
@@ -349,119 +158,10 @@ def test_launcher_binds_both_recovery_menus_to_its_generation_endpoint():
 # --------------------------------------------------------------------------
 
 
-def test_the_desktop_setup_window_cannot_write_settings_at_all(monkeypatch, tmp_path):
-    """D-8 closed: the desktop host has NO save path of its own.
-
-    The one deliberately preserved exception was authoring the fresh-install
-    `light` safety coverage. `POST /api/onboarding/complete` now authors it on
-    its own server-side freshness proof (see
-    `test_a_desktop_shaped_completion_still_authors_light_on_a_fresh_install`
-    in tests/test_onboarding_complete_endpoint.py), so the exception is gone and
-    the full->light ratchet is the ONLY rule an ordinary save sees — before and
-    after a settings file exists."""
-    from ouroboros import config as cfg
-    from ouroboros import launcher_onboarding
-
-    monkeypatch.setattr(cfg, "SETTINGS_PATH", tmp_path / "settings.json")
-    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
-    monkeypatch.delenv("OUROBOROS_SAFETY_MODE", raising=False)
-
-    # Generic (non-owner) save of that lowering: refused on a fresh install.
-    with pytest.raises(PermissionError, match="OUROBOROS_SAFETY_MODE lowering refused"):
-        cfg.save_settings({"OUROBOROS_SAFETY_MODE": "light", "TOTAL_BUDGET": 10})
-    assert not (tmp_path / "settings.json").exists()
-
-    seen = {}
-
-    def drive(created):
-        api = created["js_api"]
-        seen["methods"] = [n for n in dir(api) if not n.startswith("_")]
-        api.onboarding_finished({"ok": True, "restart_required": True})
-
-    _created, _fake = _install_fake_webview(monkeypatch, on_start=drive)
-    outcome = launcher_onboarding.present_first_run_onboarding(
-        {}, 8765, open_external_url=lambda url: {"ok": False},
-    )
-
-    # Completion, the external opener and the caption tint: none of them writes settings.
-    assert seen["methods"] == ["onboarding_finished", "open_external_url", "set_native_appearance"]
-    assert outcome == {"saved": True, "restart_required": True}
-    # The window reported completion, and the LAUNCHER still wrote nothing: the
-    # bytes on disk (if any) came from the endpoint the page posted to.
-    assert not (tmp_path / "settings.json").exists()
-
-    # With a settings file present, the ratchet still refuses the same lowering.
-    (tmp_path / "settings.json").write_text(json.dumps({"TOTAL_BUDGET": 10}), encoding="utf-8")
-    with pytest.raises(PermissionError, match="OUROBOROS_SAFETY_MODE lowering refused"):
-        cfg.save_settings({"OUROBOROS_SAFETY_MODE": "off", "TOTAL_BUDGET": 10})
 
 
-def test_the_launcher_never_authors_settings_during_first_run(monkeypatch, tmp_path):
-    """The invariant the old bridge-validation test guarded, at its new home.
-
-    Payload validation and the refusal-writes-nothing rule now belong to the
-    completion endpoint (tests/test_onboarding_complete_endpoint.py:
-    `test_subscription_alone_does_not_satisfy_the_launch_gate`). What remains
-    true HERE is stronger and simpler: presenting first-run onboarding writes
-    nothing, whatever the page does."""
-    from ouroboros import config as cfg
-    from ouroboros import launcher_onboarding
-
-    monkeypatch.setattr(cfg, "SETTINGS_PATH", tmp_path / "settings.json")
-    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
-
-    def drive(created):
-        # Nothing on the bridge can persist, so a page that tries finds no door.
-        assert not hasattr(created["js_api"], "save_wizard")
-
-    _install_fake_webview(monkeypatch, on_start=drive)
-    outcome = launcher_onboarding.present_first_run_onboarding(
-        {}, 8765, open_external_url=lambda url: {"ok": False},
-    )
-
-    assert outcome["saved"] is False
-    assert not (tmp_path / "settings.json").exists()
 
 
-def test_pre_server_normalization_never_writes_the_settings_file(monkeypatch, tmp_path):
-    """The launcher normalizes provider defaults before starting the server and
-    persists NONE of it — on a fresh install OR on an existing one.
-
-    The fresh-install half was always the rule (creating settings.json here would
-    destroy the freshness every install-time proof is gated on); the existing-install
-    half is the same objection without the carve-out. Startup is a read, and a read
-    that rewrites the file it read turns a normalization into an owner decision.
-    Nothing is lost: the normalization is applied to the environment here and
-    re-derived by every reader, and the completion save persists it."""
-    from ouroboros import config as cfg
-    from ouroboros import launcher_onboarding
-
-    monkeypatch.setattr(cfg, "SETTINGS_PATH", tmp_path / "settings.json")
-    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(launcher_onboarding, "load_settings", lambda: {})
-    applied: list = []
-    monkeypatch.setattr(launcher_onboarding, "_apply_settings_to_env", applied.append)
-    monkeypatch.setattr(
-        launcher_onboarding,
-        "apply_runtime_provider_defaults",
-        lambda settings: (dict(settings), True, ["OUROBOROS_MODEL_LIGHT"]),
-    )
-    assert not hasattr(launcher_onboarding, "save_settings"), (
-        "the launcher bound a settings writer again"
-    )
-
-    _settings, onboarding_required = launcher_onboarding.prepare_first_run_settings()
-
-    assert onboarding_required is True
-    assert len(applied) == 1, "the normalization must still reach the environment"
-    assert not (tmp_path / "settings.json").exists()
-
-    # An install that ALREADY has a settings file is not a licence to rewrite it.
-    (tmp_path / "settings.json").write_text("{}", encoding="utf-8")
-    before = (tmp_path / "settings.json").read_bytes()
-    launcher_onboarding.prepare_first_run_settings()
-    assert (tmp_path / "settings.json").read_bytes() == before
-    assert len(applied) == 2
 
 
 def test_server_boot_never_writes_the_settings_file():

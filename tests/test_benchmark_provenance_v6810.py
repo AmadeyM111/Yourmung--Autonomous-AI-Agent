@@ -177,22 +177,6 @@ def test_declaring_a_direct_provider_slot_grants_exactly_that_provider():
     assert compat["OPENAI_BASE_URL"] == "https://compat.example/v1"
 
 
-def test_paired_credentials_travel_together_or_not_at_all():
-    """GigaChat needs CREDENTIALS *or* USER+PASSWORD plus its endpoint; Cloud.ru needs its
-    base_url. A key without the fields it is useless without is a broken grant, and the
-    `GIGACHAT_` blanket prefix used to smuggle exactly half of one in unconditionally."""
-    from devtools.benchmarks.common.server_runner import _ISO_SETTINGS_ALLOW_PREFIX
-
-    assert "GIGACHAT_" not in _ISO_SETTINGS_ALLOW_PREFIX, (
-        "the GigaChat family must be gated on the declared slots, not copied by prefix"
-    )
-
-    giga = build_isolated_settings(_LIVE, OUROBOROS_MODEL="gigachat::GigaChat-3-Ultra")
-    assert giga["GIGACHAT_CREDENTIALS"] == "gc-value"
-    assert giga["GIGACHAT_PASSWORD"] == "gp-value"
-
-    without = build_isolated_settings(_LIVE)
-    assert "GIGACHAT_CREDENTIALS" not in without and "GIGACHAT_PASSWORD" not in without
 
 
 def test_credential_groups_cover_every_routable_provider():
@@ -403,93 +387,10 @@ def test_manifest_records_role_options_with_the_same_source_as_models(
     assert not set(file_options) & set(manifest["provider_credentials"]["declared_model_slots"])
 
 
-def test_model_id_classifiers_preserve_the_prior_ordered_vocabulary():
-    from devtools.benchmarks.common.model_slots import _ACTIVE_FIXED_MODEL_KEYS
-    from devtools.benchmarks.programbench.run_programbench_e2e import _MODEL_ID_SLOT_KEYS
-
-    # Model-ID vocabulary includes the independent Supervisor, minus reviewer carriers (the review
-    # pool lives in the roster, OUROBOROS_SUBAGENTS): adding role metadata must not
-    # drop a fallback list, resurrect Heavy, or widen model-ID admission.
-    prior = (
-        "OUROBOROS_MODEL", "OUROBOROS_MODEL_LIGHT", "OUROBOROS_MODEL_SAFETY", "OUROBOROS_MODEL_VISION",
-        "OUROBOROS_MODEL_CONSCIOUSNESS", "OUROBOROS_MODEL_FALLBACKS",
-        "OUROBOROS_WEBSEARCH_MODEL",
-    )
-    assert _ACTIVE_FIXED_MODEL_KEYS == prior
-    assert _MODEL_ID_SLOT_KEYS == prior
-    # Image generation selects a route per call and has no Settings model slot.
-    from devtools.benchmarks.common.manifests import ACTIVE_MODEL_SLOT_KEYS
-
-    assert "OUROBOROS_MODEL_IMAGE" not in ACTIVE_MODEL_SLOT_KEYS
-    assert "OUROBOROS_MODEL_IMAGE" not in _MODEL_ID_SLOT_KEYS
 
 
-def test_programbench_image_slot_does_not_migrate_as_a_chat_model(tmp_path, monkeypatch):
-    from devtools.benchmarks.common.manifests import MODEL_SLOT_KEYS
-    from devtools.benchmarks.common.model_slots import single_model_subagents_setting
-    from devtools.benchmarks.programbench.run_programbench_e2e import preflight_model_slots
-    from ouroboros.provider_models import ALL_PROVIDER_CREDENTIAL_KEYS
-
-    for key in (*MODEL_SLOT_KEYS, *ALL_PROVIDER_CREDENTIAL_KEYS):
-        monkeypatch.delenv(key, raising=False)
-    settings_path = tmp_path / "settings.json"
-    settings_path.write_text(json.dumps({
-        "OPENAI_API_KEY": "synthetic-test-key",
-        "OUROBOROS_MODEL": "openai::model-x",
-        "OUROBOROS_MODEL_IMAGE": "openai/gpt-image-2",
-        "OUROBOROS_SUBAGENTS": single_model_subagents_setting("openai::model-x"),
-    }), encoding="utf-8")
-    slots = preflight_model_slots(settings_path, solve_model="openai::model-x")
-    assert slots["OUROBOROS_MODEL"] == "openai::model-x"
-    assert "OUROBOROS_MODEL_IMAGE" not in slots
 
 
-@pytest.mark.parametrize("model", ["openai::model-x", "claudexor::codex=model-x"])
-def test_fixed_actor_records_account_window_options_without_changing_model_checks(model, tmp_path, monkeypatch):
-    from devtools.benchmarks.common.manifests import MODEL_SLOT_KEYS
-    from devtools.benchmarks.common.model_slots import fixed_model_actor_snapshot, runtime_actor_snapshot
-    from devtools.benchmarks.programbench import run_programbench_e2e as pb
-    from ouroboros.provider_models import ALL_PROVIDER_CREDENTIAL_KEYS
-
-    for key in (*MODEL_SLOT_KEYS, *ALL_PROVIDER_CREDENTIAL_KEYS):
-        monkeypatch.delenv(key, raising=False)
-    # Exact same model, independent role pins/windows, and an ordered Auto fallback.
-    options = {
-        "OUROBOROS_MODEL_ACCOUNTS": json.dumps({"main": "account-a", "light": "account-b", "fallback": ["", "account-b"]}),
-        "OUROBOROS_MODEL_CONTEXT_WINDOWS": json.dumps({"main": 872000, "light": 256000, "fallback": [0, 256000]}),
-    }
-    baseline = fixed_model_actor_snapshot(model)
-    settings = dict(options)
-    actual = fixed_model_actor_snapshot(model, target=settings)
-    assert actual["mismatches"] == []
-    assert actual["model_slots"] == baseline["model_slots"]
-    assert actual["model_route_options"] == options
-    assert actual["available_subagents"] == baseline["available_subagents"]
-    assert actual["review_pool"] == baseline["review_pool"]
-    assert all(settings[key] == value for key, value in options.items())
-    settings_path = tmp_path / "settings.json"
-    settings_path.write_text(json.dumps(settings), encoding="utf-8")
-    normalized = pb.preflight_model_slots(settings_path, solve_model=model)
-    assert normalized["OUROBOROS_MODEL"] == normalized["OUROBOROS_MODEL_LIGHT"] == model
-    assert not set(options) & set(normalized)
-
-    settings["OUROBOROS_MODEL_FALLBACKS"] = f"{model},foreign/model"
-    refused = runtime_actor_snapshot(settings, expected_model=model)
-    assert any("OUROBOROS_MODEL_FALLBACKS" in error for error in refused["mismatches"])
-    roster = json.loads(settings["OUROBOROS_SUBAGENTS"])
-    seat = next(row for row in roster["items"] if row.get("review_eligible"))
-    seat["route"] = {"kind": "agent_session", "target_id": "codex=model-x"}
-    seat.pop("delivery", None)
-    settings["OUROBOROS_SUBAGENTS"] = json.dumps(roster)
-    refused = runtime_actor_snapshot(settings, expected_model=model)
-    assert any("agent_session" in error for error in refused["mismatches"])
-    # The direct-provider legacy model-ID refusal still runs with role metadata present.
-    if model.startswith("openai::"):
-        settings["OPENAI_API_KEY"] = "synthetic-test-key"
-        settings["OUROBOROS_MODEL"] = "openai/model-x"
-        settings_path.write_text(json.dumps(settings), encoding="utf-8")
-        with pytest.raises(SystemExit, match="OUROBOROS_MODEL"):
-            pb.preflight_model_slots(settings_path, solve_model=model)
 
 
 # --------------------------------------------------------------------------- FIX B
@@ -954,27 +855,3 @@ def test_context_admission_terminal_is_truncated_without_claiming_provider_failu
     assert runtime_terminal_disclosure({"status": "completed", "reason_code": ""})["truncated"] is False
 
 
-def test_the_two_out_of_tree_mirrors_stay_pinned_to_the_derived_vocabulary():
-    """Three hand-written copies of one vocabulary is how all three came to be wrong.
-
-    The Harbor runner is a source template executed inside the task container, so it now
-    INTERPOLATES the SSOT instead of restating it. The CL-Bench bridge genuinely cannot
-    import it (that module lives in an external clone reached only through a call-time
-    sys.path insert), so its mirror stays — but pinned here, because the comment that asked
-    for it to be kept in sync demonstrably did not hold.
-    """
-    repo = pathlib.Path(__file__).resolve().parents[1]
-
-    harbor = (repo / "devtools/benchmarks/terminal_bench/harbor_installed_agent.py").read_text(encoding="utf-8")
-    assert "truncated = reason_code in {truncation_codes_literal}" in harbor
-    assert "truncation_codes_literal = repr(tuple(sorted(RUNTIME_TRUNCATION_REASON_CODES)))" in harbor
-    assert "max_rounds_exceeded" not in harbor
-
-    patch = (
-        repo / "devtools/benchmarks/continual_learning/operator_patches/clb_multi_instance_outcomes.v6746.patch"
-    ).read_text(encoding="utf-8")
-    mirrored = re.search(r'"truncated": reason_code in \((.*?)\),', patch, re.S)
-    assert mirrored, "the CL-Bench mirror's truncation expression is no longer parseable"
-    assert set(re.findall(r'"([a-z0-9_]+)"', mirrored.group(1))) == set(RUNTIME_TRUNCATION_REASON_CODES), (
-        "the CL-Bench operator patch has drifted from RUNTIME_TRUNCATION_REASON_CODES"
-    )

@@ -19,31 +19,6 @@ def source(call_id="read", text="exact evidence " * 500):
         {"role": "tool", "tool_call_id": call_id, "content": text}]
 
 
-@pytest.mark.parametrize("dialect", ["function", "custom", "native", "gigachat", "claudexor"])
-def test_complete_source_survives_real_transport_syntax(dialect):
-    from ouroboros.llm import LLMClient
-
-    canonical = source()
-    client = LLMClient.__new__(LLMClient)
-    if dialect == "custom":
-        from ouroboros.openai_chat_custom import project_function_tools_to_openai_custom, project_messages_for_openai_custom
-        catalog = project_function_tools_to_openai_custom([{"type": "function", "function": {
-            "name": "read_file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}])
-        physical = project_messages_for_openai_custom(canonical, catalog)
-    elif dialect == "native":
-        _system, physical = client._build_anthropic_messages(canonical)
-    elif dialect == "gigachat":
-        physical = client._gigachat_messages(canonical)
-    elif dialect == "claudexor":
-        from ouroboros.llm_messages import project_declared_system_prefix
-        physical = project_declared_system_prefix({"provider": "claudexor"}, canonical)
-    else:
-        physical = canonical
-    unit = cc._atomic_units(canonical)[0]
-    assert cc.exposed_context_units(canonical, physical) == ({"unit_id": unit.unit_id, "raw_sha256": unit.raw_sha256},)
-    altered = copy.deepcopy(canonical)
-    altered[1]["content"] = "a new result reusing the same call id"
-    assert cc.exposed_context_units(altered, physical) == ()
 
 
 def test_unexposed_new_result_is_not_folded_by_an_exposure_bound_view(tmp_path):

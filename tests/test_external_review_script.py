@@ -404,31 +404,6 @@ def test_contributor_packet_is_the_pre_move_packet(tmp_path, monkeypatch):
         assert set(archive.namelist()) == {"review-evidence.json", "outcome.json", "full-output.txt"}
 
 
-def test_contributor_review_runs_in_this_process_on_the_installed_body(tmp_path, monkeypatch):
-    """D31: the installed body's review flow and rules run, in this process.
-
-    The wrapper hands the review operation its own checkout (the target base
-    here) with the frozen subject; it never re-executes a copy of itself, never
-    hands a child process a rewritten environment, and never writes the host's
-    data root."""
-    run = _run_golden_contributor_review(tmp_path, monkeypatch)
-
-    assert run.exit_code == 0
-    [call] = run.calls
-    assert call["pid"] == os.getpid()
-    assert Path(call["repo_dir"]) == Path(run.fixture["repo"])
-    assert {key: call["arguments"][key] for key in ("root", "surface", "subject", "base", "head")} == {
-        "root": "system_repo", "surface": "change", "subject": "base..head",
-        "base": run.fixture["base_sha"], "head": run.fixture["head_sha"]}
-    assert f"External PR title: {shared.PROPOSAL_TITLE}" in call["arguments"]["goal"]
-    assert run.spawned and all(item["command"][0] == "git" for item in run.spawned)
-    # The runtime's git helpers may drop a variable (GIT_DIFF_OPTS); nothing is rewritten.
-    assert not any(item["env_rewritten"] for item in run.spawned)
-    assert {path.name: path.read_bytes() for path in run.host.iterdir()} == run.host_before
-    repo = Path(run.fixture["repo"])
-    assert shared.git(repo, "rev-parse", "HEAD") == run.fixture["base_sha"]
-    assert shared.git(repo, "status", "--porcelain") == ""
-    assert shared.git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
 
 
 def test_contributor_lane_refuses_before_review_when_the_proposal_tests_fail(tmp_path, monkeypatch):

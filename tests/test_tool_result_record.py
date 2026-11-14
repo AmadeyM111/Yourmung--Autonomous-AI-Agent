@@ -86,56 +86,6 @@ def test_absent_process_exit_and_absent_outcome_are_not_success():
     assert timeout["facts"]["timed_out"] is True and "killed_by_host" not in timeout["facts"]
 
 
-@pytest.mark.parametrize("provider", ["openai", "openrouter", "local", "anthropic", "gigachat", "claudexor"])
-def test_actual_provider_builders_remove_only_host_row_metadata(monkeypatch, provider):
-    from ouroboros.llm import LLMClient
-
-    messages = transcript()
-    original = copy.deepcopy(messages)
-    client = LLMClient.__new__(LLMClient)
-    if provider in {"openai", "openrouter"}:
-        payload = client._build_remote_kwargs(
-            {"provider": provider, "resolved_model": "fixture-model",
-             "supports_openrouter_extensions": provider == "openrouter"},
-            messages, "max", 64, "auto", None, None, skip_capability_fetch=True,
-        )
-        sent = payload["messages"]
-    elif provider == "local":
-        monkeypatch.setattr("ouroboros.local_model.get_manager", lambda: SimpleNamespace(serving_context_evidence=lambda: {}))
-        _, payload = client._build_local_candidate(messages, None, 64, "auto")  # never cut (#1018)
-        sent = payload["messages"]
-    elif provider == "anthropic":
-        _, sent = client._build_anthropic_messages(messages)
-    elif provider == "gigachat":
-        sent = client._gigachat_messages(messages)
-    else:
-        from ouroboros import config
-        from ouroboros.llm_claudexor import ModelTurnState, _request
-
-        monkeypatch.setattr("ouroboros.llm_claudexor.owned_engine_version",
-                            lambda: config.CLAUDEXOR_MODEL_TURN_STATE_MIN_VERSION)
-        opaque = {"route": {"source": "codex", "model": "fixture-model"}, KEY: {KEY: "native value"}}
-        slot = ModelTurnState(opaque)
-        payload = _request(
-            {"provider": "claudexor", "source": "codex", "resolved_model": "fixture-model"},
-            messages, None, {"model_account_override": "", "model_turn_state": slot,
-                             "prospective": True, "_no_account_preference": True},
-        )
-        assert payload["nativeContinuation"] == opaque == slot.envelope
-        sent = payload["messages"]
-    assert all(KEY not in row for row in sent)
-    assert messages == original and read_tool_result_record(messages[-1])["facts"]["exit_code"] == 17
-    if provider == "anthropic":
-        assert sent[1]["content"][-1]["input"][KEY] == "ordinary user argument"
-        assert sent[2]["content"][0]["content"] == messages[-1]["content"]
-    elif provider == "gigachat":
-        assert sent[1]["function_call"]["arguments"][KEY] == "ordinary user argument"
-        assert json.loads(sent[-1]["content"])["result"] == messages[-1]["content"]
-    else:
-        assert sent[1]["tool_calls"] == messages[1]["tool_calls"]
-        assert sent[-1]["content"] == messages[-1]["content"]
-        if provider == "openrouter":
-            assert sent[1]["reasoning_details"] == messages[1]["reasoning_details"]
 
 
 def test_physical_backstop_preserves_nested_opaque_keys_and_model_switch_keeps_record():

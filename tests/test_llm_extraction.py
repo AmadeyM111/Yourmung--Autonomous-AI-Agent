@@ -15,7 +15,6 @@ from ouroboros import (
     llm_capability_policy,
     llm_claudexor,
     llm_fallback,
-    llm_gigachat,
     llm_local,
     llm_messages,
     llm_openai_compatible,
@@ -43,7 +42,6 @@ _LEAVES = (
     llm_messages,
     llm_fallback,
     llm_anthropic,
-    llm_gigachat,
     llm_local,
     llm_openai_compatible,
     llm_pricing,
@@ -113,10 +111,6 @@ _MIXIN_OWNERS = {
         "_coalesce_anthropic_message _normalize_anthropic_response "
         "_sanitize_anthropic_tool_result_content _stringify_anthropic_content"
     ),
-    (llm_gigachat, "_GigaChatLaneMixin"): (
-        "_chat_gigachat _get_gigachat_client _gigachat_function_result _gigachat_messages "
-        "_gigachat_text _new_gigachat_client _normalize_gigachat_response"
-    ),
 
     (llm_local, "_LocalLaneMixin"): "_chat_local _build_local_candidate _finalize_local_candidate",
     (llm_openai_compatible, "_OpenAICompatibleLaneMixin"): (
@@ -131,7 +125,6 @@ _PARENT_MEMBERS = frozenset({
     "__init__", "chat", "chat_async", "vision_query", "default_model",
     "available_models", "_strip_reasoning_wrappers", "_parse_tool_calls_from_content",
     "_stringify_tool_description", "_sanitize_chat_completion_tools", "_build_anthropic_tools",
-    "_gigachat_sanitize_schema", "_gigachat_functions",
 })
 
 
@@ -232,7 +225,7 @@ def test_llm_client_member_inventory_is_unchanged():
     assert hashlib.sha256(
         json.dumps(composed, separators=(",", ":")).encode()
 
-    ).hexdigest() == "649ce387a5e259fcc9835b4bd52b56b8a867ce2595eeae3ac33308abc1a7795f"
+    ).hexdigest() == "9b3971066defa007aefdf711db4b585b1577b64b90b75d24d914c5d30feb8aa3"
     for name in composed:
         assert hasattr(LLMClient, name), name
 
@@ -246,7 +239,6 @@ def test_llm_mixin_composition_order_is_pinned():
         "_MessageShapingMixin",
         "_RecoveryLadderMixin",
         "_AnthropicLaneMixin",
-        "_GigaChatLaneMixin",
         "_LocalLaneMixin",
         "_OpenAICompatibleLaneMixin",
         "object",

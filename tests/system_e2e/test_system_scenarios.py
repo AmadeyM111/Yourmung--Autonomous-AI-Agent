@@ -373,20 +373,6 @@ def test_f21_keyless_settings_pin_every_slot_and_refuse_credentials():
         assert_settings_keyless({**cfg, "OPENAI_COMPATIBLE_BASE_URL": "https://api.example.com/v1"})
 
 
-def test_f21_projected_provider_family_credentials_default_empty():
-    """The carve-out S3's name pin relies on can never legitimise a secret: the server
-    projects settings ∪ ``SETTINGS_DEFAULTS`` into its children, so a credential-shaped
-    member of the stripped provider family that is projected (``settings_env_keys``)
-    must ship an EMPTY default — a keyless file then projects only endpoint fields
-    (base URLs, scope, TLS flag), never a key. Credential shape comes from the
-    harness's own regex over the family it strips, not from a hand list."""
-    projected_family = STRIPPED_PROVIDER_ENV_KEYS & set(settings_env_keys())
-    credential_shaped = sorted(k for k in projected_family if _CREDENTIAL_SHAPE_RE.search(k))
-    # The derivation must see the canonical credentials, or an empty set passes vacuously.
-    assert {"ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "GIGACHAT_CREDENTIALS",
-            "CLOUDRU_FOUNDATION_MODELS_API_KEY"} <= set(credential_shaped), credential_shaped
-    non_empty = [k for k in credential_shaped if str(SETTINGS_DEFAULTS.get(k) or "").strip()]
-    assert not non_empty, f"credential-shaped provider keys ship a non-empty default: {non_empty}"
 
 
 def test_keyless_review_catalog_parses_under_the_trees_own_parser(monkeypatch):

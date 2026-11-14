@@ -67,9 +67,6 @@ from ouroboros.llm_capability_policy import (
 from ouroboros.llm_fallback import (
     _RecoveryLadderMixin,  # noqa: F401
 )
-from ouroboros.llm_gigachat import (
-    _GigaChatLaneMixin,  # noqa: F401
-)
 from ouroboros.context_budget import estimate_message_chars as _estimate_message_chars  # noqa: F401 -- the historical private name
 from ouroboros.llm_local import (
     _LocalLaneMixin,  # noqa: F401
@@ -147,7 +144,6 @@ class LLMClient(
     _MessageShapingMixin,
     _RecoveryLadderMixin,
     _AnthropicLaneMixin,
-    _GigaChatLaneMixin,
     _LocalLaneMixin,
     _OpenAICompatibleLaneMixin,
 ):
@@ -168,7 +164,6 @@ class LLMClient(
         self._local_port: Optional[int] = None
         self._remote_clients: Dict[Tuple[str, str, str, Tuple[Tuple[str, str], ...]], Any] = {}
         self._async_remote_clients: Dict[Tuple[str, str, str, Tuple[Tuple[str, str], ...]], Any] = {}
-        self._gigachat_clients: Dict[Tuple[str, str, str, str, str, bool], Any] = {}
 
     @caller_deadline_scoped
     @model_waitable
@@ -204,7 +199,7 @@ class LLMClient(
 
         ``response_format`` (e.g. ``{"type": "json_object"}``) is optional request
         intent on the OpenAI-compatible/OpenRouter lanes: local, Anthropic-native,
-        and GigaChat routes ignore it, and a provider rejection strips it via the
+        and some routes ignore it, and a provider rejection strips it via the
         optional-parameter retry — callers must keep a text-parse fallback.
 
         ``default_temperature`` is a host hint, unlike explicit ``temperature``.
@@ -341,18 +336,6 @@ class LLMClient(
                     target, messages, tools, reasoning_effort,
                     max_tokens, tool_choice, temperature, no_proxy, timeout,
                     **({"stream": True} if stream else {}),
-                )
-            result[1]["ledger_attempt_ids"] = list(attempt_ids)
-            return result
-        if target.get("provider") == "gigachat":
-            if tools:
-                raise ValueError("chat_async does not support GigaChat tool calls")
-            # The gigachat library client is synchronous; offload to a thread
-            # like the Anthropic path so the event loop is never blocked.
-            with capture_attempt_ids() as attempt_ids:
-                result = await asyncio.to_thread(
-                    self._chat_gigachat, target, messages, tools, reasoning_effort,
-                    max_tokens, tool_choice, temperature, no_proxy,
                 )
             result[1]["ledger_attempt_ids"] = list(attempt_ids)
             return result
@@ -557,62 +540,6 @@ class LLMClient(
             description_normalizer=LLMClient._stringify_tool_description,
             on_drop=_warn,
         )
-
-    @staticmethod
-    def _gigachat_sanitize_schema(node: Any) -> Any:
-        """Make a JSON-Schema node acceptable to GigaChat's stricter validator.
-
-        GigaChat rejects any ``"type": "object"`` node that lacks a ``properties``
-        key with HTTP 422 ("Field is missing"), whereas OpenAI/JSON-Schema allow a
-        free-form object. Recursively ensure every object node carries
-        ``properties`` (default ``{}``), descending through ``properties`` values,
-        array ``items``, ``additionalProperties``, and ``anyOf``/``oneOf``/``allOf``.
-        ``cache_control`` markers are dropped wherever they appear.
-        """
-        if isinstance(node, list):
-            return [LLMClient._gigachat_sanitize_schema(v) for v in node]
-        if not isinstance(node, dict):
-            return node
-        out: Dict[str, Any] = {}
-        for key, value in node.items():
-            if key == "cache_control":
-                continue
-            if key == "properties" and isinstance(value, dict):
-                out[key] = {
-                    pk: LLMClient._gigachat_sanitize_schema(pv) for pk, pv in value.items()
-                }
-            elif key in ("items", "additionalProperties") and isinstance(value, (dict, list)):
-                out[key] = LLMClient._gigachat_sanitize_schema(value)
-            elif key in ("anyOf", "oneOf", "allOf") and isinstance(value, list):
-                out[key] = [LLMClient._gigachat_sanitize_schema(v) for v in value]
-            else:
-                out[key] = value
-        if out.get("type") == "object" and "properties" not in out:
-            out["properties"] = {}
-        return out
-
-    @staticmethod
-    def _gigachat_functions(
-        tools: Optional[List[Dict[str, Any]]],
-    ) -> List[Dict[str, Any]]:
-        """Convert OpenAI tool definitions to GigaChat ``functions`` entries."""
-        functions: List[Dict[str, Any]] = []
-        for tool in tools or []:
-            if not isinstance(tool, dict):
-                continue
-            fn = tool.get("function") if "function" in tool else tool
-            fn = fn or {}
-            name = str(fn.get("name") or "").strip()
-            if not name:
-                continue
-            entry: Dict[str, Any] = {"name": name}
-            if fn.get("description"):
-                entry["description"] = str(fn["description"])
-            params = fn.get("parameters")
-            if isinstance(params, dict):
-                entry["parameters"] = LLMClient._gigachat_sanitize_schema(params)
-            functions.append(entry)
-        return functions
 
     def vision_query(
         self,

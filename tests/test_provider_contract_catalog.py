@@ -84,22 +84,3 @@ def test_root_combinator_failure_names_tool_and_keyword(keyword):
         assert_portable_tool_schemas(bad)
 
 
-def test_every_physical_provider_projection_preserves_the_complete_name_set():
-    from ouroboros.llm import LLMClient
-    from ouroboros.openai_chat_custom import project_function_tools_to_openai_custom
-
-    canonical = shipped_builtin_tool_schemas()
-    expected = set(_function_names(canonical))
-
-    openrouter_function = LLMClient._sanitize_chat_completion_tools(canonical)
-    anthropic = LLMClient._build_anthropic_tools(canonical)
-    gigachat = LLMClient._gigachat_functions(canonical)
-    openai_custom = project_function_tools_to_openai_custom(openrouter_function)
-
-    assert set(_function_names(openrouter_function)) == expected
-    assert {tool["name"] for tool in anthropic} == expected
-    assert {tool["name"] for tool in gigachat} == expected
-    assert set(openai_custom.tool_names) == expected
-    assert {
-        tool["custom"]["name"] for tool in openai_custom.wire_tools()
-    } == expected

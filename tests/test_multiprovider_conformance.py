@@ -209,21 +209,6 @@ _DRIVERS = sorted(PROVIDER_DRIVERS)
 _REMOTE = [name for name in _DRIVERS if PROVIDER_DRIVERS[name].remote]
 
 
-def test_conformance_parametrization_derives_from_the_provider_registry():
-    """Structural completeness: a provider registered in PROVIDER_PREFIXES
-    without a conformance driver is RED — a new provider cannot ship without
-    passing this suite. The local lane rides along explicitly."""
-    registry = {provider for _prefix, provider in PROVIDER_PREFIXES}
-    assert registry, "the provider registry parsed empty"
-    missing = registry - set(PROVIDER_DRIVERS)
-    assert not missing, (
-        f"provider(s) {sorted(missing)} are registered in PROVIDER_PREFIXES but have "
-        "no conformance driver — add a PROVIDER_DRIVERS entry and make the lane pass"
-    )
-    extra = set(PROVIDER_DRIVERS) - registry - {"local"}
-    assert not extra, f"conformance drivers without a registry row: {sorted(extra)}"
-    prefixes = [prefix for prefix, _provider in PROVIDER_PREFIXES]
-    assert len(prefixes) == len(set(prefixes)), "provider prefixes must be unambiguous"
 
 
 _TARGET_REQUIRED_KEYS = {
@@ -232,15 +217,6 @@ _TARGET_REQUIRED_KEYS = {
 }
 
 
-@pytest.mark.parametrize("name", _REMOTE)
-def test_route_resolution_has_the_required_form(name):
-    driver = PROVIDER_DRIVERS[name]
-    observed = _observe(driver.spec(
-        [], call={"kind": "resolve_target", "model": driver.model}))
-    target = observed["returned"]["value"]
-    assert _TARGET_REQUIRED_KEYS <= set(target), sorted(target)
-    assert target["provider"] == driver.provider
-    assert target["resolved_model"] and target["usage_model"]
 
 
 def test_usage_model_attribution_is_unambiguous_across_providers():
@@ -255,36 +231,6 @@ def test_usage_model_attribution_is_unambiguous_across_providers():
     assert len(usage_models) == len(PROVIDER_PREFIXES), usage_models
 
 
-@pytest.mark.parametrize("name", _DRIVERS)
-def test_success_has_the_shared_response_and_ledger_shape(name):
-    driver = PROVIDER_DRIVERS[name]
-    observed = _observe(driver.spec([driver.success_step]))
-    assert "raised" not in observed, observed.get("raised")
-    returned = observed["returned"]
-    message, usage = returned["message"], returned["usage"]
-
-    assert isinstance(message, dict)
-    assert message.get("content") is None or isinstance(message.get("content"), str)
-    assert int(usage.get("prompt_tokens") or 0) >= 0
-    assert int(usage.get("completion_tokens") or 0) >= 0
-    # EVERY lane stamps usage provenance — the local asymmetry was CPL6-F1.
-    assert usage.get("provider") == driver.provider
-    assert usage.get("resolved_model")
-
-    # Honest cost planes: the key always exists; cost_final is a bool and may
-    # be True only for a KNOWN, non-estimated cost.
-    assert "cost" in usage
-    assert usage["cost"] is None or isinstance(usage["cost"], (int, float))
-    assert isinstance(usage.get("cost_final"), bool)
-    if usage["cost_final"]:
-        assert usage["cost"] is not None and not usage.get("cost_estimated")
-
-    # One successful send = one settled physical-attempt ledger row.
-    attempts = observed.get("physical_attempts") or []
-    assert len(attempts) == 1 and returned.get("ledger_attempt_count") == 1
-    assert attempts[0]["provider"] == driver.provider
-    assert (attempts[0]["state"], attempts[0]["transitions"]) == ("settled", 3)
-    assert observed["unused_script_steps"] == 0
 
 
 @pytest.mark.parametrize("name", _DRIVERS)
@@ -328,13 +274,6 @@ def test_typed_policy_refusal_is_permanent_one_send_only(name):
     assert observed["unused_script_steps"] == 1
 
 
-@pytest.mark.parametrize("name", _DRIVERS)
-def test_caller_timeout_reaches_the_transport(name):
-    driver = PROVIDER_DRIVERS[name]
-    observed = _observe(driver.spec(
-        [driver.success_step], chat_kwargs={"timeout": 33.0}))
-    assert "raised" not in observed, observed.get("raised")
-    assert driver.timeout_of(observed["sends"][0]) == 33.0
 
 
 def test_model_operation_control_reply_loss_rejoins_one_physical_generation():

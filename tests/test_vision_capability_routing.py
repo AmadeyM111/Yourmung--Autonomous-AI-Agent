@@ -27,28 +27,6 @@ def recorded(monkeypatch, tmp_path):
     ], source="OpenRouter /models")
 
 
-def test_resolve_vlm_model_follows_route_evidence_not_names(recorded, monkeypatch):
-    from ouroboros.tools import vision as V
-    client = object()
-    monkeypatch.setenv("OUROBOROS_MODEL_VISION", "")
-    # An explicit model is called even when its metadata says no (owner decision).
-    assert V._resolve_vlm_model(client, TEXT_ONLY) == TEXT_ONLY
-    assert V._resolve_vlm_model(client, "acme/never-listed-1") == "acme/never-listed-1"
-
-    # No explicit model: a confirmed yes first, then an unknown; a confirmed no is skipped.
-    monkeypatch.setattr(
-        V, "_vision_capable_slot_candidates",
-        lambda c, ctx=None: [TEXT_ONLY, "acme/never-listed-1", SEES],
-    )
-    assert V._resolve_vlm_model(client, "", ctx=SimpleNamespace()) == SEES
-    monkeypatch.setattr(V, "_vision_capable_slot_candidates",
-                        lambda c, ctx=None: [TEXT_ONLY, "acme/never-listed-1"])
-    assert V._resolve_vlm_model(client, "", ctx=SimpleNamespace()) == "acme/never-listed-1"
-
-    # Every candidate confirmed unable -> "" so the caller surfaces VLM_NO_VISION_MODEL.
-    monkeypatch.setattr(V, "_vision_capable_slot_candidates",
-                        lambda c, ctx=None: [TEXT_ONLY, "gigachat::GigaChat-2-Max"])
-    assert V._resolve_vlm_model(client, "", ctx=SimpleNamespace()) == ""
 
 
 def test_slot_candidates_prefer_active_then_light_dedup(monkeypatch):

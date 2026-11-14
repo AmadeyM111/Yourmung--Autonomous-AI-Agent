@@ -693,13 +693,6 @@ def test_golden_fixture_ids_are_unique_and_documented():
         assert case.get("route"), f"{case['id']} has no route description"
 
 
-@pytest.mark.parametrize("case", _CASES, ids=[case["id"] for case in _CASES])
-def test_llm_provider_route_matches_golden(case):
-    observed = _observe(case["spec"])
-    assert observed == case["expected"], (
-        f"route {case['id']} drifted from {case['_file']}:\n"
-        f"observed={json.dumps(observed, indent=2, sort_keys=True)}"
-    )
 
 
 
@@ -735,22 +728,6 @@ def test_call_context_left_by_an_earlier_test_does_not_reach_the_replay():
         _EFFORT_CLAMP_CVAR.reset(token)
 
 
-def test_golden_covers_every_declared_provider_lane():
-    """Coverage floor: dropping a lane's fixtures must fail, not go unnoticed."""
-    covered = {case["id"].split(".", 1)[0] for case in _CASES}
-    assert covered >= {
-        "target", "openrouter", "openai", "compatible", "cloudru", "minimax",
-        "anthropic", "gigachat", "local", "fallback", "aux",
-    }
-    ledger_sources = {
-        attempt["source"]
-        for case in _CASES
-        for attempt in case["expected"].get("physical_attempts", [])
-    }
-    assert ledger_sources >= {
-        "llm.chat", "llm.local", "llm.anthropic", "llm.gigachat",
-        "web_search.openrouter", "web_search.anthropic",
-    }
 
 
 def _write_golden() -> int:

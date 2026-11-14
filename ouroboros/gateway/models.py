@@ -18,7 +18,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ouroboros.config import load_settings
-from ouroboros.net_transport import ExtraCaBundleError, extra_ca_bundle, verify_kwargs
+from ouroboros.net_transport import ExtraCaBundleError, verify_kwargs
 from ouroboros.gateway._helpers import json_error, json_exception
 from ouroboros.observability import redact_projection
 from ouroboros.provider_connections import (
@@ -199,50 +199,6 @@ async def _fetch_anthropic_model_catalog(
     return models
 
 
-async def _fetch_gigachat_model_catalog(
-    credentials: str,
-    scope: str,
-    base_url: str,
-    verify_ssl_certs: bool,
-    user: str = "",
-    password: str = "",
-) -> list[dict[str, str]]:
-    """List GigaChat models via the `gigachat` library (not OpenAI-compatible).
-
-    Auth is either an authorization key (OAuth) or user/password. Uses the
-    library's native async client so no blocking call / thread offload is needed
-    (the catalog loader stays fully async and fork-safe). Failures propagate to
-    the loader, which degrades gracefully per-provider.
-    """
-    from gigachat import GigaChatAsyncClient
-
-    kwargs: dict = {"scope": scope or "GIGACHAT_API_PERS", "verify_ssl_certs": verify_ssl_certs}
-    bundle = extra_ca_bundle()
-    if bundle:
-        kwargs["ca_bundle_file"] = bundle
-    if credentials:
-        kwargs["credentials"] = credentials
-    if user:
-        kwargs["user"] = user
-    if password:
-        kwargs["password"] = password
-    if base_url:
-        kwargs["base_url"] = base_url
-
-    async with GigaChatAsyncClient(**kwargs) as client:
-        result = await client.aget_models()
-
-    entries: list[dict[str, str]] = []
-    for model in getattr(result, "data", None) or []:
-        model_id = str(getattr(model, "id_", "") or "").strip()
-        if not model_id:
-            continue
-        entries.append(
-            _build_model_catalog_entry("gigachat", "GigaChat", model_id, model_id)
-        )
-    return entries
-
-
 # The catalog label of each kind's built-in items (OpenRouter items carry their vendor).
 _CATALOG_LABELS = {"openai": "OpenAI", "minimax": "MiniMax", "deepseek": "DeepSeek", "zai": "Z.ai (GLM)",
                    "openai-compatible": "OpenAI Compatible", "cloudru": "Cloud.ru"}
@@ -255,11 +211,6 @@ def _connection_loader(kind: str, target: dict, record_image_input: bool):
         return lambda client: _fetch_openrouter_model_catalog(client, key)
     if kind == "anthropic":
         return lambda client: _fetch_anthropic_model_catalog(client, key, record_image_input=record_image_input)
-    if kind == "gigachat":
-        # GigaChat isn't OpenAI-compatible; the loader ignores the shared httpx
-        # client and uses the gigachat library directly (auth via key or basic).
-        return lambda _client: _fetch_gigachat_model_catalog(
-            key, target["scope"], base, target["verify_ssl_certs"], target["user"], target["password"])
     # MiniMax, DeepSeek, Z.ai, Cloud.ru and every compatible server serve an
     # OpenAI-compatible GET /models on the connection's own endpoint.
     record = {"record_image_input": True} if record_image_input and kind in {"deepseek", "openai-compatible"} else {}

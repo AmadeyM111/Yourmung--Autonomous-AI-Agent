@@ -197,20 +197,6 @@ def _kind_target(provider: str, get: Any, connection: str, configured: Any, *,
         return {"api_key": get("api_key", ""),
                 "base_url": (get("base_url", "") or "").strip() or "https://foundation-models.api.cloud.ru/v1",
                 "default_headers": {}, **_DIRECT_LANE}
-    if provider == "gigachat":
-        # GigaChat is NOT OpenAI-compatible — the `gigachat` library owns the transport
-        # and auth: `api_key` holds the authorization key (base64 client_id:secret) for
-        # the OAuth flow, OR user/password for basic auth against an internal endpoint.
-        # base_url/scope/verify are carried for the `_chat_gigachat` path.
-        verify = get("verify_ssl_certs", "")
-        verify_raw = ("" if verify is None else str(verify)).strip().lower()
-        return {
-            "api_key": get("credentials", ""), "user": (get("user", "") or "").strip(),
-            "password": get("password", "") or "",
-            "base_url": (get("base_url", "") or "").strip() or "https://api.giga.chat/v1",
-            "scope": (get("scope", "") or "").strip() or "GIGACHAT_API_PERS",
-            "verify_ssl_certs": verify_raw not in ("0", "false", "no", "off"), "default_headers": {}, **_DIRECT_LANE,
-        }
     if provider == "openai-compatible":
         if connection:
             api_key, base_url = str(get("api_key", "") or "").strip(), str(get("base_url", "") or "").strip()
@@ -261,7 +247,7 @@ class _ProviderRoutingMixin:
         accepts every format. Explicit unsupported Claudexor intent still refuses.
         """
         provider, _model = cls._parse_provider_model(model)
-        return not use_local and provider not in {"claudexor", "anthropic", "gigachat"}
+        return not use_local and provider not in {"claudexor", "anthropic"}
 
     @request_wire_scoped
     def _chat_remote(
@@ -310,13 +296,6 @@ class _ProviderRoutingMixin:
                 no_proxy=no_proxy,
                 timeout=timeout,
                 **({"stream": True} if stream else {}),
-            )
-
-        if target.get("provider") == "gigachat":
-            return self._chat_gigachat(
-                target, messages, tools, reasoning_effort, max_tokens, tool_choice, temperature,
-                no_proxy=no_proxy,
-                timeout=timeout,
             )
 
         if no_proxy:
@@ -487,7 +466,7 @@ class _ProviderRoutingMixin:
             return resolved_model
         if provider == "claudexor":
             return f"claudexor::{resolved_model}"
-        known = provider in {"openai", "anthropic", "cloudru", "gigachat", "minimax", "deepseek", "zai"}
+        known = provider in {"openai", "anthropic", "cloudru", "minimax", "deepseek", "zai"}
         return f"{provider if known else 'openai-compatible'}/{resolved_model}"
 
     def _resolve_remote_target(

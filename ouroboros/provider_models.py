@@ -136,11 +136,6 @@ PROVIDER_KINDS: dict[str, KindSpec] = {
     "cloudru": KindSpec("Cloud.ru Foundation Models", (
         ("api_key", "CLOUDRU_FOUNDATION_MODELS_API_KEY", True),
         ("base_url", "CLOUDRU_FOUNDATION_MODELS_BASE_URL", False))),
-    "gigachat": KindSpec("GigaChat", (
-        ("credentials", "GIGACHAT_CREDENTIALS", True), ("user", "GIGACHAT_USER", False),
-        ("password", "GIGACHAT_PASSWORD", True), ("base_url", "GIGACHAT_BASE_URL", False),
-        ("scope", "GIGACHAT_SCOPE", False), ("verify_ssl_certs", "GIGACHAT_VERIFY_SSL_CERTS", False)),
-        ready=(("credentials",), ("user", "password"))),
     # An empty key is a keyless endpoint; the endpoint itself is what configures it.
     "openai-compatible": KindSpec("OpenAI-compatible endpoint", (
         ("api_key", "OPENAI_COMPATIBLE_API_KEY", True),
@@ -547,15 +542,6 @@ CLOUDRU_DIRECT_DEFAULTS = {
     "fallback": "cloudru::zai-org/GLM-4.7",
 }
 
-GIGACHAT_DIRECT_DEFAULTS = {
-    # Ultra is available only to individuals in Freemium. GigaChat 2 Max is
-    # available to personal and legal-entity paid plans as well, so it is the
-    # strongest current default that does not strand B2B/CORP installs.
-    "main": "gigachat::GigaChat-2-Max",
-    "heavy": "gigachat::GigaChat-2-Max",
-    "light": "gigachat::GigaChat-2-Max",
-    "fallback": "gigachat::GigaChat-2-Max",
-}
 
 MINIMAX_DIRECT_DEFAULTS = {
     "main": "minimax::MiniMax-M3",
@@ -614,7 +600,6 @@ DIRECT_PROVIDER_DEFAULTS = {
     "openai": OPENAI_DIRECT_DEFAULTS,
     "anthropic": ANTHROPIC_DIRECT_DEFAULTS,
     "cloudru": CLOUDRU_DIRECT_DEFAULTS,
-    "gigachat": GIGACHAT_DIRECT_DEFAULTS,
     "minimax": MINIMAX_DIRECT_DEFAULTS,
     "deepseek": DEEPSEEK_DIRECT_DEFAULTS,
     "zai": ZAI_DIRECT_DEFAULTS,
@@ -630,7 +615,6 @@ DIRECT_PROVIDER_REVIEW_ROLES = {
     "openai": ("main",),
     "anthropic": ("main",),
     "cloudru": ("main",),
-    "gigachat": ("main",),
     "minimax": ("main", "light", "light"),
     "deepseek": ("main",),
     "zai": ("main",),
@@ -740,7 +724,7 @@ def compatible_only_main_model(settings: Mapping[str, Any]) -> str:
 # A built-in connection's endpoint as Capability Evidence fingerprints it, byte for byte
 # what stored window evidence and owner acknowledgements were filed under: none for the
 # fixed-endpoint kinds, the saved endpoint for these, the region/plan endpoint for MiniMax/Z.ai.
-_FINGERPRINT_ENDPOINT_FIELD = {"openai-compatible": "base_url", "cloudru": "base_url", "gigachat": "base_url"}
+_FINGERPRINT_ENDPOINT_FIELD = {"openai-compatible": "base_url", "cloudru": "base_url"}
 
 
 def capability_base_url(model: str, settings: Mapping[str, Any] | None = None) -> str:

@@ -227,7 +227,7 @@ def infer_api_key_type(model: str, provider: Optional[str] = None) -> str:
     ``claudexor`` is explicit route evidence (#1578): a session's seat or observed
     model text never relabels it as an OpenRouter or Anthropic key, empty model included."""
     provider_name = str(provider or "").strip().lower()
-    if provider_name in {"local", "openrouter", "openai", "anthropic", "openai-compatible", "cloudru", "gigachat",
+    if provider_name in {"local", "openrouter", "openai", "anthropic", "openai-compatible", "cloudru",
                          "minimax", "deepseek", "zai", "claudexor"}:
         return provider_name
     raw_model = str(model or "").strip()
@@ -243,10 +243,8 @@ def infer_api_key_type(model: str, provider: Optional[str] = None) -> str:
         return "openai-compatible"
     if normalized.startswith("cloudru/"):
         return "cloudru"
-    if normalized.startswith("gigachat/"):
-        return "gigachat"
     # NB: un-prefixed "minimax/..." deliberately falls through to OpenRouter below —
-    # unlike cloudru/gigachat, minimax IS a real OpenRouter vendor namespace, and
+    # unlike cloudru, minimax IS a real OpenRouter vendor namespace, and
     # slash-form ids stay router-style by design (direct routing uses minimax::,
     # already resolved by provider_for_model above). Classifying minimax/ as the
     # direct key would make safety.py demand MINIMAX_API_KEY on OpenRouter installs.
@@ -262,13 +260,12 @@ def infer_provider_from_model(model: str) -> str:
 
     Rules (same prefix logic as infer_api_key_type, returns canonical provider name;
     the registry drives it, so every direct prefix — anthropic::, openai::,
-    openai-compatible::, cloudru::, gigachat::, minimax::, deepseek:: — maps to
+    openai-compatible::, cloudru::, minimax::, deepseek:: — maps to
     its provider):
       anthropic::*          → "anthropic"
       openai::*             → "openai"
       openai-compatible::*  → "openai-compatible"
       cloudru::*            → "cloudru"
-      gigachat::*           → "gigachat"
       anything else         → "openrouter"  (un-prefixed OpenRouter routing)
 
     Used by review-pipeline emitters to ensure /api/cost-breakdown attribution

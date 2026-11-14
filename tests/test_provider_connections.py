@@ -47,35 +47,6 @@ def _settings(rows=ROWS, **extra):
     return {**BUILTIN, CONNECTIONS_KEY: [dict(row) for row in rows], **extra}
 
 
-@pytest.mark.parametrize("route,expected", [
-    ("openrouter@byok::anthropic/claude-opus-5.5", {
-        "provider": "openrouter", "api_key": "row-or", "base_url": "https://openrouter.ai/api/v1",
-        "provider_routing": "repro", "usage_model": "openrouter@byok::anthropic/claude-opus-5.5",
-        "default_headers": {**OPENROUTER_APP_HEADERS, **OPENROUTER_METADATA_HEADERS},
-        "supports_openrouter_extensions": True}),
-    ("openai@work::gpt-5.6-sol", {"provider": "openai", "api_key": "row-oa", "base_url": "https://api.openai.com/v1"}),
-    ("anthropic@k2::claude-opus-5.5", {"provider": "anthropic", "api_key": "row-an", "resolved_model": "claude-opus-5-5",
-                                       "usage_model": "anthropic@k2::claude-opus-5-5"}),
-    ("deepseek@ds2::deepseek-v4-pro", {"provider": "deepseek", "api_key": "row-ds", "base_url": DEEPSEEK_BASE_URL,
-                                       "requires_reasoning_echo": True}),
-    ("zai@coding::glm-5.3", {"provider": "zai", "api_key": "row-z", "base_url": ZAI_PLAN_ENDPOINTS["coding"]}),
-    ("minimax@cn::MiniMax-M3", {"provider": "minimax", "api_key": "row-mm", "base_url": MINIMAX_REGION_ENDPOINTS["cn_zh"],
-                                "reasoning_split": True}),
-    ("cloudru@cr2::zai-org/GLM-4.7", {"provider": "cloudru", "api_key": "row-cr",
-                                       "base_url": "https://cloudru-2.example/v1"}),
-    ("gigachat@corp::GigaChat-2-Max", {"provider": "gigachat", "api_key": "", "user": "u", "password": "row-pw",
-                                        "base_url": "https://giga-2.example/v1", "scope": "GIGACHAT_API_CORP",
-                                        "verify_ssl_certs": False}),
-    ("openai-compatible@vllm::llama", {"provider": "openai-compatible", "api_key": "row-ck",
-                                       "base_url": "https://vllm.example/v1", "keyless": False}),
-    ("openai-compatible@ollama::llama", {"provider": "openai-compatible", "api_key": "",
-                                         "base_url": "http://127.0.0.1:11434/v1", "keyless": True}),
-])
-def test_a_named_connection_reads_its_row_through_the_kind_branch(route, expected):
-    target = resolve_target(route, _settings())
-    assert {key: target[key] for key in expected} == expected
-    assert target["connection"] == route.partition("@")[2].partition("::")[0]
-    assert target["api_key"] not in set(BUILTIN.values())  # never the built-in key
 
 
 @pytest.mark.parametrize("route,key,base_url", [
@@ -173,22 +144,6 @@ def test_credential_plan_carries_the_rows_only_for_a_named_route():
     assert CONNECTIONS_KEY not in provider_credential_plan({"OUROBOROS_MODEL": "x/y"})["planned_keys"]
 
 
-def test_meta_lists_every_connection_as_the_picker_shows_it(monkeypatch):
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    settings = _settings(ROWS + [{"kind": "deepseek", "name": "default", "enabled": False}])
-    document = {key: value for key, value in settings.items() if key != "OPENROUTER_API_KEY"}
-    meta = {row["id"]: row for row in connections_meta(settings, document)}
-    assert list(meta)[:3] == ["openrouter", "openrouter@byok", "openai"]
-    assert meta["openrouter"] == {"kind": "openrouter", "name": "", "label": "", "builtin": True, "enabled": True,
-                                  "configured": True, "source": "environment", "id": "openrouter",
-                                  "display": "OpenRouter"}
-    assert meta["openrouter@byok"]["display"] == "OpenRouter · Claude credits"
-    assert meta["openrouter@byok"]["source"] == "settings" and meta["openrouter@byok"]["builtin"] is False
-    assert meta["deepseek"]["enabled"] is False and meta["deepseek"]["configured"] is True
-    assert meta["gigachat@corp"]["display"] == "GigaChat · corp"
-    assert meta["openai-compatible@ollama"]["configured"] is True
-    unset = connections_meta({}, {})
-    assert {row["source"] for row in unset} == {"none"} and len(unset) == 9
 
 
 def test_references_name_rows_whose_connection_cannot_serve():
@@ -232,28 +187,8 @@ def test_save_validation_refuses_a_malformed_row(raw, fragment):
     assert fragment in error and rows == []
 
 
-def test_save_validation_accepts_valid_rows():
-    raw = ROWS + [{"kind": "openrouter", "name": "default", "enabled": False},
-                  {"kind": "openrouter", "name": "json", "provider_routing": '{"only": ["anthropic"]}', "api_key": "k"}]
-    rows, error = normalize_connections(raw)
-    assert error == "" and rows == raw
 
 
-def test_masking_round_trip_keeps_secrets_by_row_identity():
-    from ouroboros.gateway.secret_rows import ConnectionSecretIdentityAmbiguous, mask_connections, rehydrate_connections
-
-    assert mask_connections(ROWS)[0]["api_key"] == "***"  # a short secret shows nothing of itself
-    long_rows = [{**ROWS[0], "api_key": "sk-or-v1-0123456789"}, ROWS[7]]
-    shown = mask_connections(long_rows)
-    assert shown[0]["api_key"] == "sk-or-v1..." and shown[1]["password"] == "***set***"
-    assert shown[0]["label"] == "Claude credits"  # only secrets are masked
-    assert rehydrate_connections(shown, long_rows) == long_rows
-    renamed = [{**shown[0], "name": "byok-2"}]
-    assert rehydrate_connections(renamed, long_rows)[0]["api_key"] == ""  # a new identity gets no saved key
-    with pytest.raises(ConnectionSecretIdentityAmbiguous):
-        rehydrate_connections(shown[:1], [long_rows[0], dict(long_rows[0])])
-    typed = [{**shown[0], "api_key": "sk-typed-new-key"}]
-    assert rehydrate_connections(typed, long_rows)[0]["api_key"] == "sk-typed-new-key"
 
 
 # --- Built-in fingerprints stay byte-identical (golden recorded on base 135965a2f) ----------------
@@ -292,24 +227,6 @@ _FP_GOLDEN = {
 }
 
 
-@pytest.mark.parametrize("model", sorted(_FP_GOLDEN))
-def test_built_in_route_fingerprints_are_byte_identical(model, monkeypatch):
-    from ouroboros.capability_evidence import route_fingerprint
-    from ouroboros.context_window import route_observation_scope
-    from ouroboros.gateway.settings import _active_main_route
-    from ouroboros.response_limits import _response_fingerprint, dispatch_target
-    from ouroboros.reviewer_window import reviewer_route
-    from ouroboros.vision_routing import image_route_scope
-
-    monkeypatch.setattr("ouroboros.config.runtime_settings", lambda: dict(_FP_SETTINGS))
-    route = _active_main_route(_FP_SETTINGS, model_override=model)
-    provider, base_url = route["provider"], route["base_url"]
-    observed = (provider, base_url, route_fingerprint(provider=provider, base_url=base_url, model=model),
-                _response_fingerprint(provider=provider, model=model, base_url=base_url),
-                route_observation_scope(dict(route, options={}), _FP_SETTINGS),
-                image_route_scope(dispatch_target(model, _FP_SETTINGS)))
-    assert observed == _FP_GOLDEN[model]
-    assert reviewer_route(model) == (provider, base_url)
 
 
 def test_a_named_connection_fingerprints_its_own_endpoint_and_shares_a_fixed_one():

@@ -97,7 +97,6 @@ D20 = "Presence"
 "ouroboros/swarm_receipt.py" = "D07"
 "ouroboros/swarm_receipt_sources.py" = "D07"
 "ouroboros/swarm_wait_facts.py" = "D07"
-"launcher.py" = "D18"
 "ouroboros/budget_pause.py" = "D01"
 "ouroboros/work_stop.py" = "D01"
 "ouroboros/installation_stop.py" = "D08"
@@ -113,14 +112,6 @@ D20 = "Presence"
 "ouroboros/control_actor.py" = "D01"
 "ouroboros/task_carrier.py" = "D01"
 "ouroboros/sleep_custody.py" = "D01"
-"ouroboros/launcher_windows_runtime.py" = "D18"
-"ouroboros/launcher_tray.py" = "D18"
-"ouroboros/launcher_tray_macos.py" = "D18"
-"ouroboros/launcher_background.py" = "D18"
-"ouroboros/launcher_appearance.py" = "D18"
-"ouroboros/launcher_readiness.py" = "D18"
-"ouroboros/launcher_window_chrome.py" = "D18"
-"ouroboros/launcher_page_zoom.py" = "D18"
 "ouroboros/standalone_page.py" = "D18"  # a page served before any asset: the builtin theme.js and ui.css inlined
 "ouroboros/desktop_notifications.py" = "D18"
 "ouroboros/desktop_media.py" = "D18"
@@ -387,15 +378,12 @@ D20 = "Presence"
 "ouroboros/workspace_file_outputs.py" = "D17"
 "ouroboros/improvement_backlog.py" = "D15"
 "ouroboros/launcher_bootstrap.py" = "D18"
-"ouroboros/launcher_onboarding.py" = "D12"
-"ouroboros/launcher_server_reaper.py" = "D18"
 "ouroboros/runtime_venv.py" = "D18"
 "ouroboros/llm.py" = "D02"
 "ouroboros/llm_anthropic.py" = "D02"
 "ouroboros/llm_attempt.py" = "D02"
 "ouroboros/llm_capability_policy.py" = "D02"
 "ouroboros/llm_fallback.py" = "D02"
-"ouroboros/llm_gigachat.py" = "D02"
 "ouroboros/llm_local.py" = "D02"
 "ouroboros/llm_messages.py" = "D02"
 "ouroboros/reasoning_artifacts.py" = "D02"
@@ -1149,7 +1137,6 @@ allowed = [
   "D12->D02",
   "D12->D03",
   "D12->D07",
-  "D12->D11",
   "D12->D13",
   "D12->D18",
   "D13->D01",
@@ -1199,7 +1186,6 @@ allowed = [
   "D17->D16",
   "D17->D18",
   "D17->D19",
-  "D18->D09",
   "D18->D10",
   "D18->D12",
   "D18->D13",
@@ -1288,6 +1274,7 @@ lazy_only = [
   "D12->D06",
   "D12->D09",
   "D12->D10",
+  "D12->D11",
   "D12->D15",
   "D12->D16",
   "D12->D17",
@@ -1325,8 +1312,8 @@ lazy_only = [
   "D17->D13",
   "D17->D20",
   "D18->D01",
-  "D18->D07",
   "D18->D08",
+  "D18->D09",
   "D18->D11",
   "D18->D14",
   "D18->D16",

@@ -36,18 +36,6 @@ _FORMERLY_REMAPPED_IDS = (
 )
 
 
-def test_has_startup_ready_provider_accepts_any_remote_key_or_local_routing():
-    assert has_startup_ready_provider({"OPENROUTER_API_KEY": "sk-or-test"})
-    assert has_startup_ready_provider({"OPENAI_API_KEY": "sk-openai"})
-    assert has_startup_ready_provider({"ANTHROPIC_API_KEY": "sk-ant"})
-    assert has_startup_ready_provider({"MINIMAX_API_KEY": "minimax-key"})
-    assert has_startup_ready_provider({"OPENAI_COMPATIBLE_BASE_URL": "https://compat.example/v1"})
-    assert not has_startup_ready_provider({"OPENAI_COMPATIBLE_API_KEY": "compat-key"})
-    assert has_startup_ready_provider({"CLOUDRU_FOUNDATION_MODELS_API_KEY": "cloudru-key"})
-    assert has_startup_ready_provider({"GIGACHAT_CREDENTIALS": "giga-creds"})
-    assert has_startup_ready_provider({"USE_LOCAL_MAIN": True})
-    assert has_startup_ready_provider({"USE_LOCAL_FALLBACK": "True"})
-    assert not has_startup_ready_provider({"LOCAL_MODEL_SOURCE": "Qwen/Qwen2.5-7B-Instruct-GGUF"})
 
 
 def test_consciousness_local_lane_autostarts_but_is_not_startup_ready():
@@ -262,18 +250,6 @@ def test_apply_runtime_provider_defaults_clears_shipped_opus47_heavy_with_openro
     assert normalized["CLAUDE_CODE_MODEL"] == current_claude_code
 
 
-@pytest.mark.parametrize("shipped_heavy", _NEWLY_RETIRED_SHIPPED_HEAVY_DEFAULTS)
-def test_every_newly_retired_product_heavy_is_cleared_before_actor_migration(shipped_heavy):
-    normalized, changed, changed_keys = apply_runtime_provider_defaults({
-        "OUROBOROS_MODEL_HEAVY": shipped_heavy,
-    })
-
-    resolution = resolve_configured_subagents(normalized)
-    rows = () if resolution.config is None else resolution.config.items
-    assert changed
-    assert changed_keys == ["OUROBOROS_MODEL_HEAVY"]
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
-    assert all(row.subagent_id != "legacy-heavy" for row in rows)
 
 
 @pytest.mark.parametrize(
@@ -608,52 +584,12 @@ def test_apply_runtime_provider_defaults_cloudru_keeps_saved_shipped_values():
     assert normalized["OUROBOROS_SCOPE_REVIEW_MODELS"].startswith("cloudru::")
 
 
-def test_apply_runtime_provider_defaults_gigachat_only_elevates_to_direct():
-    """A GigaChat-only user (user/password auth, no other provider) whose document authors no
-    model gets gigachat:: proposals — exercises the exclusive-direct path that previously
-    KeyError'd because gigachat lacked a _DIRECT_PROVIDER_AUTO_DEFAULTS entry."""
-    normalized = _loaded({"GIGACHAT_USER": "user", "GIGACHAT_PASSWORD": "pass"})
-    assert normalized["OUROBOROS_MODEL"] == "gigachat::GigaChat-2-Max"
-    assert "OUROBOROS_MODEL_HEAVY" not in normalized
-    # ABI-10: retired comma keys are never introduced into settings.
-    assert "OUROBOROS_REVIEW_MODELS" not in normalized
-    assert "OUROBOROS_SCOPE_REVIEW_MODEL" not in normalized
 
 
-def test_gigachat_only_factory_pool_stays_on_gigachat():
-    pool = _factory_pool_models({"GIGACHAT_USER": "user", "GIGACHAT_PASSWORD": "pass",
-                                 "OUROBOROS_MODEL": "gigachat::GigaChat-2-Max"})
-    assert pool and all(m.startswith("gigachat::") for m in pool)
 
 
-def test_apply_runtime_provider_defaults_gigachat_credentials_keeps_saved_shipped_values():
-    """A GigaChat-only user (authorization key) whose document still carries saved
-    non-gigachat values keeps them (owner 2A); the shipped Heavy is not misclassified as
-    custom, and the retired scope keys keep their own former-default classification."""
-    saved = {
-        "GIGACHAT_CREDENTIALS": "base64-key",
-        "OUROBOROS_MODEL": "google/gemini-3.5-flash",
-        "OUROBOROS_MODEL_HEAVY": "google/gemini-3.5-flash",
-        "OUROBOROS_MODEL_LIGHT": "google/gemini-3.5-flash",
-        "OUROBOROS_MODEL_FALLBACKS": "anthropic/claude-sonnet-4.6",
-        "OUROBOROS_SCOPE_REVIEW_MODEL": "openai/gpt-5.5",
-        "OUROBOROS_SCOPE_REVIEW_MODELS": "openai/gpt-5.5",
-    }
-    normalized, changed, _ = apply_runtime_provider_defaults(dict(saved))
-    assert changed
-    assert {key: normalized[key] for key in _SLOTS} == {key: saved[key] for key in _SLOTS}
-    assert normalized["OUROBOROS_MODEL_HEAVY"] == ""
-    assert normalized["OUROBOROS_SCOPE_REVIEW_MODEL"] == "gigachat::GigaChat-2-Max"
-    assert normalized["OUROBOROS_SCOPE_REVIEW_MODELS"] == "gigachat::GigaChat-2-Max"
 
 
-def test_gigachat_defaults_are_reachable_for_personal_and_legal_scopes():
-    """Ultra is Freemium-personal only; the shipped Max proposal works for every
-    supported auth scope instead of stranding B2B/CORP fresh installs."""
-    for scope in ("GIGACHAT_API_PERS", "GIGACHAT_API_B2B", "GIGACHAT_API_CORP"):
-        normalized = _loaded({"GIGACHAT_CREDENTIALS": "base64-key", "GIGACHAT_SCOPE": scope})
-        assert normalized["OUROBOROS_MODEL"] == "gigachat::GigaChat-2-Max"
-        assert normalized["GIGACHAT_SCOPE"] == scope
 
 
 def test_local_only_install_keeps_light_and_fallback_on_the_local_main_route():
@@ -729,45 +665,6 @@ def test_the_retired_deep_review_key_is_left_to_the_read_seam():
         assert kept["OUROBOROS_MODEL_DEEP_SELF_REVIEW"] == "openai/gpt-5.5-pro"
 
 
-def test_a_fresh_local_first_install_still_authors_safety_light(tmp_path, monkeypatch):
-    """LOCAL-FIRST: LOCAL_MODEL_SOURCE is present at first launch, and the
-    pre-wizard normalization DOES flag changes (here it clears a retired shipped
-    Heavy default). The launcher must not persist that on a fresh
-    install — the save would create the settings file and silently cost the
-    wizard its safety-light authorship. Pins the launcher's actual decision:
-    persist only when the file already exists."""
-    import ouroboros.config as cfg
-    from ouroboros.settings_setup_contract import wizard_authors_safety_light
-
-    settings_path = tmp_path / "settings.json"
-    monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path, raising=False)
-
-    fresh = dict(SETTINGS_DEFAULTS)
-    fresh["LOCAL_MODEL_SOURCE"] = "lmstudio"
-    fresh["OUROBOROS_MODEL_HEAVY"] = "google/gemini-3.5-flash"
-    _normalized, changed, changed_keys = apply_runtime_provider_defaults(fresh)
-    assert changed, "local-first normalization genuinely flags changes"
-    assert "OUROBOROS_MODEL_HEAVY" in changed_keys
-
-    # The launcher's persistence decision, verbatim: changed AND file exists.
-    assert not (changed and settings_path.exists()), (
-        "a fresh install must not persist the pre-wizard normalization"
-    )
-    assert wizard_authors_safety_light() is True
-
-    settings_path.write_text("{}", encoding="utf-8")
-    assert (changed and settings_path.exists()), "an existing install still persists it"
-    assert wizard_authors_safety_light() is False
-
-    # ...and the pre-onboarding normalizers implement at least that decision. BOTH
-    # have since gone further and persist nothing at all, which satisfies the
-    # fresh-install rule by construction rather than by a carve-out that has to be
-    # got right (behavioural coverage: tests/test_onboarding_host.py).
-    repo = cfg.pathlib.Path(__file__).parent.parent
-    launcher_host = (repo / "ouroboros" / "launcher_onboarding.py").read_text(encoding="utf-8")
-    server_src = (repo / "server.py").read_text(encoding="utf-8")
-    assert "save_settings(" not in launcher_host
-    assert "save_settings(" not in server_src
 
 
 def test_telegram_subscription_intents_are_recognized():

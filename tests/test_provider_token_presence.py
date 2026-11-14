@@ -242,21 +242,6 @@ def test_switch_facts_never_size_a_tariff_tier_by_an_unreported_input(tmp_path, 
             "$10.00/M out, cache read $0.20/M (estimated input tier).") in facts
 
 
-@pytest.mark.parametrize("raw,expected", [
-    ({"prompt_tokens": 11, "completion_tokens": 2}, [11, 2, None, None]),
-    ({"prompt_tokens": 11, "completion_tokens": 2, "precached_prompt_tokens": 0}, [11, 2, 0, None]),
-    ({"prompt_tokens": 50, "completion_tokens": 7, "precached_prompt_tokens": 10}, [50, 7, 10, None]),
-    (None, [None, None, None, None]),  # the library returned no usage object at all
-])
-def test_gigachat_presence_reaches_round_and_usage_rows(tmp_path, monkeypatch, offline, raw, expected):
-    body = {"message": {"content": "done"}, **({"usage": raw} if raw is not None else {})}
-    round_counts, usage_counts, usage = _loop_round(
-        tmp_path, monkeypatch, "gigachat::GigaChat-3-Pro", {"GIGACHAT_CREDENTIALS": "gigachat-fixture-key"},
-        {"kind": "response", "body": body})
-    assert round_counts == usage_counts == expected
-    raw = raw or {}
-    assert [usage[key] for key in ("prompt_tokens", "completion_tokens", "cached_tokens")] == [
-        int(raw.get(key) or 0) for key in ("prompt_tokens", "completion_tokens", "precached_prompt_tokens")]
 
 
 @pytest.mark.parametrize("raw,expected", [
