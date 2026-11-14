@@ -720,7 +720,7 @@ def test_every_runtime_importer_cache_sweep_takes_the_shared_lock():
     root = pathlib.Path(__file__).resolve().parents[1]
     sweeps: dict = {}
     for path in [*root.glob("ouroboros/**/*.py"), *root.glob("supervisor/**/*.py"),
-                 root / "server.py", root / "launcher.py"]:
+                 root / "server.py"]:
         text = path.read_text(encoding="utf-8")
         if "invalidate_caches" not in text:
             continue

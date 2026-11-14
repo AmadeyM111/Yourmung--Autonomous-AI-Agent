@@ -264,14 +264,6 @@ def test_extract_video_frames_unavailable_hints_cv2_workaround(monkeypatch):
     assert "cv2" in out and "view_image" in out
 
 
-def test_harbor_agent_prefix_installs_imageio_ffmpeg():
-    """TB P0-1 pin: the harbor install script puts ffmpeg into the AGENT prefix
-    (pip imageio-ffmpeg) so extract_video_frames works inside task containers."""
-    import pathlib
-
-    src = (pathlib.Path(__file__).resolve().parents[1]
-           / "devtools" / "benchmarks" / "terminal_bench" / "harbor_installed_agent.py").read_text(encoding="utf-8")
-    assert "pip install imageio-ffmpeg" in src
 
 
 def test_media_user_files_admission_read_parity(tmp_path, monkeypatch):

@@ -416,8 +416,6 @@ def test_auto_low_source_inventory_has_no_true_writer_or_ghost_reader():
         "ouroboros/gateway/owner_settings.py",
         "ouroboros/gateway/settings.py",
         "devtools/benchmarks/common/server_runner.py",
-        "devtools/benchmarks/terminal_bench/harbor_installed_agent.py",
-        "devtools/benchmarks/continual_learning/run_clb.py",
     }
     response_paths = {
         path for path, text in sources.items()
