@@ -1,1 +1,0 @@
-"""ProgramBench adapter helpers."""
