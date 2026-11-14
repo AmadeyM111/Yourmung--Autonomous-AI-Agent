@@ -125,18 +125,6 @@ export const PROVIDER_CARDS = [
         note: 'Pick Z.ai as the source in Models or Agents, then choose glm-5.3 or glm-5.3-flash. Coding Plan subscribers: set Plan to <code>coding</code>; the default <code>payg</code> is pay-as-you-go, and a Coding Plan key tested there reports No credits.',
     },
     {
-        id: 'gigachat', kind: 'gigachat', title: 'GigaChat', icon: '/static/providers/gigachat.svg', hint: 'Sber GigaChat via the gigachat library', advanced: true,
-        fields: [
-            { id: 's-gigachat-credentials', rowField: 'credentials', settingKey: 'GIGACHAT_CREDENTIALS', secret: true, label: 'Authorization key', placeholder: 'Base64 client_id:secret (OAuth)' },
-            { id: 's-gigachat-scope', rowField: 'scope', settingKey: 'GIGACHAT_SCOPE', label: 'Scope', placeholder: 'GIGACHAT_API_PERS' },
-            { id: 's-gigachat-user', rowField: 'user', settingKey: 'GIGACHAT_USER', label: 'User (basic auth, optional)', placeholder: 'username', credential: true },
-            { id: 's-gigachat-password', rowField: 'password', settingKey: 'GIGACHAT_PASSWORD', secret: true, label: 'Password (basic auth, optional)', placeholder: 'password' },
-            { id: 's-gigachat-base-url', rowField: 'base_url', settingKey: 'GIGACHAT_BASE_URL', label: 'Base URL', placeholder: 'https://api.giga.chat/v1' },
-            { id: 's-gigachat-verify-ssl', rowField: 'verify_ssl_certs', settingKey: 'GIGACHAT_VERIFY_SSL_CERTS', label: 'Verify SSL certs', placeholder: 'true / false' },
-        ],
-        note: 'Pick GigaChat as the source in Models or Agents to route a role through this account. Authenticate with either an Authorization Key (OAuth, scope <code>GIGACHAT_API_PERS</code>, <code>GIGACHAT_API_B2B</code>, or <code>GIGACHAT_API_CORP</code>) or User + Password.',
-    },
-    {
         id: 'anthropic', kind: 'anthropic', title: 'Anthropic', icon: '/static/providers/anthropic.png', hint: 'Direct Anthropic API access',
         fields: [{ id: 's-anthropic', rowField: 'api_key', settingKey: 'ANTHROPIC_API_KEY', secret: true, label: 'API key', placeholder: 'sk-ant-...' }],
         note: 'Pick Anthropic as the source in Models or Agents to route a role directly through this key.',
@@ -293,7 +281,7 @@ export function renderSettingsPage() {
                     <details class="settings-more-providers" id="settings-more-providers">
                         <summary>
                             <span class="settings-provider-title"><span>More providers</span></span>
-                            <span class="settings-provider-hint">Cloud.ru Foundation Models, MiniMax, DeepSeek, and GigaChat</span>
+                            <span class="settings-provider-hint">Cloud.ru Foundation Models, MiniMax, DeepSeek, and Z.ai</span>
                         </summary>
                         <div class="settings-more-providers-body">
                             ${PROVIDER_CARDS.filter((card) => card.advanced).map(providerSettingsCard).join('')}

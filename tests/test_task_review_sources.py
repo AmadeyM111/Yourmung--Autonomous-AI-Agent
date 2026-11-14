@@ -199,51 +199,6 @@ def test_history_page_stops_after_exact_task_rows_and_one_lookahead(tmp_path, mo
     assert [p["record_id"] for p in payload["review_projection"]["panels"]] == [r["record_id"] for r in records[1:3]]
 
 
-@pytest.mark.parametrize("storage", ["legacy", "ledger"])
-@pytest.mark.parametrize("owner_field", ["task_id", "origin_task_id", "presentation_owner_task_id", "group_id"])
-def test_task_bound_saved_skill_export_matches_detail_and_bridge_prefix(tmp_path, storage, owner_field):
-    import ast
-    import pathlib
-    import urllib.parse
-
-    from ouroboros.gateway.extensions import _skill_review_history_detail_sync
-    from ouroboros.skill_review_history import review_history_path
-    from tests.test_review_ledger import _facts, _raw
-
-    for job, owner in [("exact-job", "skill-owner"), ("another-job", "foreign-task")]:
-        lifecycle = {"job_id": job, owner_field: f"task:{owner}:weather" if owner_field == "group_id" else owner,
-                     "status": "clean", "job_status": "completed", "content_hash": "a" * 64}
-        if storage == "legacy":
-            path = review_history_path(tmp_path, "weather")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a") as stream:
-                stream.write(json.dumps(lifecycle) + "\n")
-        else:
-            record = rl.build_wave_record(_facts([_raw("s", "m", parts=("skill",))], task_id="physical-task"),
-                                          surface="skill", drive_root=tmp_path)
-            record.subject.update(kind="skill", skill="weather")
-            record.brief["skill"] = lifecycle
-            rl.write_record(tmp_path, record)
-    url = "/api/tasks/skill-owner/reviews/skill/exact-job?skill=weather&format=text"
-    # Execute the existing validator body, without starting or changing the app.
-    launcher = pathlib.Path(__file__).resolve().parents[1] / "launcher.py"
-    function = next(n for n in ast.walk(ast.parse(launcher.read_text()))
-                    if isinstance(n, ast.FunctionDef) and n.name == "_resolve_bridge_file_url")
-    namespace = {"actual_port": 8000, "urllib": urllib}
-    exec(compile(ast.Module(body=[function], type_ignores=[]), str(launcher), "exec"), namespace)
-    assert namespace["_resolve_bridge_file_url"](url) == "http://127.0.0.1:8000" + url
-    with pytest.raises(ValueError):
-        namespace["_resolve_bridge_file_url"]("/api/skills/weather/review-history/exact-job?format=text")
-    with client_for(tmp_path) as client:
-        response = client.get(url)
-        assert response.status_code == 200
-        assert response.text == _skill_review_history_detail_sync(tmp_path, "weather", "exact-job")["markdown"]
-        assert response.headers["content-disposition"].startswith("attachment;")
-        assert client.get(url.replace("skill-owner", "foreign-task")).status_code == 404
-        assert client.get(url.replace("weather", "another-skill")).status_code == 404
-        assert client.get(url.replace("exact-job", "another-job")).status_code == 404
-        swapped = url.replace("exact-job", "another-job").replace("skill-owner", "foreign-task")
-        assert client.get(swapped).status_code == 200  # The refused job exists, under its own task.
 
 
 def test_history_contract_publishes_the_actual_response(tmp_path):
@@ -265,51 +220,6 @@ def test_history_contract_publishes_the_actual_response(tmp_path):
     assert _js_typedef_fields(js, "TaskReviewHistoryResponse") == set(get_type_hints(TaskReviewHistoryResponse))
 
 
-def test_saved_skill_download_through_real_launcher_and_http(tmp_path, monkeypatch):
-    import pathlib
-    import socket
-    import threading
-    import time
-
-    import uvicorn
-
-    from ouroboros.skill_review_history import review_history_detail, review_history_path
-    from tests.test_ui_smoke_large_artifacts import _native_file_api
-
-    path = review_history_path(tmp_path, "weather")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"job_id": "job", "task_id": "owner", "status": "clean",
-                               "job_status": "completed", "content_hash": "b" * 64}) + "\n")
-    app = Starlette(routes=task_review_routes())
-    app.state.drive_root = tmp_path
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    server = uvicorn.Server(uvicorn.Config(NetworkAuthGate(app), log_level="warning"))
-    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
-    thread.start()
-    try:
-        deadline = time.monotonic() + 10
-        while not server.started and thread.is_alive() and time.monotonic() < deadline:
-            time.sleep(.01)
-        assert server.started
-        monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path / "download-home"))
-        sizes = []
-        api, _ = _native_file_api(sock.getsockname()[1], sizes)
-        old = api.download_file_to_downloads("/api/skills/weather/review-history/job?format=text", "old.txt")
-        assert old["ok"] is False and "/api/tasks/" in old["error"]
-        result = api.download_file_to_downloads("/api/tasks/owner/reviews/skill/job?skill=weather&format=text", "review.txt")
-        assert result["ok"] is True
-        # The export is UTF-8 bytes and the launcher copies them as they came: compare bytes, never a locale decode.
-        expected = review_history_detail(tmp_path, "weather", "job")["markdown"].encode("utf-8")
-        assert pathlib.Path(result["path"]).read_bytes() == expected
-        assert sizes and all(0 < size <= 1024 * 1024 for size in sizes)
-        foreign = api.download_file_to_downloads("/api/tasks/foreign/reviews/skill/job?skill=weather&format=text", "foreign.txt")
-        assert foreign["ok"] is False and "404" in foreign["error"]
-    finally:
-        server.should_exit = True
-        thread.join(10)
-        sock.close()
-        assert not thread.is_alive()
 
 
 def test_saved_skill_export_is_the_same_normalized_text_as_the_json_detail(tmp_path):

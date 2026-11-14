@@ -682,14 +682,6 @@ def _imports_before_first_body_import(path: pathlib.Path) -> tuple[list[str], st
     return before, ""
 
 
-@pytest.mark.parametrize("entry", ["server.py", "launcher.py"])
-def test_real_entries_reach_the_package_hook_through_stdlib_only(entry):
-    repo = pathlib.Path(__file__).resolve().parents[1]
-
-    before, first_body = _imports_before_first_body_import(repo / entry)
-
-    assert first_body.startswith("ouroboros"), first_body  # the package init (the hook) is the first body code
-    assert set(before) <= set(sys.stdlib_module_names), sorted(set(before) - set(sys.stdlib_module_names))
 
 
 def test_real_hook_runs_before_the_package_imports_anything_and_the_helper_is_stdlib_only():

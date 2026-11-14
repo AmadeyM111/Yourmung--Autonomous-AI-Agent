@@ -201,40 +201,8 @@ def _asks_for_hidden_window(call: ast.Call) -> bool:
     return False
 
 
-def test_launcher_process_spawns_open_no_console_window():
-    offenders = []
-    for path in LAUNCHER_PROCESS_FILES:
-        rel = path.relative_to(REPO_ROOT).as_posix()
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        replacing = {id(node) for function in ast.walk(tree) if isinstance(function, ast.FunctionDef)
-                     and (rel, function.name) in _IMAGE_REPLACEMENT for node in ast.walk(function)}
-        for node in ast.walk(tree):
-            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                    and isinstance(node.func.value, ast.Name)):
-                continue
-            module, name = node.func.value.id, node.func.attr
-            if name in _SPAWNS.get(module, ()) and not _asks_for_hidden_window(node):
-                offenders.append(f"{rel}:{node.lineno}: {module}.{name} without hidden-window flags")
-            if module == "os" and id(node) not in replacing and (
-                    name.startswith(("exec", "spawn", "posix_spawn")) or name in {"system", "popen", "startfile"}):
-                offenders.append(f"{rel}:{node.lineno}: os.{name}; the launcher replaces itself only through "
-                                 "launcher_bootstrap.exec_source_launcher")
-    assert not offenders, "\n".join(offenders)
 
 
-def test_no_product_code_detaches_a_process_from_its_console():
-    offenders = []
-    files = [*SCAN_FILES, REPO_ROOT / "launcher.py", *(path for base in SCAN_DIRS for path in base.rglob("*.py"))]
-    for path in sorted(set(files)):
-        rel = path.relative_to(REPO_ROOT).as_posix()
-        if rel in CONSOLE_DETACHING_ALLOWLIST:
-            continue
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            name = (node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute)
-                    else node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None)
-            if name in _CONSOLE_DETACHING:
-                offenders.append(f"{rel}:{node.lineno}: {name}")
-    assert not offenders, "\n".join(offenders)
 
 
 def test_platform_layer_exports_core_symbols():

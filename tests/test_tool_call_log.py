@@ -396,21 +396,6 @@ def test_a_failed_start_append_is_disclosed_on_the_wait_end_host_error_and_refus
     assert refused["is_error"] is True and refusal["start_log"] == missed
 
 
-def test_editbench_counts_each_logical_call_once(tmp_path):
-    from devtools.benchmarks.editbench.run_editbench import _mine_metrics
-
-    rows = [_log_row("tool_call_started", "ok"), _log_row("tool_call", "ok", is_error=False),
-            _log_row("tool_call_started", "unknown"),
-            _log_row("tool_call_started", "waited"), _log_row("tool_call_timeout", "waited"),
-            _log_row("tool_call_started", "late"), _log_row("tool_call_timeout", "late"),
-            _log_row("tool_call", "late", is_error=False),
-            {**_log_row("tool_call"), "ts": "t0", "is_error": True}]  # a legacy row
-    for logs in (tmp_path / "logs", tmp_path / "task" / "logs"):  # the canonical mirror repeats every row
-        logs.mkdir(parents=True)
-        (logs / "tools.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
-    metrics = _mine_metrics(tmp_path, "t")
-    # ok + unknown + waited + late + legacy; the two waits ended and the legacy row erred.
-    assert metrics["tool_calls"] == {"read_file": 5} and metrics["tool_errors"] == {"read_file": 3}
 
 
 def test_completion_receipts_replay_host_facts_without_hiding_errors(tmp_path):

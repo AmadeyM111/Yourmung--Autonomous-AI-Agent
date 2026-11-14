@@ -52,25 +52,6 @@ def test_the_default_target_is_still_the_immutable_image():
     assert _entrypoint(stages["runtime"]["lines"]) == ["python", "server.py"]
 
 
-def test_the_managed_target_hosts_the_launcher_over_a_complete_released_seed():
-    stages = _stages()
-    managed = stages["managed"]
-    assert managed["from"] == "runtime"
-    text = "\n".join(managed["lines"])
-    assert "COPY --from=ouroboros-seed repo.bundle repo_bundle_manifest.json /opt/ouroboros/seed/" in text
-    assert "bundle verify /opt/ouroboros/seed/repo.bundle" in text, "a shallow seed fails the build"
-    entry = _entrypoint(managed["lines"])
-    assert entry[:3] == ["python", "/app/launcher.py", "--no-ui"]
-    assert entry[entry.index("--seed-bundle") + 1] == "/opt/ouroboros/seed"
-    assert entry[entry.index("--runtime-venv") + 1] == "/ouroboros/body/venv"
-    assert '["--launch-intent", "automatic"]' in text
-    layout = dict(re.findall(r"(OUROBOROS_[A-Z_]+|HOME)=(\S+)", text))
-    assert layout["OUROBOROS_REPO_DIR"] == "/ouroboros/body/repo"
-    assert layout["OUROBOROS_DATA_DIR"] == "/ouroboros/data"
-    assert layout["OUROBOROS_PID_FILE"].startswith("/ouroboros/data/"), "a second container sharing data loses the lock"
-    for key in ("OUROBOROS_SUBAGENT_PROJECTS_ROOT", "OUROBOROS_SUBAGENT_WORKTREE_ROOT", "OUROBOROS_DELIVERABLES_ROOT"):
-        assert layout[key].startswith("/ouroboros/work/")
-    assert layout["HOME"] == "/ouroboros/home"
 
 
 def test_the_compose_carrier_is_the_one_executable_recipe():

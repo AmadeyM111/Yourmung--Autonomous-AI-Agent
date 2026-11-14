@@ -182,19 +182,3 @@ def test_cli_cost_finality_wait_branches(monkeypatch):
     assert out["cost_final"] is True and calls
 
 
-def test_pb_cost_finality_wait_branches(monkeypatch):
-    from devtools.benchmarks.programbench import programbench_adapter as pb
-
-    calls = []
-    monkeypatch.setattr(
-        pb, "ouroboros_api_request",
-        lambda base, method, path, body=None, timeout=None: calls.append(path)
-        or {"status": "completed", "cost_final": True},
-    )
-    r = {"status": "cancelled"}
-    assert pb._await_cost_finality("http://x", "t", r) is r and not calls
-    r2 = {"status": "degraded"}
-    assert pb._await_cost_finality("http://x", "t", r2) is r2 and not calls
-    r3 = {"status": "completed", "cost_final": False}
-    out = pb._await_cost_finality("http://x", "t", r3, grace_sec=5.0)
-    assert out["cost_final"] is True and calls

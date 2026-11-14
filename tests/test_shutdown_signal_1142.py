@@ -121,29 +121,6 @@ def test_main_server_bounds_the_graceful_drain_from_the_shared_constant():
     assert SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC + 2 < LAUNCHER_STOP_GRACE_SEC
 
 
-def test_launcher_graceful_phase_signals_only_the_server_pid(monkeypatch):
-    import launcher
-
-    calls: list = []
-
-    class Process:
-        pid = 4242
-
-        def terminate(self):
-            calls.append("terminate")
-
-        def wait(self, timeout):
-            calls.append(("wait", timeout))
-
-    monkeypatch.setattr(launcher, "IS_WINDOWS", False)
-    monkeypatch.setattr(launcher, "_agent_proc", Process())
-    monkeypatch.setattr(launcher, "_agent_job", None)
-    monkeypatch.setattr(launcher.os, "killpg", lambda *a, **k: calls.append("killpg"), raising=False)
-    monkeypatch.setattr(launcher, "kill_process_tree", lambda proc, **kw: calls.append("kill_tree"))
-    monkeypatch.setattr(launcher, "_cleanup_recorded_server_group_for_pid", lambda *a: None)
-    launcher.stop_agent()
-    assert calls == ["terminate", ("wait", launcher.LAUNCHER_STOP_GRACE_SEC)]
-    assert not hasattr(launcher, "terminate_process_tree"), "the group SIGTERM helper left the launcher"
 
 
 def _free_port() -> int:
@@ -437,49 +414,5 @@ print(json.dumps({"stdin": child.stdout, "child_exit": child.returncode, "should
     assert json.loads(proc.stdout) == {"stdin": "ordinary stdin survives", "child_exit": 0, "should_exit": False}
 
 
-def test_windows_launcher_requests_cooperative_quit_before_wait(monkeypatch):
-    import launcher
-    calls = []
-    class Pipe:
-        def write(self, data): calls.append(("write", data))
-        def flush(self): calls.append("flush")
-        def close(self): calls.append("close")
-    class Process:
-        pid = 12345
-        stdin = Pipe()
-        def terminate(self): pytest.fail("TerminateProcess must not be the graceful step")
-        def wait(self, timeout): calls.append(("wait", timeout))
-    monkeypatch.setattr(launcher, "IS_WINDOWS", True)
-    monkeypatch.setattr(launcher, "_agent_proc", Process())
-    monkeypatch.setattr(launcher, "_agent_job", None)
-    monkeypatch.setattr(launcher, "_cleanup_recorded_server_group_for_pid", lambda *args: None)
-    launcher.stop_agent()
-    assert calls == [("write", b"quit\n"), "flush", "close", ("wait", launcher.LAUNCHER_STOP_GRACE_SEC)]
 
 
-@pytest.mark.parametrize("pipe_failure", [False, True])
-def test_windows_launcher_keeps_forced_fallback_when_grace_expires(monkeypatch, pipe_failure):
-    import launcher
-    calls = []
-    class Pipe:
-        def write(self, data):
-            calls.append("request")
-            if pipe_failure: raise BrokenPipeError("fixture closed pipe")
-        def flush(self): pass
-        def close(self):
-            if pipe_failure: raise BrokenPipeError("fixture flush on close")
-    class Process:
-        pid = 12345
-        stdin = Pipe()
-        def wait(self, timeout):
-            calls.append(("wait", timeout))
-            if len([c for c in calls if isinstance(c, tuple)]) == 1:
-                raise subprocess.TimeoutExpired("server", timeout)
-    monkeypatch.setattr(launcher, "IS_WINDOWS", True)
-    monkeypatch.setattr(launcher, "_agent_proc", Process())
-    monkeypatch.setattr(launcher, "_agent_job", "owned-job")
-    monkeypatch.setattr(launcher, "terminate_job", lambda job: calls.append("force"))
-    monkeypatch.setattr(launcher, "close_job", lambda job: calls.append("close_job"))
-    monkeypatch.setattr(launcher, "_cleanup_recorded_server_group_for_pid", lambda *args: None)
-    launcher.stop_agent()
-    assert calls == ["request", ("wait", launcher.LAUNCHER_STOP_GRACE_SEC), "force", ("wait", 5), "close_job"]

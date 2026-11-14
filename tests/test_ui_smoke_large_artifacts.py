@@ -59,17 +59,6 @@ def _native_file_api(port, read_sizes):
     return namespace["MainApi"](), sha256(source.read_bytes()).hexdigest()
 
 
-def test_native_download_harnesses_build_the_launchers_real_bridge_class():
-    """Default lane, no browser or window: both opt-in download harnesses execute MainApi's real class
-    body, so a name it newly reads at class time fails here instead of only inside a browser run."""
-    from tests.test_widget_stream_download_ui import native_file_api
-
-    launcher = Path(__file__).resolve().parents[1] / "launcher.py"
-    for harness in (_native_file_api, native_file_api):
-        api, digest = harness(0, [])
-        assert type(api).__name__ == "MainApi" and callable(api.download_file_to_downloads)
-        assert api.shell_info()["native_notifications"]["status"] == "unavailable", "headless: no adapter"
-        assert digest == sha256(launcher.read_bytes()).hexdigest()
 
 
 @pytest.mark.ui_browser

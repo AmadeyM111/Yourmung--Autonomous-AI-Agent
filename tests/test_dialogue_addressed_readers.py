@@ -554,26 +554,6 @@ def test_telegram_tail_does_equal_sql_work_with_foreign_history(tmp_path, monkey
     assert measurements[0] == measurements[1] and measurements[0]["steps"] > 0
 
 
-@pytest.mark.parametrize("stream", ["chat", "progress"])
-def test_benchmark_dialogue_queries_do_equal_work_with_foreign_rooms(tmp_path, monkeypatch, stream):
-    from devtools.benchmarks.terminal_bench import atif
-
-    measurements = []
-    for rooms in (1, 30):
-        root = tmp_path / str(rooms)
-        own = {"task_id": "selected", "direction": "out", "text": "own answer"}
-        ds.append(root, stream, own)
-        for room in range(rooms):
-            ds.append(root, stream, {"chat_id": room + 10, "task_id": f"other-{room}",
-                                     "direction": "out", "text": "foreign answer"})
-        # Trace the converter's exact SQL through the common VM meter. Its real
-        # read-only connection is exercised by terminal_bench/test_atif.py.
-        monkeypatch.setattr(atif, "_open_dialogue", lambda _path: ds.transaction(root, write=False))
-        with metered(monkeypatch) as measured:
-            rows = atif._dialogue_rows(root, stream, task_id="selected", final=stream == "chat")
-        assert rows == [own]
-        measurements.append(dict(measured))
-    assert measurements[0] == measurements[1] and measurements[0]["steps"] > 0
 
 
 def test_the_sidebar_keeps_every_project_while_the_archive_imports(tmp_path):

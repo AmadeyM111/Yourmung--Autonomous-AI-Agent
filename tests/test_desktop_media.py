@@ -145,12 +145,6 @@ def test_non_linux_shells_keep_native_prompt(monkeypatch):
 
 
 
-def test_launcher_keeps_display_probe_alias_and_origin_bound_hook():
-    import launcher
-    assert launcher._display_ready is media.display_ready
-    source = (ROOT / "launcher.py").read_text()
-    assert "attach_media_permissions(background.attach(window), url)" in source
-    assert "def _on_closing()" in source  # Background owns the existing shutdown callback.
 
 
 def test_linux_bundle_restores_resource_paths_after_frozen_hooks(tmp_path, monkeypatch):

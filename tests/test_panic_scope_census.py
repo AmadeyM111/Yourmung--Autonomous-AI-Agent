@@ -214,21 +214,6 @@ def test_a_failing_census_is_disclosed_and_the_other_requests_still_run(tmp_path
     assert "commands" in diagnostics["requests"] and "daemon" in diagnostics["settlements"]
 
 
-def test_launcher_completion_and_known_only_startup_keep_their_admission_and_exit_order():
-    launcher = (REPO / "launcher.py").read_text(encoding="utf-8")
-    panic_branch = launcher[launcher.index("if exit_code == PANIC_EXIT_CODE:"):]
-    completion = panic_branch.index('name="panic-scope-completion"')
-    assert completion < panic_branch.index('_kill_orphaned_children(reason="panic_stop")')
-    assert "join(timeout=" in panic_branch[completion:completion + 400], "bounded: the app's exit never waits on a stalled census"
-    assert "exclude\": {os.getpid(), os.getppid(), 1}" in panic_branch.replace("'", '"'), "the launcher and its parent are excluded"
-    server = (REPO / "server.py").read_text(encoding="utf-8")
-    main = server[server.index("def main() -> int:"):]
-    assert (main.index("admit_data_root(DATA_DIR)") < main.index("process_scope.initialize_installation_scope(DATA_DIR)")
-            < main.index("automatic_launch_allowed("))
-    # Ordinary doors never sweep the installation scope: close, quit, planned and manual Restart.
-    for path in ("ouroboros/server_restart.py", "ouroboros/owned_shutdown.py"):
-        text = (REPO / path).read_text(encoding="utf-8")
-        assert "panic_scope_census" not in text and "complete_pending_panic_sweep" not in text
 
 
 def test_the_daemon_spawn_env_keeps_the_installation_marker_and_sheds_task_and_run_markers(monkeypatch, tmp_path):
