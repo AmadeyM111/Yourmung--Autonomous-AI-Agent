@@ -25,10 +25,10 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D15 | Memory, knowledge, consciousness & self-evolution | 32 | 0 |
 | D16 | Observability, usage accounting & cost | 27 | 0 |
 | D17 | Projects, workspaces & task results | 52 | 0 |
-| D18 | Launcher, packaging, platform & shared substrate | 25 | 0 |
+| D18 | Launcher, packaging, platform & shared substrate | 26 | 0 |
 | D19 | Frozen contracts (ABI) | 12 | 0 |
 | D20 | Presence | 20 | 0 |
-| **total** | | **922** | **0** |
+| **total** | | **923** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -53,7 +53,7 @@ Rows may import columns (`[graph].allowed`). `·` = forbidden direction.
 | **D15** | ✓ | · | ✓ | ✓ | · | · | · | · | · | · | · | ✓ | · | · | · | ✓ | ✓ | ✓ | ✓ | · |
 | **D16** | · | ✓ | · | · | · | ✓ | · | · | · | · | · | ✓ | · | · | · | · | ✓ | ✓ | · | · |
 | **D17** | ✓ | · | · | ✓ | ✓ | ✓ | ✓ | ✓ | · | · | ✓ | ✓ | · | · | ✓ | ✓ | · | ✓ | ✓ | · |
-| **D18** | · | · | · | · | · | · | · | · | · | ✓ | · | ✓ | ✓ | · | · | · | · | · | · | · |
+| **D18** | · | · | · | · | · | · | · | · | ✓ | ✓ | · | ✓ | ✓ | · | · | · | · | · | · | · |
 | **D19** | · | · | · | · | · | · | · | · | · | · | · | · | · | ✓ | · | · | · | ✓ | · | · |
 | **D20** | · | · | · | ✓ | ✓ | · | · | · | · | · | · | · | · | · | ✓ | · | ✓ | ✓ | ✓ | · |
 
@@ -65,7 +65,7 @@ Rows may import columns (`[graph].allowed`). `·` = forbidden direction.
 
 ## Hidden coupling (classified out of the strict graph)
 
-- lazy-only cross-domain pairs: **126**
+- lazy-only cross-domain pairs: **125**
   - D01->D10
   - D01->D11
   - D02->D05
@@ -174,7 +174,6 @@ Rows may import columns (`[graph].allowed`). `·` = forbidden direction.
   - D17->D20
   - D18->D01
   - D18->D08
-  - D18->D09
   - D18->D11
   - D18->D14
   - D18->D16
@@ -1130,6 +1129,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/git_observation.py`
 - `ouroboros/jsonl_tail.py`
 - `ouroboros/launcher_bootstrap.py`
+- `ouroboros/launcher_server_reaper.py`
 - `ouroboros/markdown_source.py`
 - `ouroboros/node_runtime.py`
 - `ouroboros/panic_source.py`

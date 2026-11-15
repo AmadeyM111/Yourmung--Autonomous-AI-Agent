@@ -227,13 +227,13 @@ def _patch_execute_candidate(monkeypatch, llm_module, execute):
 
     Upstream's ``LLMClient`` read ``_execute_candidate`` as a module global of
     ``ouroboros.llm``; the v7 split imports it into each lane mixin
-    (``llm_anthropic``, ``llm_fallback``, ``llm_gigachat``) from ``llm_attempt``,
+    (``llm_anthropic``, ``llm_fallback``) from ``llm_attempt``,
     so the historical single patch target no longer reaches the send. Patch the
     facade AND every lane that binds the name."""
     import importlib
 
     monkeypatch.setattr(llm_module, "_execute_candidate", execute)
-    for name in ("ouroboros.llm_anthropic", "ouroboros.llm_fallback", "ouroboros.llm_gigachat", "ouroboros.llm_local"):
+    for name in ("ouroboros.llm_anthropic", "ouroboros.llm_fallback", "ouroboros.llm_local"):
         module = importlib.import_module(name)
         if hasattr(module, "_execute_candidate"):
             monkeypatch.setattr(module, "_execute_candidate", execute)

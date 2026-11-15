@@ -253,40 +253,6 @@ def test_the_local_lane_measures_and_sends_the_same_single_line(tmp_path, monkey
 
 
 
-def _real_gigachat(monkeypatch, chat_statuses):
-    """The installed ``gigachat`` SDK itself (pinned in requirements-runtime.lock), with only its
-    two httpx transports replaced: every chat POST body and every auth POST is recorded."""
-    import httpx
-
-    from ouroboros.llm_gigachat import _GigaChatLaneMixin
-
-    posts = {"chat": [], "auth": 0}
-    statuses = iter(chat_statuses)
-
-    def chat(request):
-        posts["chat"].append(json.loads(request.content))
-        status = next(statuses)
-        body = {"choices": [{"message": {"role": "assistant", "content": "ok"}, "index": 0, "finish_reason": "stop"}],
-                "created": 1, "model": "GigaChat-2", "object": "chat.completion",
-                "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}}
-        return httpx.Response(status, json=body if status == 200 else {"status": status, "message": "refused"})
-
-    def auth(_request):
-        posts["auth"] += 1
-        return httpx.Response(200, json={"access_token": f"token-{posts['auth']}", "expires_at": 4_102_444_800_000})
-
-    real = _GigaChatLaneMixin._new_gigachat_client
-    built = []
-
-    def new(target, timeout=None, max_retries=None):
-        client = real(target, timeout=timeout, max_retries=max_retries)
-        client._client_instance = httpx.Client(base_url=client._settings.base_url, transport=httpx.MockTransport(chat))
-        client._auth_client_instance = httpx.Client(transport=httpx.MockTransport(auth))
-        built.append(client)
-        return client
-
-    monkeypatch.setattr(LLMClient, "_new_gigachat_client", staticmethod(new))
-    return posts, built
 
 
 

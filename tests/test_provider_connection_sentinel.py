@@ -160,7 +160,7 @@ def _named_settings(source: str) -> set[str]:
 def test_only_the_resolver_names_provider_credential_settings():
     files = [path for root in ("ouroboros", "supervisor", "scripts") for path in (REPO / root).rglob("*.py")]
     sources = {path.relative_to(REPO).as_posix(): path.read_text(encoding="utf-8")
-               for path in [*files, REPO / "server.py", REPO / "launcher.py"]}
+               for path in [*files, REPO / "server.py"]}
     readers = {name for name, text in sources.items()
                if any(key in text for key in ROUTE_CREDENTIAL_SETTING_KEYS) and _named_settings(text)}
     assert readers - OWNERS == set(JUSTIFIED), (
