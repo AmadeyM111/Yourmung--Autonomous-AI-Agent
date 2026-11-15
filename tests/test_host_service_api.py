@@ -12,7 +12,7 @@ from ouroboros.event_bus import CHAT_OUTBOUND, publish_event
 from ouroboros.skill_loader import compute_content_hash, save_enabled, save_review_state, save_skill_grants, SkillReviewState
 from ouroboros.utils import atomic_write_json
 from tests._store_shared import seed_result
-from tests.test_launcher_handoff_stop import native_guard  # noqa: F401
+from tests._native_guard import native_guard  # noqa: F401
 
 
 class FakeBridge:

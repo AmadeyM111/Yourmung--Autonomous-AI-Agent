@@ -173,22 +173,6 @@ def test_new_panic_is_still_broad_and_replaces_corrupt_pending(world, tmp_path):
     assert not pending.exists()
 
 
-def test_only_the_launchers_observed_panic_exit_requests_installation_completion():
-    launcher = ast.parse((REPO / "launcher.py").read_text())
-    calls = [node for node in ast.walk(launcher) if isinstance(node, ast.Call)
-             and any(kw.arg == "target" and isinstance(kw.value, ast.Name)
-                     and kw.value.id == "complete_pending_panic_sweep" for kw in node.keywords)]
-    assert len(calls) == 1
-    kwargs = next(kw.value for kw in calls[0].keywords if kw.arg == "kwargs")
-    assert any(isinstance(k, ast.Constant) and k.value == "installation"
-               and isinstance(v, ast.Constant) and v.value is True for k, v in zip(kwargs.keys, kwargs.values))
-    panic_branch = next(node for node in ast.walk(launcher) if isinstance(node, ast.If)
-                        and ast.unparse(node.test) == "exit_code == PANIC_EXIT_CODE")
-    assert calls[0] in list(ast.walk(panic_branch))
-    for path in (REPO / "server.py", REPO / "ouroboros" / "process_scope.py"):
-        for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "complete_pending_panic_sweep":
-                assert not any(kw.arg == "installation" for kw in node.keywords), str(path)
 
 
 def test_real_known_old_process_ends_but_new_marker_process_survives_manual_start(tmp_path, monkeypatch):

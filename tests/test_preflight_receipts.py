@@ -273,37 +273,6 @@ def test_a_new_process_reuses_a_complete_run_through_the_canonical_root_and_star
             for p in (tmp_path / f"task-{tag}").rglob(receipts.RECEIPTS_DIR)] == []
 
 
-def test_code_loaded_before_a_source_change_neither_mints_nor_accepts_while_fresh_processes_do(tmp_path):
-    install = _executing_copy(tmp_path)
-    repo = _tiny_repo(tmp_path)
-    canonical = tmp_path / "canonical"
-    loaded_a = _driver(tmp_path, "loaded-a", src=install, repo=repo, canonical=canonical, task="resolver",
-                       wait=True, runs=2)
-    try:
-        generation_a = _read(loaded_a, tmp_path, "loaded-a")["ready"]
-        changed = install / "ouroboros" / "preflight_node.py"
-        changed.write_text(changed.read_text(encoding="utf-8") + "\n# generation B\n", encoding="utf-8")
-        loaded_a.stdin.write("go\n")
-        loaded_a.stdin.flush()
-        old = _read(loaded_a, tmp_path, "loaded-a")
-        assert (old["error"], old["passed"], old["calls"]["pytest"]) == (None, True, 2), old  # tests still run
-        assert old["receipt"]["status"] == "declined"
-        assert old["receipt"]["reason"] == "the executing source changed after this process loaded it"
-        assert _receipt_files(canonical) == []
-
-        fresh = _run_once(tmp_path, "fresh-b", src=install, repo=repo, canonical=canonical, task="fresh")
-        assert fresh["baseline"] not in ("", generation_a)
-        assert (fresh["calls"]["pytest"], fresh["receipt"]["status"]) == (2, "published"), fresh
-        again = _run_once(tmp_path, "fresh-b-again", src=install, repo=repo, canonical=canonical, task="again")
-        assert (again["calls"], again["receipt"]["status"]) == ({"node": 0, "pytest": 0}, "reused"), again
-
-        loaded_a.stdin.write("go\n")  # B's receipt exists now; the A-loaded process still may not take it
-        loaded_a.stdin.flush()
-        old_again = _read(loaded_a, tmp_path, "loaded-a")
-        assert (old_again["baseline"], old_again["calls"]["pytest"]) == (generation_a, 2), old_again
-        assert old_again["receipt"]["status"] == "declined" and len(_receipt_files(canonical)) == 1
-    finally:
-        _stop(loaded_a)
 
 
 # The code of a pool worker (imported in the child as its pickled target): the REAL
@@ -432,42 +401,6 @@ if __name__ == "__main__":
 '''
 
 
-@pytest.mark.skipif("forkserver" not in multiprocessing.get_all_start_methods(),
-                    reason="this platform's multiprocessing offers no forkserver start method")
-@pytest.mark.parametrize("entry", ["server.py", "cli"])
-def test_a_pool_worker_pins_the_generation_it_loaded_never_a_later_disk(tmp_path, entry):
-    """Generation A is loaded; "ready" is past worker_ready and "held" has built its agent
-    when B lands. Both keep A and decline; a fresh forkserver worker pins B only if it loaded
-    B; a fork inherits its parent's A. A CPython <3.14 forkserver never preloads __main__, so
-    every child re-runs it; 3.14+ preloads a path __main__ once and children inherit it. The
-    assertions hold either way."""
-    install = _executing_copy(tmp_path)
-    helper = tmp_path / "helper"
-    helper.mkdir()
-    (helper / "c2_pool_worker.py").write_text(_POOL_WORKER, encoding="utf-8")
-    script = tmp_path / "server_life.py"
-    script.write_text(_SERVER_LIFE, encoding="utf-8")
-    data = tmp_path / "data"
-    env = {**os.environ, "OUROBOROS_DATA_DIR": str(data), "OUROBOROS_SETTINGS_PATH": str(data / "settings.json")}
-
-    done = subprocess.run([sys.executable, "-I", str(script), str(install), str(helper), str(data), entry],
-                          cwd=str(tmp_path), env=env, capture_output=True, text=True, timeout=900)
-
-    assert done.returncode == 0, done.stderr[-6000:]
-    out = json.loads(done.stdout.strip().splitlines()[-1])
-    assert out["exit"] == [0, 0, 0, 0] and out["parent"] == out["a"] != out["b"]
-    main = os.path.normpath(install / "server.py" if entry == "server.py" else script)
-    generation = {"A": out["a"], "B": out["b"]}
-    changed = ["", "the executing source changed after this process loaded it"]
-    for name, fact in out["facts"].items():
-        seen = json.dumps({name: fact})
-        assert os.path.normpath(fact["main"]) == main, seen
-        # the pin names the generation this worker loaded first, never a later disk read,
-        # and only a worker running nothing but B may mint or accept B
-        assert fact["baseline"] == generation[fact["loaded"]["utils"]], seen
-        assert fact["status"] == ([out["b"], ""] if set(fact["loaded"].values()) == {"B"} else changed), seen
-    assert out["facts"]["ready"]["loaded"] == out["facts"]["held"]["loaded"] == {"utils": "A", "agent": "A"}
-    assert out["facts"]["fork"]["loaded"]["utils"] == "A" and out["facts"]["fresh"]["loaded"]["agent"] == "B"
 
 
 _ENTRY_PROBE = r'''

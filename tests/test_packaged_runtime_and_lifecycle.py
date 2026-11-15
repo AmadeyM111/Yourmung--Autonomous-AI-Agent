@@ -80,15 +80,6 @@ def test_bundled_node_uses_the_same_bases(tmp_path, monkeypatch):
     assert platform_layer.resolve_bundled_node() == str(candidate)
 
 
-def test_bundle_dir_env_is_exported_to_the_server_and_cli():
-    """The two spawn seams must hand the bundle root down; nothing else can."""
-    launcher_src = (REPO_ROOT / "launcher.py").read_text(encoding="utf-8")
-    start_agent = launcher_src.split("def start_agent", 1)[1].split("\ndef ", 1)[0]
-    assert "BUNDLE_DIR_ENV" in start_agent
-
-    cli_src = (REPO_ROOT / "ouroboros" / "packaged_cli.py").read_text(encoding="utf-8")
-    inner_env = cli_src.split("def _inner_cli_env", 1)[1].split("\ndef ", 1)[0]
-    assert "BUNDLE_DIR_ENV: str(runtime.bundle_root)" in inner_env
 
 
 # --------------------------------------------------------------------------
@@ -169,14 +160,6 @@ def test_install_deps_reports_a_failing_pip(tmp_path):
 # launcher wrapper, bootstrap, and the restart loop — not die in a bare call.
 # --------------------------------------------------------------------------
 
-def test_the_launcher_wrapper_propagates_the_install_result(monkeypatch):
-    import launcher
-
-    monkeypatch.setattr(launcher, "_bootstrap_context", lambda: None)
-    monkeypatch.setattr(launcher, "_install_deps_impl", lambda ctx: False)
-    assert launcher._install_deps() is False
-    monkeypatch.setattr(launcher, "_install_deps_impl", lambda ctx: True)
-    assert launcher._install_deps() is True
 
 
 def test_bootstrap_repo_reports_a_failed_dependency_install(tmp_path, monkeypatch):
@@ -202,61 +185,6 @@ def test_bootstrap_repo_reports_a_failed_dependency_install(tmp_path, monkeypatc
     assert bootstrap_module.bootstrap_repo(context) is True  # no install needed, no failure
 
 
-def test_a_restart_with_a_failed_dependency_install_pauses_and_discloses(
-    monkeypatch, tmp_path, caplog,
-):
-    """XG-7B.3 through the REAL caller: agent_lifecycle_loop used to discard
-    _install_deps' result and restart an evolved checkout without the packages
-    its reviewed commit added. It must retry once, visibly, and name the
-    consequence when the retry also fails."""
-    import logging
-    import threading
-
-    import launcher
-
-    monkeypatch.setattr(launcher, "_shutdown_event", threading.Event())
-    monkeypatch.setattr(launcher, "_cleanup_recorded_server_process", lambda reason: [])
-    # The per-generation stray sweep must never signal a real process from a test.
-    monkeypatch.setattr(launcher, "_reap_same_install_strays", lambda reason: [])
-    monkeypatch.setattr(
-        launcher, "_cleanup_recorded_server_group_for_pid", lambda pid, reason: None,
-    )
-    monkeypatch.setattr(launcher, "_update_server_process_record_port", lambda pid, port: None)
-    monkeypatch.setattr(launcher, "_await_generation_endpoint", lambda *a, **kw: 52123)
-    monkeypatch.setattr(launcher, "_wait_for_server", lambda port, timeout=45, abort_event=None, proc=None: True)
-    monkeypatch.setattr(launcher, "PORT_FILE", tmp_path / "port")
-    monkeypatch.setattr(launcher, "_sync_existing_repo_from_bundle", lambda: None)
-    monkeypatch.setattr("time.sleep", lambda seconds: None)
-
-    install_calls = []
-
-    def _failing_install():
-        install_calls.append(1)
-        return False
-
-    monkeypatch.setattr(launcher, "_install_deps", _failing_install)
-
-    starts = []
-
-    def _fake_start_agent(port):
-        starts.append(port)
-        if len(starts) == 1:
-            return types.SimpleNamespace(
-                pid=1, returncode=launcher.RESTART_EXIT_CODE, wait=lambda: None,
-            )
-        launcher._shutdown_event.set()
-        return types.SimpleNamespace(pid=2, returncode=0, wait=lambda: None)
-
-    monkeypatch.setattr(launcher, "start_agent", _fake_start_agent)
-
-    with caplog.at_level(logging.ERROR, logger="launcher"):
-        launcher.agent_lifecycle_loop(port=52123)
-
-    assert len(install_calls) == 2, "no visible retry: the failed install was discarded"
-    assert len(starts) == 2, "the restart must still proceed under the crash fuse"
-    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
-    assert any("Dependency install failed" in m for m in errors)
-    assert any("crash fuse" in m for m in errors)
 
 
 # --------------------------------------------------------------------------
@@ -1059,38 +987,6 @@ def test_the_bind_host_is_never_stamped_from_settings_over_the_environment(monke
     assert os.environ["OUROBOROS_SERVER_HOST"] == "0.0.0.0"
 
 
-def test_start_agent_never_overwrites_an_operator_env_host(monkeypatch, tmp_path):
-    """XG-7B.2: the export exclusion made ENV the bind-host authority, but
-    start_agent re-stamped the MERGED settings value (usually the shipped
-    127.0.0.1 default no owner ever authored) AFTER apply_settings_to_env —
-    reintroducing for launcher-managed runs exactly the regression the
-    exclusion closed. Driven THROUGH start_agent, not a re-implementation."""
-    import io
-    import os
-
-    import launcher
-
-    # Environ restored by the autouse conftest snapshot: apply_settings_to_env mutates the live mapping.
-    captured = {}
-
-    def _capture_popen(command, **kwargs):
-        captured["env"] = dict(kwargs.get("env") or {})
-        return types.SimpleNamespace(pid=4242, stdout=io.BytesIO(b""), kill=lambda: None)
-
-    monkeypatch.setattr(launcher, "_hidden_popen", _capture_popen)
-    monkeypatch.setattr(launcher, "_write_server_process_record", lambda *a, **k: None)
-    monkeypatch.setattr(launcher, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(
-        launcher, "_load_settings", lambda: {"OUROBOROS_SERVER_HOST": "127.0.0.1"},
-    )
-
-    os.environ["OUROBOROS_SERVER_HOST"] = "0.0.0.0"  # the operator's explicit choice
-    launcher.start_agent(port=52123)
-    assert captured["env"]["OUROBOROS_SERVER_HOST"] == "0.0.0.0"
-
-    os.environ.pop("OUROBOROS_SERVER_HOST", None)  # silence: settings may stand in
-    launcher.start_agent(port=52123)
-    assert captured["env"]["OUROBOROS_SERVER_HOST"] == "127.0.0.1"
 
 
 def test_an_owner_restart_re_execs_without_the_inherited_runtime_mode_pin(monkeypatch, tmp_path):

@@ -253,7 +253,7 @@ def run_review_change(ctx, **arguments):
 '''
 
 _CARRIERS = ("VERSION", "pyproject.toml", "uv.lock", "web/package.json", "web/modules/api_types.js",
-             "README.md", "docs/ARCHITECTURE.md", "site/install/index.html", "docs/install/index.html")
+             "README.md", "docs/ARCHITECTURE.md", "docs/install/index.html")
 
 
 def _git(repo: pathlib.Path, *args: str) -> str:

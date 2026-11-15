@@ -229,17 +229,6 @@ class TestCompactionAndLanes:
         messages[1]["content"] = [_image_block("a")]
         assert _atomic_units(messages) == ()
 
-    def test_gigachat_text_placeholder(self):
-        from ouroboros.llm import LLMClient
-
-        text = LLMClient._gigachat_text([
-            {"type": "text", "text": "hello "},
-            _image_block("a"),
-        ])
-        assert "hello" in text
-        # The marker names our lane, never the model.
-        assert "[image omitted: our GigaChat transport lane cannot carry images" in text
-        assert "model has no vision" not in text
 
     def test_provider_payload_strips_internal_metadata(self):
         from ouroboros.llm import LLMClient

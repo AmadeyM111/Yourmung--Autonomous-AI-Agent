@@ -145,7 +145,6 @@ JUSTIFIED = {
     "scripts/run_external_review.py": "operator wrapper: provisions the built-in keys from the operator's own secrets",
     "scripts/reconcile_openrouter_cost.py": "explicit reconciliation: the saved OpenRouter key whose fingerprint bought "
                                             "the row, built-in or added; any other refuses as credential_mismatch, unsent",
-    "scripts/qualify_linux_appimage.py": "packaging qualification: writes an endpoint into its own test settings",
 }
 
 
@@ -161,7 +160,7 @@ def _named_settings(source: str) -> set[str]:
 def test_only_the_resolver_names_provider_credential_settings():
     files = [path for root in ("ouroboros", "supervisor", "scripts") for path in (REPO / root).rglob("*.py")]
     sources = {path.relative_to(REPO).as_posix(): path.read_text(encoding="utf-8")
-               for path in [*files, REPO / "server.py", REPO / "launcher.py"]}
+               for path in [*files, REPO / "server.py"]}
     readers = {name for name, text in sources.items()
                if any(key in text for key in ROUTE_CREDENTIAL_SETTING_KEYS) and _named_settings(text)}
     assert readers - OWNERS == set(JUSTIFIED), (

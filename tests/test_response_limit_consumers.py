@@ -186,16 +186,6 @@ def test_subscription_reviewer_sizing_reads_the_maximum_of_the_account_its_windo
     assert len(reads) == 2 * reads_per_sizing + 1  # the ack's own exact-account read; sizing adds none
 
 
-def test_gigachat_numeric_field_is_capped_before_its_real_accounted_send(transport, monkeypatch):
-    root, client, sent = transport
-    model = 'gigachat::GigaChat-2'
-    target = client._resolve_remote_target(model)
-    record_response_ack(root, provider='gigachat', model=model, base_url=target['base_url'], max_output_tokens=4096)
-    response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='ok', function_call=None), finish_reason='stop')],
-        usage=SimpleNamespace(prompt_tokens=5, completion_tokens=1, precached_prompt_tokens=0))
-    monkeypatch.setattr(client, '_get_gigachat_client', lambda *a, **k: SimpleNamespace(chat=lambda candidate: sent.append(candidate) or response))
-    client.chat([{'role': 'user', 'content': 'reply'}], model, max_tokens=65536)
-    assert sent[-1]['max_tokens'] == ua.last_physical_attempt_capture().max_completion_tokens == 4096
 
 
 def test_local_cap_is_bound_to_the_served_artifact_and_local_endpoint(transport, monkeypatch):

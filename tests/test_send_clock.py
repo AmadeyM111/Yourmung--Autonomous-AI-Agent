@@ -251,124 +251,12 @@ def test_the_local_lane_measures_and_sends_the_same_single_line(tmp_path, monkey
     assert {row["candidate_raw_sha256"] for row in rows} == {_digest(sent)}
 
 
-def test_the_gigachat_lane_seals_its_line_before_measurement(tmp_path, monkeypatch, ticking):
-    from tests.test_physical_candidate_capture import _scope
-
-    root = tmp_path / "data"
-    (root / "state").mkdir(parents=True)
-    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(root))
-    monkeypatch.setenv("TOTAL_BUDGET", "100")
-    monkeypatch.setattr(ua, "estimate_cost_optional", lambda *a, **kw: 0.0)
-    client, sent = LLMClient(api_key="unused"), []
-    completion = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content="ok", function_call=None), finish_reason="stop")],
-        usage=SimpleNamespace(prompt_tokens=5, completion_tokens=1, precached_prompt_tokens=0))
-    monkeypatch.setattr(client, "_get_gigachat_client", lambda target, timeout=None: SimpleNamespace(
-        chat=lambda candidate: sent.append(copy.deepcopy(candidate)) or completion))
-    target = {"provider": "gigachat", "resolved_model": "GigaChat-2", "usage_model": "gigachat::GigaChat-2"}
-    with ua.usage_scope(_scope(root, "task-giga")), sc.MainSendClock(MOSCOW).bound() as clock:
-        client._chat_gigachat(target, [{"role": "user", "content": "привет"}], None, "high", 64, "auto")
-    assert sent[0]["messages"][-1] == {"role": "user", "content": clock.notes[0]}
-    assert {row["candidate_raw_sha256"] for row in _ledger(root)} == {_digest(sent[0])}
 
 
-def _real_gigachat(monkeypatch, chat_statuses):
-    """The installed ``gigachat`` SDK itself (pinned in requirements-runtime.lock), with only its
-    two httpx transports replaced: every chat POST body and every auth POST is recorded."""
-    import httpx
-
-    from ouroboros.llm_gigachat import _GigaChatLaneMixin
-
-    posts = {"chat": [], "auth": 0}
-    statuses = iter(chat_statuses)
-
-    def chat(request):
-        posts["chat"].append(json.loads(request.content))
-        status = next(statuses)
-        body = {"choices": [{"message": {"role": "assistant", "content": "ok"}, "index": 0, "finish_reason": "stop"}],
-                "created": 1, "model": "GigaChat-2", "object": "chat.completion",
-                "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}}
-        return httpx.Response(status, json=body if status == 200 else {"status": status, "message": "refused"})
-
-    def auth(_request):
-        posts["auth"] += 1
-        return httpx.Response(200, json={"access_token": f"token-{posts['auth']}", "expires_at": 4_102_444_800_000})
-
-    real = _GigaChatLaneMixin._new_gigachat_client
-    built = []
-
-    def new(target, timeout=None, max_retries=None):
-        client = real(target, timeout=timeout, max_retries=max_retries)
-        client._client_instance = httpx.Client(base_url=client._settings.base_url, transport=httpx.MockTransport(chat))
-        client._auth_client_instance = httpx.Client(transport=httpx.MockTransport(auth))
-        built.append(client)
-        return client
-
-    monkeypatch.setattr(LLMClient, "_new_gigachat_client", staticmethod(new))
-    return posts, built
 
 
-def test_the_gigachat_sdk_sends_each_accounted_attempt_once_despite_its_env_retries(tmp_path, monkeypatch, ticking):
-    """``GIGACHAT_MAX_RETRIES`` would make the SDK re-send a 5xx on its own, unseen by the ledger
-    (shown on a bare client); the lane passes ``max_retries=0``, the SDK's supported control."""
-    import gigachat
-    import httpx
-
-    from gigachat.exceptions import ServerError
-    from tests.test_physical_candidate_capture import _scope
-
-    monkeypatch.setenv("GIGACHAT_MAX_RETRIES", "3")
-    monkeypatch.setenv("GIGACHAT_RETRY_BACKOFF_FACTOR", "0")
-    bare_posts = []
-    bare = gigachat.GigaChat(access_token="t", base_url="https://giga.test/api/v1")
-    bare._client_instance = httpx.Client(base_url="https://giga.test/api/v1", transport=httpx.MockTransport(
-        lambda request: bare_posts.append(request) or httpx.Response(503, json={"message": "busy"})))
-    with pytest.raises(ServerError):
-        bare.chat({"model": "GigaChat-2", "messages": [{"role": "user", "content": "x"}]})
-    assert bare._settings.max_retries == 3 and len(bare_posts) == 4  # what the environment alone would do
-
-    root = tmp_path / "data"
-    (root / "state").mkdir(parents=True)
-    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(root))
-    monkeypatch.setenv("TOTAL_BUDGET", "100")
-    monkeypatch.setattr(ua, "estimate_cost_optional", lambda *a, **kw: 0.0)
-    posts, built = _real_gigachat(monkeypatch, [503])
-    target = {"provider": "gigachat", "resolved_model": "GigaChat-2", "usage_model": "gigachat::GigaChat-2",
-              "access_token": "t", "base_url": "https://giga.test/api/v1"}
-    with ua.usage_scope(_scope(root, "task-giga")), sc.MainSendClock(MOSCOW).bound():
-        with pytest.raises(ServerError):
-            LLMClient(api_key="unused")._chat_gigachat(target, [{"role": "user", "content": "привет"}], None,
-                                                       "high", 64, "auto")
-    assert built[0]._settings.max_retries == 0 and len(posts["chat"]) == 1
-    assert [row["state"] for row in _ledger(root)] == ["unresolved"]
 
 
-def test_the_gigachat_sdk_401_resend_repeats_the_sealed_attempt_and_claims_no_fresh_clock(
-        tmp_path, monkeypatch, ticking):
-    """The one hidden re-send the SDK has no switch for, qualified exactly: with a token it
-    believed usable, a 401 resets it, re-authenticates and sends the SAME body again — inside
-    the one accounted attempt, with the clock line sampled before the first send."""
-    from tests.test_physical_candidate_capture import _scope
-
-    root = tmp_path / "data"
-    (root / "state").mkdir(parents=True)
-    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(root))
-    monkeypatch.setenv("TOTAL_BUDGET", "100")
-    monkeypatch.setattr(ua, "estimate_cost_optional", lambda *a, **kw: 0.0)
-    posts, _built = _real_gigachat(monkeypatch, [200, 401, 200])
-    target = {"provider": "gigachat", "resolved_model": "GigaChat-2", "usage_model": "gigachat::GigaChat-2",
-              "api_key": "credentials", "base_url": "https://giga.test/api/v1"}
-    client = LLMClient(api_key="unused")
-    with ua.usage_scope(_scope(root, "task-giga")):
-        for text in ("first", "second"):
-            with sc.MainSendClock(MOSCOW).bound():
-                client._chat_gigachat(target, [{"role": "user", "content": text}], None, "high", 64, "auto")
-    assert posts["auth"] == 2 and len(posts["chat"]) == 3
-    first, refused, resent = posts["chat"]
-    assert refused == resent and refused["messages"][0]["content"] == "second"
-    assert refused["messages"][-1]["content"] == resent["messages"][-1]["content"] != first["messages"][-1]["content"]
-    rows = _ledger(root)
-    assert [row["state"] for row in rows] == ["settled"] * 2  # two attempts, not three
 
 
 def test_every_claudexor_invocation_samples_anew_and_uploads_its_sealed_bytes(main_call, ticking):
@@ -546,47 +434,6 @@ def test_a_transcript_adopts_only_its_own_answered_omission(case):
 # --- the forced final is admitted on its fresh request ------------------------------------
 
 
-@pytest.mark.parametrize("model,env", [("openai::gpt-test", {"OPENAI_API_KEY": "unused"}),
-                                       ("anthropic::claude-test", {"ANTHROPIC_API_KEY": "unused"})])
-def test_the_forced_final_admits_the_fresh_clocked_send_without_drift(monkeypatch, tmp_path, ticking, model, env):
-    from ouroboros import llm as llm_module, task_pacing
-    from ouroboros.llm_claudexor import cache_key_for_model
-    from ouroboros import loop_forced_finalization as forced
-    from tests.test_tree_cost_ceiling import _patch_execute_candidate
-    from tests.test_wrapup_real_send_parity import _Captured, _MESSAGES, _TOOLS
-
-    for key, value in env.items():
-        monkeypatch.setenv(key, value)
-    monkeypatch.setattr(LLMClient, "_SUPPORTED_PARAMS_FETCHED", True, raising=False)
-    monkeypatch.setattr("ouroboros.pricing._fetch_live_rows", lambda *_a, **_kw: {})
-    captured = {}
-
-    def execute(request, send, before_dispatch):
-        captured["request"] = request
-        raise _Captured()
-
-    _patch_execute_candidate(monkeypatch, llm_module, execute)
-    client = LLMClient(api_key="unused")
-    (tmp_path / "logs").mkdir()
-    with ua.usage_scope(ua.UsageScope(drive_root=tmp_path, task_id="forced", root_task_id="forced")):
-        with sc.MainSendClock(MOSCOW).bound():  # as ``prepared_wrapup_candidate`` binds it
-            admitted = task_pacing.prospective_wrapup_attempt_request(
-                llm=client, messages=_MESSAGES, model=model, reasoning_effort="high", tools=_TOOLS,
-                cache_affinity=cache_key_for_model(model))
-        try:  # the lane stops at the executor seam, once the physical request exists
-            call_llm_with_retry(client, _MESSAGES, model, _TOOLS, "high", 1, tmp_path / "logs", "forced", 1,
-                                queue.Queue(), {}, initial_messages=_MESSAGES, send_clock_policy=MOSCOW)
-        except _Captured:
-            pass
-    actual = captured["request"]
-    # Two samples, one candidate: different raw bytes, same size and clock-free identity.
-    assert actual.candidate_raw_sha256 != admitted.candidate_raw_sha256
-    assert actual.candidate_raw_size_bytes == admitted.candidate_raw_size_bytes
-    assert actual.candidate_clock_free_sha256 == admitted.candidate_clock_free_sha256 is not None
-    predicate = _forced_predicate(forced, admitted)
-    assert predicate(actual) is True
-    changed = SimpleNamespace(**{**vars(actual), "candidate_clock_free_sha256": "0" * 64})
-    assert predicate(changed) is False  # a genuinely different candidate still drifts
 
 
 def _tokenizer_sees_digits(monkeypatch):

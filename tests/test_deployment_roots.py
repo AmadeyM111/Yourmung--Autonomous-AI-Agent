@@ -120,39 +120,6 @@ def test_a_direct_server_names_its_executing_checkout_before_imports(tmp_path, e
     assert facts["lock"] is False, "importing the server admits nothing"
 
 
-def test_the_launcher_requests_the_configured_port_and_stamps_its_child(monkeypatch, tmp_path):
-    import launcher
-
-    monkeypatch.delenv("OUROBOROS_SERVER_PORT", raising=False)
-    assert launcher._requested_server_port() == launcher.AGENT_SERVER_PORT
-    monkeypatch.setenv("OUROBOROS_SERVER_PORT", "9234")
-    assert launcher._requested_server_port() == 9234
-
-    repo_dir = tmp_path / "repo"
-    repo_dir.mkdir()
-    (repo_dir / "server.py").write_text("print('server')\n", encoding="utf-8")
-    captured = {}
-
-    class FakeProcess:
-        pid = 4243
-        stdout = type("Out", (), {"readline": lambda self, _limit=-1: b""})()
-
-    def fake_popen(cmd, **kwargs):
-        captured.update(kwargs, cmd=cmd)
-        return FakeProcess()
-
-    monkeypatch.setattr(launcher, "IS_WINDOWS", False)
-    monkeypatch.setattr(launcher, "DATA_DIR", tmp_path / "data")
-    monkeypatch.setattr(launcher, "REPO_DIR", repo_dir)
-    monkeypatch.setattr(launcher, "EMBEDDED_PYTHON", sys.executable)
-    monkeypatch.setattr(launcher, "_load_settings", lambda: {})
-    monkeypatch.setattr(launcher, "_apply_settings_to_env", lambda _settings: None)
-    monkeypatch.setattr(launcher, "_hidden_popen", fake_popen)
-    launcher.start_agent(port=launcher._requested_server_port())
-    assert captured["env"]["OUROBOROS_SERVER_PORT"] == "9234"
-    assert captured["env"]["OUROBOROS_LAUNCHER_STOP_STDIN"] == "1" and captured["stdin"] is subprocess.PIPE
-    record = json.loads((tmp_path / "data" / "state" / "server_process.json").read_text(encoding="utf-8"))
-    assert record["port"] == 9234 and isinstance(record.get("fingerprint"), dict)
 
 
 def _consecutive_free_ports(count: int) -> int:

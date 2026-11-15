@@ -52,25 +52,6 @@ def test_the_default_target_is_still_the_immutable_image():
     assert _entrypoint(stages["runtime"]["lines"]) == ["python", "server.py"]
 
 
-def test_the_managed_target_hosts_the_launcher_over_a_complete_released_seed():
-    stages = _stages()
-    managed = stages["managed"]
-    assert managed["from"] == "runtime"
-    text = "\n".join(managed["lines"])
-    assert "COPY --from=ouroboros-seed repo.bundle repo_bundle_manifest.json /opt/ouroboros/seed/" in text
-    assert "bundle verify /opt/ouroboros/seed/repo.bundle" in text, "a shallow seed fails the build"
-    entry = _entrypoint(managed["lines"])
-    assert entry[:3] == ["python", "/app/launcher.py", "--no-ui"]
-    assert entry[entry.index("--seed-bundle") + 1] == "/opt/ouroboros/seed"
-    assert entry[entry.index("--runtime-venv") + 1] == "/ouroboros/body/venv"
-    assert '["--launch-intent", "automatic"]' in text
-    layout = dict(re.findall(r"(OUROBOROS_[A-Z_]+|HOME)=(\S+)", text))
-    assert layout["OUROBOROS_REPO_DIR"] == "/ouroboros/body/repo"
-    assert layout["OUROBOROS_DATA_DIR"] == "/ouroboros/data"
-    assert layout["OUROBOROS_PID_FILE"].startswith("/ouroboros/data/"), "a second container sharing data loses the lock"
-    for key in ("OUROBOROS_SUBAGENT_PROJECTS_ROOT", "OUROBOROS_SUBAGENT_WORKTREE_ROOT", "OUROBOROS_DELIVERABLES_ROOT"):
-        assert layout[key].startswith("/ouroboros/work/")
-    assert layout["HOME"] == "/ouroboros/home"
 
 
 def test_the_compose_carrier_is_the_one_executable_recipe():
@@ -169,20 +150,3 @@ def test_boot_health_fails_only_when_the_phase_is_failed():
             server.shutdown()
 
 
-def test_the_guides_point_to_the_carrier_instead_of_repeating_it():
-    deployment = (REPO / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
-    assert "packaging/docker/compose.yaml" in deployment and "```yaml" not in deployment
-    assert "python-build-standalone release 20261009" in deployment
-    assert "CPython 3.10.22 and SQLite 3.53.1" in deployment
-    assert "does not replace" in deployment
-    assert "installing the app again" in deployment
-    assert "boot.phase" in deployment and "no start deadline" in deployment
-    readme = (REPO / "docs" / "ENGINE_README.md").read_text(encoding="utf-8")
-    assert "CPython 3.10.22 and SQLite 3.53.1" in readme
-    assert "install the app again" in readme
-    for page in (REPO / "site" / "install" / "index.html", REPO / "docs" / "install" / "index.html"):
-        html = page.read_text(encoding="utf-8")
-        assert "CPython 3.10.22 and SQLite 3.53.1" in html
-        assert "install the app again" in html
-    assert "packaging/docker/compose.yaml" in readme
-    assert "docker/compose.yaml" in (REPO / "packaging" / "systemd" / "README.md").read_text(encoding="utf-8")

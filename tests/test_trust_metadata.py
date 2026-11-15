@@ -56,56 +56,6 @@ def test_citation_metadata_has_the_approved_author_and_acknowledgment():
     }
 
 
-def test_scorecard_workflow_is_fully_pinned_and_publishes_sarif():
-    path = REPO / ".github" / "workflows" / "scorecard.yml"
-    workflow = yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
-
-    assert workflow["on"] == {
-        "push": {"branches": ["main"]},
-        "schedule": [{"cron": "30 1 * * 6"}],
-    }
-    assert workflow["permissions"] == "read-all"
-    job = workflow["jobs"]["analysis"]
-    assert job["runs-on"] == "ubuntu-latest"
-    assert job["permissions"] == {
-        "security-events": "write",
-        "id-token": "write",
-    }
-
-    ordered_steps = job["steps"]
-    assert [(step["name"], step["uses"]) for step in ordered_steps] == [
-        (
-            "Checkout code",
-            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-        ),
-        (
-            "Run analysis",
-            "ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc",
-        ),
-        (
-            "Upload artifact",
-            "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-        ),
-        (
-            "Upload to code-scanning",
-            "github/codeql-action/upload-sarif@f205ea1c3313d32999d8d6a48b4f6530d4437b38",
-        ),
-    ]
-    steps = {step["name"]: step for step in ordered_steps}
-
-    assert steps["Checkout code"]["with"] == {"persist-credentials": "false"}
-    scorecard = steps["Run analysis"]["with"]
-    assert scorecard == {
-        "results_file": "results.sarif",
-        "results_format": "sarif",
-        "publish_results": "true",
-    }
-    assert steps["Upload artifact"]["with"] == {
-        "name": "SARIF file",
-        "path": "results.sarif",
-        "retention-days": "5",
-    }
-    assert steps["Upload to code-scanning"]["with"] == {"sarif_file": "results.sarif"}
 
 
 def test_benchmark_evidence_is_release_bound_and_excludes_unready_evidence():

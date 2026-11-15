@@ -160,42 +160,6 @@ def _expected_text(row: dict) -> str:
     return content if isinstance(content, str) else [b["text"] for b in content if b.get("type") == "text"][-1]
 
 
-@pytest.mark.parametrize("book", [False, True], ids=["no-handbook", "handbook"])
-def test_each_round_seals_the_newest_text_row_and_only_marker_lanes_render_it(monkeypatch, book):
-    seen, observed = {lane: [] for lane in (*_MARKED, *_PLAIN)}, []
-    for number, messages, shadow in _rounds(book):
-        expected = _EXPECTED[number - 1]
-        assert [i for i, m in enumerate(messages) if "cache_control" in m] == [expected], number
-        assert _unmarked(messages) == shadow, "the seal never changes canonical content"
-        # A view authored over the last observed send still binds: the move is presentation only.
-        assert cc._view_source_messages(messages[:len(observed)]) == cc._view_source_messages(observed)
-        observed = copy.deepcopy(messages)
-        hosts = [i for i, m in enumerate(messages) if HOST_TEXT_SHA_KEY in m]
-        assert all(host_row_intact(messages[i]) for i in hosts)
-        newest = {max(i for i in hosts if messages[i][HOST_CONTEXT_KIND_KEY] == kind)
-                  for kind in {messages[i][HOST_CONTEXT_KIND_KEY] for i in hosts}}
-        assert _obsolete_host_rows(messages) == set(hosts) - newest
-        assert all(read_tool_result_record(m)["state"] == "recorded" for m in messages if TOOL_RESULT_RECORD_KEY in m)
-        for lane in seen:
-            payload = _payload(lane, messages, monkeypatch)
-            seen[lane].append(payload)
-            if lane in _MARKED:
-                assert _marked_texts(payload) == [_expected_text(messages[expected])], (lane, number)
-            else:
-                assert "cache_control" not in json.dumps(payload["messages"]), lane
-                assert _wire(payload) == _wire(_payload(lane, _unmarked(messages), monkeypatch)), lane
-            if lane in ("anthropic", "openrouter-anthropic"):
-                tools = payload["tools"]
-                assert len(LLMClient._payload_cache_breakpoints(payload)) == 4
-                assert ("cache_control" in tools[-1]) == (not book), "schemas get a marker only from a free slot"
-    for lane, payloads in seen.items():
-        for previous, current in zip(payloads, payloads[1:]):
-            if lane in _MARKED:
-                (before, [mark]), (after, [moved]) = _blocks(previous), _blocks(current)
-                assert after[:mark + 1] == before[:mark + 1], "the last request's cached prefix is repeated"
-                assert moved > mark, "the boundary advances every round"
-            else:
-                assert _wire(current)[:len(_wire(previous))] == _wire(previous), "byte-for-byte extension"
 
 
 def test_native_replay_stays_exact_and_unmarked_while_the_boundary_follows(monkeypatch):

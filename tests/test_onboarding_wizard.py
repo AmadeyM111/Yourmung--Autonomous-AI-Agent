@@ -1068,25 +1068,6 @@ def test_settings_save_refuses_lock_timeout_without_deleting_the_owner_lock(
     assert lock_path.read_text(encoding="utf-8") == "other-writer"
 
 
-def test_the_launcher_onboarding_module_authors_no_onboarding_settings():
-    """CHANGED SUBJECT (D-8 closure). This used to pin that the desktop wizard
-    save callback bound `save_settings` and passed the fresh-install safety
-    default. That callback is gone: every host completes through
-    `POST /api/onboarding/complete`, which authors the default itself.
-
-    What is worth pinning now is the inverse, and it has since gone all the way:
-    the module persists NOTHING. Its pre-server normalization is applied to the
-    process environment and re-derived by every reader, so `save_settings` is no
-    longer bound at all and the setup window gets a lifecycle bridge with no
-    persistence."""
-    from ouroboros import launcher_onboarding
-
-    assert getattr(launcher_onboarding, "save_settings", None) is None
-    source = pathlib.Path(launcher_onboarding.__file__).read_text(encoding="utf-8")
-    assert "def save_wizard" not in source
-    assert "onboarding_safety_default" not in source
-    assert "prepare_onboarding_settings" not in source
-    assert "save_settings(" not in source
 
 
 def test_wizard_rejects_a_newly_typed_short_key():

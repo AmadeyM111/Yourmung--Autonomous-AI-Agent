@@ -105,21 +105,6 @@ class TestAdvisoryUsageEmit:
         # No exception — pending_events may or may not have an entry
 
 
-@pytest.mark.parametrize("model,expected_provider", [
-    ("anthropic::claude-opus-4.6", "anthropic"),
-    ("openai::gpt-5.5", "openai"),
-    ("openai-compatible::my-model", "openai-compatible"),
-    ("cloudru::GigaChat-2-Max", "cloudru"),
-    ("gigachat::GigaChat-3-Ultra", "gigachat"),
-    ("minimax::MiniMax-M3", "minimax"),
-    ("anthropic/claude-opus-4.6", "openrouter"),  # unprefixed → OpenRouter
-    ("google/gemini-3.5-flash", "openrouter"),
-    ("", "openrouter"),
-])
-def test_infer_provider_from_model(model, expected_provider):
-    """infer_provider_from_model must return correct provider for all prefixes."""
-    from ouroboros.pricing import infer_provider_from_model
-    assert infer_provider_from_model(model) == expected_provider
 
 
 class TestScopeReviewProviderAttribution:

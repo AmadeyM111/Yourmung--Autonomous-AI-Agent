@@ -69,7 +69,7 @@ EVIDENCE_NAMESPACE = "image_input"
 _EVIDENCE_FRESH_SEC = 24 * 3600
 # Our own lanes that cannot carry image bytes: llama.cpp is launched without a
 # vision handler, and the GigaChat lane flattens message content to text.
-_OWN_LANES_WITHOUT_IMAGES = {"local": "local llama.cpp", "gigachat": "GigaChat"}
+_OWN_LANES_WITHOUT_IMAGES = {"local": "local llama.cpp"}
 _IMAGE_TYPES = frozenset({"image_url", "image"})
 _OFF_MARKER = "[image omitted: the image-input mode is Off]"
 # A documented field present in a shape this parser does not read.

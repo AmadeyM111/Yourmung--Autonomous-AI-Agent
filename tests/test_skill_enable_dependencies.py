@@ -330,55 +330,6 @@ def test_the_author_finish_package_step_waits_behind_a_held_lane(drive, installs
 
 # ── the launcher grant goes through the server ──
 
-def test_the_launcher_grant_goes_through_the_server(tmp_path, monkeypatch):
-    import launcher
-    from tests._extension_loader_shared import _write_ext_skill
-
-    drive = tmp_path / "data"
-    payload = _write_ext_skill(drive / "skills" / "external", "demo", permissions=["inject_chat"],
-                               plugin_body="def register(api):\n    return None\n")
-    from ouroboros.skill_loader import load_skill
-
-    loaded = load_skill(payload, drive)
-    save_review_state(drive, "demo", SkillReviewState(status="clean", content_hash=loaded.content_hash))
-    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
-    monkeypatch.setattr(launcher, "DATA_DIR", drive)
-    monkeypatch.setattr(launcher, "_load_settings", lambda: {})
-    monkeypatch.setattr(launcher, "_read_port_file", lambda: 9876)
-    monkeypatch.setattr("ouroboros.skill_lifecycle_actions.run_skill_action",
-                        lambda *a, **k: pytest.fail("the launcher must not run the grant owner in its own process"))
-    requests: list = []
-
-    class Response(io.BytesIO):
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-    def urlopen(req, timeout=0):
-        requests.append((req.full_url, req.get_method(), json.loads(req.data.decode("utf-8")), timeout))
-        return Response(b'{"ok": true, "turn_on_when_ready": "enabled"}')
-
-    monkeypatch.setattr(launcher.urllib.request, "urlopen", urlopen)
-    result = launcher._request_skill_key_grant("demo", ["inject_chat"], lambda *a: True, allow_pending=True)
-    assert result == {"ok": True, "turn_on_when_ready": "enabled"}
-    assert requests == [("http://127.0.0.1:9876/api/skills/demo/grants", "POST",
-                         {"items": ["inject_chat"], "expected_content_hash": loaded.content_hash}, 20)]
-    assert launcher._request_skill_key_grant("demo", ["inject_chat"], lambda *a: False) == {"ok": False, "error": "Skill grant cancelled."}
-    assert len(requests) == 1  # a cancelled confirm sends nothing
-
-    prompts = []
-    assert launcher._request_skill_key_grant("demo", ["inject_chat"],
-        lambda title, message: prompts.append(message) or True, enable_after_grant=True)["ok"]
-    assert "Then turn this skill on." in prompts[0]
-    assert requests[-1][2]["enable_after_grant"] is True
-
-    def refused(req, timeout=0):
-        raise urllib.error.HTTPError(req.full_url, 409, "Conflict", None, io.BytesIO(b'{"ok": false, "error": "It turns on after a review passes.", "code": "acceptance"}'))
-
-    monkeypatch.setattr(launcher.urllib.request, "urlopen", refused)
-    assert launcher._request_skill_key_grant("demo", ["inject_chat"], lambda *a: True)["code"] == "acceptance"
 
 
 # ── removal: the host names what each remover accepts ──

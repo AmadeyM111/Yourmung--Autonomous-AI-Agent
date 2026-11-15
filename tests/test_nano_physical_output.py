@@ -92,20 +92,6 @@ def test_a_large_messages_system_field_lowers_the_anthropic_allowance(transport,
     assert short["max_tokens"] - large["max_tokens"] > 15_000
 
 
-def test_the_gigachat_lane_applies_the_same_rule(transport, monkeypatch):
-    _root, client, sent = transport
-    completion = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content="ok", function_call=None), finish_reason="stop")],
-        usage=SimpleNamespace(prompt_tokens=5, completion_tokens=1, precached_prompt_tokens=0))
-    monkeypatch.setattr(client, "_get_gigachat_client", lambda target, timeout=None: SimpleNamespace(
-        chat=lambda candidate: sent.append(copy.deepcopy(candidate)) or completion))
-    target = {"provider": "gigachat", "resolved_model": "GigaChat-2", "usage_model": "gigachat::GigaChat-2"}
-    physical = _physical(density=1.1)
-    with ua.bind_physical_attempt_context(physical):
-        client._chat_gigachat(target, [{"role": "user", "content": "привет " * 30_000}], [TOOL], "high", C, "auto")
-    assert "functions" in sent[0] and sent[0]["max_tokens"] == _rule(sent[0], physical, "max_tokens") < C
-    client._chat_gigachat(target, [{"role": "user", "content": "привет " * 30_000}], [TOOL], "high", C, "auto")
-    assert sent[1]["max_tokens"] == C  # unbound (no Main context): the caller's ceiling, as before
 
 
 def test_a_payload_without_a_numeric_field_stays_without_one(transport):

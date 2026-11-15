@@ -195,28 +195,6 @@ def test_proxy_routed_installs_keep_sdk_defaults_unless_a_bundle_exists(monkeypa
     client.close()
 
 
-def test_gigachat_client_receives_the_bundle_only_when_configured(monkeypatch, tmp_path):
-    from ouroboros.llm_gigachat import _GigaChatLaneMixin
-
-    seen: list = []
-    module = types.ModuleType("gigachat")
-
-    class _GigaChat:
-        def __init__(self, **kwargs):
-            seen.append(kwargs)
-
-    module.GigaChat = _GigaChat  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "gigachat", module)
-    target = {"api_key": "k", "scope": "GIGACHAT_API_PERS", "verify_ssl_certs": True}
-
-    _GigaChatLaneMixin._new_gigachat_client(target)
-    assert "ca_bundle_file" not in seen[-1]
-
-    extra, _cert, _key = _throwaway_ca(tmp_path)
-    monkeypatch.setenv("OUROBOROS_EXTRA_CA_BUNDLE", str(extra))
-    _GigaChatLaneMixin._new_gigachat_client(target)
-    assert seen[-1]["ca_bundle_file"] == net_transport.extra_ca_bundle()
-    assert seen[-1]["verify_ssl_certs"] is True
 
 
 @pytest.mark.serial

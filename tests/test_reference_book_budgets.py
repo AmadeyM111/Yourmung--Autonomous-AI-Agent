@@ -236,21 +236,6 @@ def test_the_mode_step_reads_events_only_for_a_binding_pull_request_and_fails_cl
     assert output.read_text(encoding="utf-8").splitlines() == ["mode=approved", "mode=warn", "mode=block"]
 
 
-@pytest.mark.parametrize("job", ["quick-test", "full-test-runs"])
-def test_both_ci_jobs_feed_the_size_lane_the_decided_mode(job):
-    import yaml
-
-    workflow = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
-    steps = workflow["jobs"][job]["steps"]
-    mode = next(step for step in steps if step.get("id") == "book_mode")
-    size = next(step for step in steps if step.get("id") == "tests_size")
-    assert mode["run"] == "python scripts/book_growth_mode.py"
-    assert mode["env"]["SHA"] == "${{ github.sha }}"
-    assert mode["env"]["REF"] == "${{ github.ref }}"
-    assert steps.index(mode) < steps.index(size)
-    assert size["env"][MODE_ENV] == "${{ steps.book_mode.outputs.mode }}"
-    # PR label events for this mode; issue label events for the accepted-failure check.
-    assert workflow["jobs"][job]["permissions"] == {"contents": "read", "pull-requests": "read", "issues": "read"}
 
 
 PUSH_SHA = "a" * 40

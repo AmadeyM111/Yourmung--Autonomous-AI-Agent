@@ -370,67 +370,8 @@ def _running_in(monkeypatch, mode):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", mode)
 
 
-@pytest.mark.parametrize("writer, key, value", [  # each value differs from its shipped default
-    ("launcher-runtime-mode", "OUROBOROS_RUNTIME_MODE", "light"),
-    ("launcher-auto-grant", "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS", "false"),
-    ("tool-timeout", "OUROBOROS_TOOL_TIMEOUT_SEC", 900),
-])
-def test_an_incidental_writer_lands_its_key_not_the_reads_proposals(install, monkeypatch, writer, key, value):
-    """The launcher's two natively confirmed owner decisions and the agent's ``set_tool_timeout`` each
-    change one key, read and written inside the settings lock. Only that key is authored: the proposals
-    (unauthored slots, a never-configured install's factory catalog) follow the next access change, every
-    saved value — blank, default-equal, another provider's id, the pending next-boot mode — stays as
-    written, and an owner write landing while the writer reads is not reverted."""
-    import threading
-
-    from ouroboros.gateway import owner_settings
-
-    _running_in(monkeypatch, "advanced")
-    _write(install, SAVED_CHOICES)
-    assert _pool_targets(cfg.load_settings()) == [ANTHROPIC[0]], "the read mints the factory panel"
-    read, landed = owner_settings._owner_read_settings_raw, threading.Event()
-
-    def read_beside_a_concurrent_owner_write(*args, **kwargs):
-        document = read(*args, **kwargs)
-        if not getattr(read_beside_a_concurrent_owner_write, "started", False):
-            read_beside_a_concurrent_owner_write.started = True
-            threading.Thread(target=lambda: (owner_settings._owner_update_settings(
-                owner_settings.fields_on_saved_document({"OUROBOROS_UI_LANGUAGE": "ru"})), landed.set()),
-                daemon=True).start()
-            landed.wait(0.3)  # after a read outside the lock it lands now; inside the lock it waits its turn
-        return document
-
-    monkeypatch.setattr(owner_settings, "_owner_read_settings_raw", read_beside_a_concurrent_owner_write)
-    _incidental_write(writer, value)
-    assert landed.wait(10)
-    stored = json.loads(install.read_text(encoding="utf-8"))
-    assert stored == {**SAVED_CHOICES, key: value, "OUROBOROS_UI_LANGUAGE": "ru"}, stored
-    if writer == "tool-timeout":  # the process takes the field alone: no saved mode reaches the environment
-        assert (os.environ["OUROBOROS_TOOL_TIMEOUT_SEC"], os.environ["OUROBOROS_RUNTIME_MODE"]) == ("900", "advanced")
-    owner_settings._owner_update_settings(lambda current: {**current, "OPENROUTER_API_KEY": "sk-or-present-key"},
-                           allow_safety_lowering=True)
-    assert _task_start().settings["OUROBOROS_MODEL"] == SHIPPED[0]
-    assert _pool_targets(cfg.load_settings()) == list(OPENROUTER_REVIEW_DEFAULTS["triad"])
 
 
-@pytest.mark.parametrize("writer, key, value", [
-    ("launcher-runtime-mode", "OUROBOROS_RUNTIME_MODE", "pro"),
-    ("launcher-auto-grant", "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS", "false"),
-    ("tool-timeout", "OUROBOROS_TOOL_TIMEOUT_SEC", 900),
-])
-def test_an_incidental_writer_creating_the_document_authors_no_other_choice(install, monkeypatch, writer, key, value):
-    """An environment-configured install has no document: the writer creates one with its key and the
-    optional bounds as they resolve now (a document's presence turns their absence into the legacy
-    finite values), never a default over an environment choice — the running Access is not raised."""
-    _running_in(monkeypatch, "light")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env-key")
-    _incidental_write(writer, value)
-    bounds = {bound: SETTINGS_DEFAULTS[bound] for bound in ("OUROBOROS_MAX_ROUNDS", "OUROBOROS_TASK_ABS_CEILING_SEC")}
-    assert json.loads(install.read_text(encoding="utf-8")) == {**bounds, key: value}
-    settings = cfg.load_settings()
-    assert {bound: settings[bound] for bound in bounds} == bounds
-    assert settings["OUROBOROS_RUNTIME_MODE"] == (value if key == "OUROBOROS_RUNTIME_MODE" else "light")
-    assert _slots(_task_start()) == ANTHROPIC
 
 
 # --- C / 3A / 4A: the factory catalog over the effective configuration -------------------

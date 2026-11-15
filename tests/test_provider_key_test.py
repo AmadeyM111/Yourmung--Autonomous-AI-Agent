@@ -348,63 +348,6 @@ def test_cleared_compatible_draft_does_not_restore_legacy_pair(monkeypatch):
     assert body == {"ok": False, "error": "Provider is not configured"}
 
 
-@pytest.mark.parametrize(
-    "model,settings,expected",
-    [
-        ("openai/test", {"OPENROUTER_API_KEY": ""}, {
-            "provider": "openrouter", "api_key": "", "base_url": "https://openrouter.ai/api/v1",
-        }),
-        ("openai::gpt-5.6-terra", {"OPENAI_API_KEY": "oa"}, {
-            "provider": "openai", "api_key": "oa", "base_url": "https://api.openai.com/v1",
-        }),
-        ("anthropic::claude-opus-5", {"ANTHROPIC_API_KEY": "ant"}, {
-            "provider": "anthropic", "api_key": "ant", "base_url": "https://api.anthropic.com/v1",
-        }),
-        ("minimax::MiniMax-M3", {"MINIMAX_API_KEY": "mm", "MINIMAX_REGION": "cn_zh"}, {
-            "provider": "minimax", "api_key": "mm", "base_url": "https://api.minimaxi.com/v1",
-        }),
-        ("cloudru::model", {
-            "CLOUDRU_FOUNDATION_MODELS_API_KEY": "cloud",
-            "CLOUDRU_FOUNDATION_MODELS_BASE_URL": "https://cloud.example/v1",
-        }, {"provider": "cloudru", "api_key": "cloud", "base_url": "https://cloud.example/v1"}),
-        ("gigachat::GigaChat-2-Max", {
-            "GIGACHAT_CREDENTIALS": "giga", "GIGACHAT_USER": "u", "GIGACHAT_PASSWORD": "p",
-            "GIGACHAT_SCOPE": "GIGACHAT_API_CORP", "GIGACHAT_BASE_URL": "https://giga.example/v1",
-            "GIGACHAT_VERIFY_SSL_CERTS": "false",
-        }, {
-            "provider": "gigachat", "api_key": "giga", "user": "u", "password": "p",
-            "scope": "GIGACHAT_API_CORP", "base_url": "https://giga.example/v1",
-            "verify_ssl_certs": False,
-        }),
-        ("openai-compatible::model", {
-            "OPENAI_COMPATIBLE_API_KEY": "compat",
-            "OPENAI_COMPATIBLE_BASE_URL": "https://compat.example/v1",
-            "OPENAI_API_KEY": "", "OPENAI_BASE_URL": "",
-        }, {
-            "provider": "openai-compatible", "api_key": "compat",
-            "base_url": "https://compat.example/v1",
-        }),
-        ("openai-compatible::model", {
-            "OPENAI_COMPATIBLE_API_KEY": "",
-            "OPENAI_COMPATIBLE_BASE_URL": "https://compat.example/v1",
-            "OPENAI_API_KEY": "legacy-must-not-win",
-            "OPENAI_BASE_URL": "https://legacy.example/v1",
-        }, {
-            "provider": "openai-compatible", "api_key": "",
-            "base_url": "https://compat.example/v1",
-        }),
-    ],
-)
-def test_explicit_settings_mapping_is_authoritative(monkeypatch, model, settings, expected):
-    for key in provider_api._PROVIDER_TEST_OVERRIDE_KEYS:
-        monkeypatch.setenv(key, "environment-value")
-    original = copy.deepcopy(settings)
-    client = LLMClient(api_key="constructor-key", base_url="https://constructor.example/v1")
-    target = client._resolve_remote_target(model, settings=settings)
-    for key, value in expected.items():
-        assert target[key] == value
-    assert settings == original
-    assert client._remote_clients == {}
 
 
 @pytest.mark.parametrize(
@@ -591,53 +534,6 @@ def test_anthropic_probe_accepts_empty_completion(monkeypatch):
     }
 
 
-def test_gigachat_probe_uses_one_ephemeral_client(monkeypatch):
-    import sys
-
-    observed = _bypass_accounting(monkeypatch)
-    monkeypatch.setenv("GIGACHAT_CREDENTIALS", "stale-environment-credentials")
-    monkeypatch.setenv("GIGACHAT_ACCESS_TOKEN", "stale-environment-token")
-    constructed = {}
-    completion = types.SimpleNamespace(
-        choices=[types.SimpleNamespace(message=types.SimpleNamespace(content="anything"))],
-        usage=types.SimpleNamespace(prompt_tokens=2, completion_tokens=1),
-    )
-    class FakeGigaChat:
-        def __init__(self, **kwargs):
-            constructed.update(kwargs)
-            self.calls = []
-            self.closed = False
-            constructed["client"] = self
-
-        def chat(self, payload):
-            self.calls.append(payload)
-            return completion
-
-        def close(self):
-            self.closed = True
-
-    monkeypatch.setitem(sys.modules, "gigachat", types.SimpleNamespace(GigaChat=FakeGigaChat))
-    client = LLMClient()
-    result = client.probe_provider_readiness(
-        "gigachat::GigaChat-2-Max",
-        settings={
-            "GIGACHAT_CREDENTIALS": "",
-            "GIGACHAT_USER": "draft-user",
-            "GIGACHAT_PASSWORD": "draft-password",
-        },
-    )
-    remote = constructed["client"]
-    assert result["ok"] is True
-    assert len(remote.calls) == len(observed) == 1
-    assert remote.calls[0]["max_tokens"] == 16
-    assert constructed["credentials"] == ""
-    assert constructed["user"] == "draft-user"
-    assert constructed["password"] == "draft-password"
-    assert constructed["access_token"] == ""
-    assert constructed["max_retries"] == 0
-    assert constructed["timeout"] == 20.0
-    assert client._gigachat_clients == {}
-    assert remote.closed is True
 
 
 def test_failure_and_malformed_success_never_retry_or_learn(monkeypatch):
@@ -790,12 +686,6 @@ def test_response_log_and_accounting_expose_only_controlled_error(
     assert "***REDACTED***" in final["reason"]
 
 
-def test_provider_test_registry_is_derived_from_provider_defaults():
-    assert provider_api._PROVIDER_TEST_KNOWN_IDS == {
-        "openrouter", "openai", "anthropic", "cloudru", "gigachat", "minimax",
-        "deepseek", "zai", "openai-compatible",
-    }
-    assert provider_api._PROVIDER_TEST_OVERRIDE_KEYS == provider_api.ALL_PROVIDER_CREDENTIAL_KEYS
 
 
 def test_provider_test_and_active_model_enumeration_never_select_legacy_heavy():

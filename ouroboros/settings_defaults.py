@@ -62,13 +62,6 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OPENAI_COMPATIBLE_BASE_URL": "",
     "CLOUDRU_FOUNDATION_MODELS_API_KEY": "",
     "CLOUDRU_FOUNDATION_MODELS_BASE_URL": "https://foundation-models.api.cloud.ru/v1",
-    "GIGACHAT_CREDENTIALS": "",
-    "GIGACHAT_USER": "",
-    "GIGACHAT_PASSWORD": "",
-    "GIGACHAT_SCOPE": "GIGACHAT_API_PERS",
-    "GIGACHAT_BASE_URL": "https://api.giga.chat/v1",
-    "GIGACHAT_VERIFY_SSL_CERTS": "true",
-    "GIGACHAT_PROFANITY_CHECK": "",
     # PEM file with CA certificates ADDED to the default trust bundle for every
     # first-party provider call (net_transport.extra_ca_bundle); "" = defaults only.
     "OUROBOROS_EXTRA_CA_BUNDLE": "",

@@ -46,7 +46,6 @@ _POPEN_ALLOWLIST = {
     # pytest root: membership is env-token/Job-Object-held and reaped at teardown,
     # so routing it through spawn_supervised would double-custody a bounded child.
     "ouroboros/process_containment.py",
-    "ouroboros/packaged_cli.py",          # user-facing CLI wrapper (foreground)
     "ouroboros/cli.py",                   # dev CLI (foreground)
     "ouroboros/server_control.py",        # restart exec path
     "ouroboros/workspace_patch_capture.py",  # waited synchronous child

@@ -353,37 +353,6 @@ def test_descendant_forwarding_is_visible_and_executable_for_both_subagent_profi
     assert "inspect the new evidence" in mailbox.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize(
-    ("target", "expected_provider"),
-    [
-        ("openai::gpt-5.5", "openai"),
-        ("anthropic::claude-fable-5", "anthropic"),
-        ("minimax::MiniMax-M2.5", "minimax"),
-        ("cloudru::deepseek-v3.1", "cloudru"),
-        ("gigachat::GigaChat-2-Max", "gigachat"),
-        ("openai-compatible::custom-model", "openai-compatible"),
-    ],
-)
-def test_api_actor_preserves_direct_provider_executable_route(target, expected_provider):
-    from ouroboros.llm import LLMClient
-    from ouroboros.subagent_runtime import resolve_configured_actor_dispatch
-
-    dispatch = resolve_configured_actor_dispatch(
-        {
-            "id": "api-child",
-            "configured_subagent": {
-                "schema": 1,
-                "selected_subagent_id": "api-builder",
-                "config_fingerprint": "configured-list-fingerprint",
-                "route": {"kind": "api_model", "target_id": target},
-                "effort": "high",
-            },
-            "task_constraint": {},
-        },
-        task_type="research",
-    )
-    assert dispatch.lane.model == target
-    assert LLMClient._resolve_remote_target(LLMClient(), dispatch.lane.model)["provider"] == expected_provider
 
 
 def test_api_actor_strips_only_the_canonical_local_marker():

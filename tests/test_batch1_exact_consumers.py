@@ -247,22 +247,6 @@ def test_review_reference_producer_history_and_chat_reconnect_keep_tool_evidence
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_osworld_readers_count_unfinished_calls_once_and_keep_legacy(tmp_path):
-    from devtools.benchmarks.osworld import run_cu_bridge_agent as bridge
-    from ouroboros.extension_loader import extension_name_prefix
-
-    prefix = extension_name_prefix(bridge.SKILL_NAME)
-    root = tmp_path / 'state/headless_tasks/t/data/logs'
-    root.mkdir(parents=True)
-    rows = [{"type": t, "task_id": "t", "tool": prefix + "screenshot", "invocation_id": "i"}
-            for t in ("tool_call_started", "tool_call_timeout")]
-    rows += [{"type": "tool_call", "tool": prefix + "remote_exec", "args": {"cmd": "pwd"}}] * 2
-    (root / 'tools.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
-    counts = bridge._collect_budget_counters(tmp_path, {}, "t")
-    assert (counts["skill_tool_calls"], counts["screenshots"], counts["remote_exec_calls"]) == (3, 1, 2)
-    trace = bridge._gate_tool_trace(tmp_path, "t")
-    assert len(trace) == 3 and trace[0]["state"] == "wait_ended"
-    assert trace[0]["is_error"] is None and not trace[0]["settled"]
 
 
 # The command child writes its own pid and parent pid atomically before sleeping.

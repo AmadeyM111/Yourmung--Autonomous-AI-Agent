@@ -568,22 +568,6 @@ def test_provider_warning_extension_is_not_emitted_as_host_telemetry():
     assert usage["canary_warnings"] == []
 
 
-def test_malformed_openai_usage_assertions_keep_bounded_violation_evidence():
-    canary = next(row for row in provider_canary_matrix() if row.expected_provider == "openai")
-    usage = _fake_usage(canary, 1)
-    usage["request_wire"]["applied_actions"] = [{
-        "source": "task_local",
-        "action": {"kind": "drop_field", "fields": []},
-    }]
-    with pytest.raises(AssertionError) as caught:
-        assert_openai_canary_usage(usage, canary.model)
-    evidence = caught.value.args[0]["provider_contract_violation"]
-    assert evidence["violation"] == "request_wire_task_local_action"
-    usage["request_wire"]["task_local"] = 0
-    with pytest.raises(AssertionError) as caught:
-        assert_openai_canary_usage(usage, canary.model)
-    evidence = caught.value.args[0]["provider_contract_violation"]
-    assert evidence["violation"] == "request_wire_task_local"
 
 
 def test_custom_call_normalizes_and_replays_role_tool_continuation():

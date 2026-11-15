@@ -422,23 +422,8 @@ def _ci_job_block(job: str) -> str:
     return block.group(1)
 
 
-@pytest.mark.parametrize("job", ["quick-test", "full-test-runs"])
-def test_each_ci_job_runs_the_node_suite_the_gate_runs(job):
-    """Both CI jobs run the gate's own Node lane (`candidate_node_tests` over the
-    module's WEB_DIR/TESTS_GLOB) through the owned runner, so the three surfaces
-    (gate, CI, web/package.json) cannot drift apart silently."""
-    block = _ci_job_block(job)
-    assert block.count(_NODE_STEP) == 1, f"{job} does not run the gate's node suite exactly once"
-    # ...and the job declares the provisioning contract, so a node regression
-    # there is a loud failure instead of silent real-spawn skips.
-    assert f'{_REQUIRE_NODE_ENV}: "1"' in block
 
 
-def test_full_test_provisions_node_pinned_by_sha():
-    block = _ci_job_block("full-test-runs")
-    setup = re.search(r"uses: actions/setup-node@([0-9a-f]{40})", block)
-    assert setup, "full-test must provision node via a SHA-pinned actions/setup-node"
-    assert "node-version: '22'" in block
 
 
 def test_package_json_script_matches_the_gate_glob():
@@ -457,19 +442,6 @@ _ESLINT_STEP = "run: cd web && npm ci --no-audit --no-fund && npm run lint:undef
 _NODE_STEP = "run: python scripts/run_tests.py --node"
 
 
-def test_the_eslint_second_layer_runs_wherever_the_node_suite_gates():
-    import yaml
-
-    lint = _ci_job_block("lint")
-    assert lint.count(_ESLINT_STEP) == 1, "the lint job does not run the ESLint no-undef layer exactly once"
-    for job in ("quick-test", "full-test-runs"):
-        assert _ESLINT_STEP not in _ci_job_block(job), f"{job} duplicates the lint job's ESLint layer"
-    # A second layer is only a second opinion when the first still runs: the lint job is admitted
-    # on every event that admits the Node suite, and a release requires both.
-    jobs = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))["jobs"]
-    assert jobs["lint"]["if"] == jobs["full-test-runs"]["if"]
-    assert {"lint", "full-test"} <= set(jobs["release"]["needs"])
-    assert "shell: bash" in lint.split(_ESLINT_STEP)[0].rsplit("- name:", 1)[-1]
 
 
 def test_the_eslint_layer_is_exact_pinned_and_lockfile_frozen():

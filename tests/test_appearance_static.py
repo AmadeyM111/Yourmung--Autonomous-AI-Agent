@@ -52,11 +52,6 @@ def _assert_persistent_webview_starts(source: str, rel: str) -> int:
     return len(calls)
 
 
-def test_every_first_party_window_uses_a_persistent_profile():
-    calls = sum(_assert_persistent_webview_starts(_read(rel), rel) for rel in WEBVIEW_HOSTS)
-    # The count is asserted so that a NEW window added without the flag fails
-    # here rather than silently using the library default.
-    assert calls == 5, f"expected 5 first-party webview.start() calls, found {calls}"
 
 
 def test_persistent_profile_guard_reads_multiline_calls_and_ignores_non_calls():
@@ -280,20 +275,6 @@ def _palette_values(css: str, selector: str) -> dict:
     return {name: clean(value) for name, value in values.items()}
 
 
-def test_screens_before_the_interface_restate_exactly_the_palette():
-    """The macOS window's first frame and the Telegram connecting page paint before ui.css can load, in code
-    that cannot read it; they restate the palette's own room and ink, both themes."""
-    from ouroboros.launcher_window_chrome import ROOM
-
-    ui = _read("web/ui.css")
-    dark, light = _palette_values(ui, ":root"), _palette_values(ui, ':root[data-theme="light"]')
-    assert ROOM == {"light": light["--bg-primary"], "dark": dark["--bg-primary"]}
-    page = _constant("skills/telegram/scripts/sidecar.py", "_BOOTSTRAP_HTML")
-    css = re.search(r"<style>(.*?)</style>", page, re.S).group(1)
-    for theme, selector, palette in (("dark", "html", dark), ("light", 'html[data-theme="light"]', light)):
-        restated = _palette_values(css, selector)
-        assert restated["--bg-primary"] == palette["--bg-primary"], theme
-        assert restated["--text-secondary"] == palette["--text-secondary"], theme
 
 
 def test_a_host_charts_default_series_are_the_approved_tokens_of_each_theme():
@@ -325,17 +306,3 @@ def test_the_telegram_connecting_page_reads_the_one_saved_choice_before_it_paint
     assert re.findall(r"<script[^>]*>([^<]*)</script>", page) == ["", ""], "an inline script would break its CSP"
 
 
-def test_windows_before_the_server_wear_the_interface_not_a_fixed_palette():
-    """Every launcher window whose page is a string is built by ``_window_page`` (theme.js and ui.css inlined)
-    and opens in the room colour of macOS (``paint_room``); no colour is written into those pages."""
-    tree = ast.parse(_read("launcher.py"))
-    pages = [keyword.value for node in ast.walk(tree) if isinstance(node, ast.Call)
-             and getattr(node.func, "attr", "") == "create_window" for keyword in node.keywords if keyword.arg == "html"]
-    assert len(pages) == 3, "already running, Git required, startup failed"
-    assert all(isinstance(page, ast.Call) and getattr(page.func, "id", "") == "_window_page" for page in pages)
-    painted = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "paint_room"]
-    assert len(painted) == len(pages)
-    source = _read("launcher.py")
-    window_css = _constant("launcher.py", "_WINDOW_CSS")
-    assert not re.search(r"#[0-9a-fA-F]{3,6}\b", window_css)
-    assert "background:#0f0f11" not in source and "color:#efeff2" not in source

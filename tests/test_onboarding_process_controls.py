@@ -9,7 +9,7 @@ import pytest
 from starlette.applications import Starlette
 from starlette.routing import Route, WebSocketRoute
 from starlette.testclient import TestClient
-from tests.test_launcher_handoff_stop import native_guard  # noqa: F401
+from tests._native_guard import native_guard  # noqa: F401
 
 pytestmark = pytest.mark.serial
 

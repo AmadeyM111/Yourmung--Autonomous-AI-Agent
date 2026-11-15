@@ -25,7 +25,6 @@ test('a provider is offered only while its credential is stored, in one owner-fa
     const every = configuredApiProviders({
         // Settings answers a GET with a placeholder, never the stored bytes.
         OPENAI_COMPATIBLE_BASE_URL: 'http://localhost:11434/v1',
-        GIGACHAT_USER: 'owner', GIGACHAT_PASSWORD: '***set***',
         CLOUDRU_FOUNDATION_MODELS_API_KEY: '***set***', MINIMAX_API_KEY: 'mm',
         DEEPSEEK_API_KEY: 'ds', ZAI_API_KEY: 'zai',
         ANTHROPIC_API_KEY: 'sk-ant', OPENAI_API_KEY: 'sk',
@@ -38,10 +37,6 @@ test('a provider is offered only while its credential is stored, in one owner-fa
 
 test('a provider with more than one credential shape accepts either of them', () => {
     const ids = (settings) => configuredApiProviders(settings).map((provider) => provider.id);
-    assert.deepEqual(ids({ GIGACHAT_CREDENTIALS: '***set***' }), ['gigachat']);
-    assert.deepEqual(ids({ GIGACHAT_USER: 'owner' }), [], 'half a basic-auth pair is not a login');
-    assert.deepEqual(ids({ GIGACHAT_PASSWORD: '***set***' }), []);
-    assert.deepEqual(ids({ GIGACHAT_USER: 'owner', GIGACHAT_PASSWORD: '***set***' }), ['gigachat']);
     assert.deepEqual(ids({ OPENAI_COMPATIBLE_BASE_URL: 'http://localhost:1234/v1' }), ['openai-compatible']);
     // The legacy pair still reaches an OpenAI-compatible endpoint at runtime.
     assert.deepEqual(ids({ OPENAI_BASE_URL: 'http://localhost:1234/v1' }), ['openai-compatible']);
@@ -53,9 +48,6 @@ test('a provider with more than one credential shape accepts either of them', ()
 test('provider names come from the setup contract, with a name for the ones it omits', () => {
     assert.equal(apiProviderLabel('openai', contract.providerProfiles), 'OpenAI');
     assert.equal(apiProviderLabel('cloudru', contract.providerProfiles), 'Cloud.ru Foundation Models');
-    // GigaChat has no profile spec; it is still a real provider with a real name.
-    assert.equal(contract.providerProfiles.gigachat, undefined);
-    assert.equal(apiProviderLabel('gigachat', contract.providerProfiles), 'GigaChat');
     assert.equal(apiProviderLabel('openai-compatible'), 'OpenAI-compatible endpoint');
     assert.equal(apiProviderLabel('later-provider'), 'later-provider');
 });

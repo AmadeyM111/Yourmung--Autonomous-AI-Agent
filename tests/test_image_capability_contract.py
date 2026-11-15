@@ -617,12 +617,6 @@ def _names_the_transport(text: str) -> bool:
     return "model has no vision" not in lowered and any(word in lowered for word in TRANSPORT_WORDS)
 
 
-def test_gigachat_lane_marker_names_the_transport_not_the_model():
-    from ouroboros.llm import LLMClient
-
-    text = LLMClient._gigachat_text([{"type": "text", "text": "look "},
-                                     {"type": "image_url", "image_url": {"url": IMAGE_URL}, "_caption": "shot"}])
-    assert _names_the_transport(text), text
 
 
 def test_local_lane_marker_names_the_transport_not_the_model(cold):
@@ -640,15 +634,6 @@ def test_local_route_main_send_marker_names_the_transport(cold):
     assert _names_the_transport(_texts(sent)), _texts(sent)
 
 
-def test_gigachat_route_main_send_marker_names_the_transport(cold, monkeypatch):
-    model = "gigachat::GigaChat-2-Max"
-    for key in ("OUROBOROS_MODEL", "OUROBOROS_MODEL_LIGHT", "OUROBOROS_MODEL_FALLBACKS"):
-        monkeypatch.setenv(key, model)
-    caption_model = _CaptionModel(default=model)
-    sent = _main_send_copy(model, caption_model)
-    assert _image_urls(sent) == []
-    assert caption_model.calls == []
-    assert _names_the_transport(_texts(sent)), _texts(sent)
 
 
 # ---------------------------------------------------------------------------

@@ -9,7 +9,7 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | domain | name | modules | proposed |
 |---|---|---:|---:|
 | D01 | Agent core & main loop | 56 | 0 |
-| D02 | LLM client, routing & providers | 44 | 0 |
+| D02 | LLM client, routing & providers | 43 | 0 |
 | D03 | Context assembly, fit & compaction | 27 | 0 |
 | D04 | Tool execution: registry, access & typed results | 24 | 0 |
 | D05 | Tool surfaces: files, code, shell, media, external | 54 | 0 |
@@ -19,16 +19,16 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D09 | Cancellation, owner control & process custody | 26 | 0 |
 | D10 | Git, update & release machinery | 40 | 0 |
 | D11 | Gateway, server & Web UI | 108 | 0 |
-| D12 | Settings & configuration | 25 | 0 |
+| D12 | Settings & configuration | 24 | 0 |
 | D13 | Safety, guards & runtime mode | 11 | 0 |
 | D14 | Skills & extensions | 76 | 0 |
 | D15 | Memory, knowledge, consciousness & self-evolution | 32 | 0 |
 | D16 | Observability, usage accounting & cost | 27 | 0 |
 | D17 | Projects, workspaces & task results | 52 | 0 |
-| D18 | Launcher, packaging, platform & shared substrate | 37 | 0 |
+| D18 | Launcher, packaging, platform & shared substrate | 26 | 0 |
 | D19 | Frozen contracts (ABI) | 12 | 0 |
 | D20 | Presence | 20 | 0 |
-| **total** | | **936** | **0** |
+| **total** | | **923** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -47,7 +47,7 @@ Rows may import columns (`[graph].allowed`). `·` = forbidden direction.
 | **D09** | ✓ | · | · | · | · | ✓ | · | ✓ | · | · | · | · | · | · | · | ✓ | ✓ | ✓ | · | · |
 | **D10** | · | · | · | ✓ | ✓ | ✓ | · | ✓ | · | · | · | ✓ | ✓ | · | · | ✓ | ✓ | ✓ | ✓ | · |
 | **D11** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | · | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **D12** | · | ✓ | ✓ | · | · | · | ✓ | · | · | · | ✓ | · | ✓ | · | · | · | · | ✓ | · | · |
+| **D12** | · | ✓ | ✓ | · | · | · | ✓ | · | · | · | · | · | ✓ | · | · | · | · | ✓ | · | · |
 | **D13** | ✓ | ✓ | · | ✓ | · | · | · | · | · | · | · | ✓ | · | · | ✓ | · | ✓ | ✓ | · | ✓ |
 | **D14** | · | ✓ | ✓ | ✓ | ✓ | ✓ | · | · | ✓ | ✓ | ✓ | ✓ | ✓ | · | · | ✓ | ✓ | ✓ | ✓ | · |
 | **D15** | ✓ | · | ✓ | ✓ | · | · | · | · | · | · | · | ✓ | · | · | · | ✓ | ✓ | ✓ | ✓ | · |
@@ -135,6 +135,7 @@ Rows may import columns (`[graph].allowed`). `·` = forbidden direction.
   - D12->D06
   - D12->D09
   - D12->D10
+  - D12->D11
   - D12->D15
   - D12->D16
   - D12->D17
@@ -172,7 +173,6 @@ Rows may import columns (`[graph].allowed`). `·` = forbidden direction.
   - D17->D13
   - D17->D20
   - D18->D01
-  - D18->D07
   - D18->D08
   - D18->D11
   - D18->D14
@@ -272,7 +272,6 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/llm_capability_policy.py`
 - `ouroboros/llm_claudexor.py`
 - `ouroboros/llm_fallback.py`
-- `ouroboros/llm_gigachat.py`
 - `ouroboros/llm_local.py`
 - `ouroboros/llm_messages.py`
 - `ouroboros/llm_observability.py`
@@ -883,7 +882,6 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/composer_cognition.py`
 - `ouroboros/config.py`
 - `ouroboros/i18n_memory.py`
-- `ouroboros/launcher_onboarding.py`
 - `ouroboros/model_slots.py`
 - `ouroboros/onboarding_wizard.py`
 - `ouroboros/review_model_routes.py`
@@ -1121,7 +1119,6 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 
 ### D18 — Launcher, packaging, platform & shared substrate
 
-- `launcher.py`
 - `ouroboros/__init__.py`
 - `ouroboros/cli.py`
 - `ouroboros/confined_files.py`
@@ -1131,20 +1128,10 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/force_remove.py`
 - `ouroboros/git_observation.py`
 - `ouroboros/jsonl_tail.py`
-- `ouroboros/launcher_appearance.py`
-- `ouroboros/launcher_background.py`
 - `ouroboros/launcher_bootstrap.py`
-- `ouroboros/launcher_page_zoom.py`
-- `ouroboros/launcher_readiness.py`
 - `ouroboros/launcher_server_reaper.py`
-- `ouroboros/launcher_tray.py`
-- `ouroboros/launcher_tray_macos.py`
-- `ouroboros/launcher_window_chrome.py`
-- `ouroboros/launcher_windows_runtime.py`
 - `ouroboros/markdown_source.py`
 - `ouroboros/node_runtime.py`
-- `ouroboros/packaged_cli.py`
-- `ouroboros/packaged_cli_install.py`
 - `ouroboros/panic_source.py`
 - `ouroboros/platform_darwin_abi.py`
 - `ouroboros/platform_layer.py`

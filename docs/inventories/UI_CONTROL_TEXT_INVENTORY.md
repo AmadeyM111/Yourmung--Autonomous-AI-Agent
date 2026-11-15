@@ -135,7 +135,7 @@ the same thing sit together: when your diff adds a row, read its neighbours.
 | ▸ More | `(no class)` | modules/place_sheet.js | 1 |
 | ▸ More | `(no class)` | modules/settings_consciousness.js | 1 |
 | [icon] More actions | `chat-plus-btn ui-hit-area` | modules/composer.js | 1 |
-| More providers Cloud.ru Foundation Models, MiniMax, DeepSeek, and GigaChat | `(no class)` | modules/settings_ui.js | 1 |
+| More providers Cloud.ru Foundation Models, MiniMax, DeepSeek, and Z.ai | `(no class)` | modules/settings_ui.js | 1 |
 | Move | `files-context-item` | modules/files.js | 1 |
 | Open | `btn btn-default` | modules/chat_media.js | 1 |
 | Open | `btn btn-default` | modules/document_reader.js | 1 |

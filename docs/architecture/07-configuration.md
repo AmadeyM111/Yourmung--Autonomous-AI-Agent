@@ -52,13 +52,6 @@ One row per key (`settings_defaults.py`). Env-only rows have no settings.json ca
 | OPENAI_COMPATIBLE_BASE_URL | "" | OpenAI-compatible endpoint; only with its own key (blank = no auth) |
 | CLOUDRU_FOUNDATION_MODELS_API_KEY | "" | Cloud.ru credential |
 | CLOUDRU_FOUNDATION_MODELS_BASE_URL | `https://foundation-models.api.cloud.ru/v1` | Cloud.ru base URL |
-| GIGACHAT_CREDENTIALS | "" | GigaChat auth key |
-| GIGACHAT_USER | "" | GigaChat user login |
-| GIGACHAT_PASSWORD | "" | GigaChat password |
-| GIGACHAT_SCOPE | `GIGACHAT_API_PERS` | GigaChat API scope |
-| GIGACHAT_BASE_URL | `https://api.giga.chat/v1` | GigaChat base URL |
-| GIGACHAT_VERIFY_SSL_CERTS | `true` | GigaChat TLS verification |
-| GIGACHAT_PROFANITY_CHECK | "" | GigaChat profanity filter passthrough |
 | OUROBOROS_EXTRA_CA_BUNDLE | "" | PEM file added to every first-party provider call's trust bundle |
 | ANTHROPIC_API_KEY | "" | Official direct-Anthropic credential |
 | MINIMAX_API_KEY | "" | MiniMax credential |

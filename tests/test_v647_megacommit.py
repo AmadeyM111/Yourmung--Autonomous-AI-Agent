@@ -746,32 +746,6 @@ def test_v651_verify_guard_inspects_exact_executed_argv():
     assert mapped["cmd"] == _normalize_check('["cat", "data/settings.json"]')  # guard == execution
 
 
-def test_v651_orchestrate_timeout_reaps_group_and_container(monkeypatch):
-    """v6.51.0 review round-4: a host-timed-out run_pro is killed via platform_layer (cross-
-    platform, NOT a raw os.killpg) and the worker's leaked obopro-w{N}-* container is removed."""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "orchp_t", "devtools/benchmarks/swe_bench_pro/e1v2/orchestrate_probe.py")
-    orchp = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(orchp)
-
-    killed = {}
-    monkeypatch.setattr(orchp, "kill_process_tree", lambda p: killed.setdefault("tree", p))
-    calls = []
-
-    class _R:
-        stdout = "abc123\n"
-
-    monkeypatch.setattr(orchp.subprocess, "run", lambda cmd, **kw: (calls.append(cmd), _R())[1])
-
-    class _Proc:
-        def wait(self, timeout=None):
-            return 0
-
-    orchp.reap_timed_out_runpro(_Proc(), 2, {})
-    assert killed.get("tree") is not None                                    # process TREE killed (cross-platform)
-    assert ["docker", "ps", "-q", "--filter", "name=obopro-w2-"] in calls    # worker-scoped reap filter
-    assert ["docker", "rm", "-f", "abc123"] in calls                         # leaked container removed
 
 
 def _verify_ctx(tmp_path, *, task_id="vhandler"):

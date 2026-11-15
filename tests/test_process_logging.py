@@ -297,19 +297,6 @@ def test_every_uvicorn_config_in_the_server_leaves_logging_to_the_root_handlers(
         assert isinstance(keywords.get("log_config"), ast.Constant) and keywords["log_config"].value is None
 
 
-def test_the_launcher_routes_its_uncaught_exceptions_through_the_shared_hooks():
-    """The frozen launcher keeps its own launcher.log handlers and shares the
-    uncaught-exception hooks, called after its guarded redaction filter loop, and
-    the output copier, imported unguarded because the module loads only the stdlib."""
-    tree = ast.parse((REPO / "launcher.py").read_text(encoding="utf-8"))
-    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
-             and isinstance(node.func, ast.Name) and node.func.id == "install_exception_hooks"]
-    assert len(calls) == 1
-    imports = {alias.name: node for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
-               and node.module == "ouroboros.process_logging" for alias in node.names}
-    assert set(imports) == {"install_exception_hooks", "copy_capped_output"}
-    start_agent = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "start_agent")
-    assert imports["copy_capped_output"] in start_agent.body  # Unguarded, before the server is spawned.
 
 
 @pytest.mark.serial

@@ -807,12 +807,6 @@ def test_unsupported_request_intent_is_not_silently_ignored(setup, option):
     assert raised.value.code == "unsupported_parameter" and not gateway.creates and not ledger(root)
 
 
-@pytest.mark.parametrize("model,expected", [(MODEL, False), ("anthropic::some-model", False),
-                                            ("gigachat::some-model", False), ("openai::some-model", True),
-                                            ("openai-compatible::some-model", True), ("provider/router-model", True)])
-def test_optional_response_format_is_a_transport_capability(model, expected):
-    assert LLMClient.supports_response_format(model) is expected
-    assert LLMClient.supports_response_format(model, use_local=True) is False
 
 
 def test_async_tools_and_capture_remain_in_callers_context(setup):
@@ -829,12 +823,6 @@ def test_async_tools_and_capture_remain_in_callers_context(setup):
     assert len(gateway.accepted_operations) == 1 and ledger(root)[-1]["state"] == "settled"
 
 
-def test_gigachat_async_tools_still_refuse_before_provider_io(setup, monkeypatch):
-    _, gateway, client = setup
-    monkeypatch.setattr(client, "_resolve_remote_target", lambda _: {"provider": "gigachat"})
-    with pytest.raises(ValueError, match="does not support GigaChat tool calls"):
-        asyncio.run(client.chat_async([], "gigachat::some-model", tools=[{"type": "function"}]))
-    assert not gateway.creates
 
 
 @pytest.mark.parametrize("profile", [None, "account-b"])

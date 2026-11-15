@@ -352,76 +352,12 @@ def test_windows_sweeps_nothing(monkeypatch):
 # Launcher wiring
 # ---------------------------------------------------------------------------
 
-def test_the_sweep_runs_per_generation_after_record_cleanup_and_no_port_sweep(monkeypatch):
-    """Behavioural: the per-generation helper runs the record cleanup, then the stray
-    sweep, and hands BOTH kinds of unresolved PIDs to the caller; no port is swept."""
-    import launcher
-
-    calls: list = []
-    monkeypatch.setattr(
-        launcher, "_cleanup_recorded_server_process", lambda reason: calls.append(("record", reason)) or [17]
-    )
-    monkeypatch.setattr(
-        launcher, "_reap_same_install_strays",
-        lambda reason: calls.append(("sweep", reason)) or [4242, 17],
-    )
-
-    unresolved = launcher._pre_generation_cleanup()
-
-    assert calls == [("record", "startup"), ("sweep", "startup")]
-    assert unresolved == [17, 4242]
-    # The lifecycle loop consumes exactly this helper before any start.
-    loop_src = inspect.getsource(launcher.agent_lifecycle_loop)
-    assert loop_src.index("_pre_generation_cleanup()") < loop_src.index("proc = start_agent(port)")
 
 
-def test_a_proven_survivor_skips_start_agent_for_that_generation(monkeypatch):
-    """Behavioural: with an unresolved predecessor reported, the generation must not start —
-    the loop logs, waits, and comes back around instead of calling start_agent."""
-    import threading
-
-    import launcher
-
-    started: list = []
-    shutdown = threading.Event()
-
-    def fake_cleanup():
-        # First generation reports a survivor; ending the loop here keeps the
-        # test to exactly one iteration.
-        shutdown.set()
-        return [4242]
-
-    monkeypatch.setattr(launcher, "_shutdown_event", shutdown)
-    monkeypatch.setattr(launcher, "_pre_generation_cleanup", fake_cleanup)
-    monkeypatch.setattr(launcher, "start_agent", lambda port: started.append(port))
-    monkeypatch.setattr(launcher.time, "sleep", lambda seconds: None)
-
-    launcher.agent_lifecycle_loop(1)
-
-    assert started == [], "an unresolved predecessor must suppress start_agent"
 
 
-def test_main_leaves_predecessor_cleanup_to_the_lifecycle_loop():
-    """main() runs no preflight copy of its own: each generation's loop resolves its predecessor.
-
-    main() may still stop the generation its own startup recorded when that startup is quit,
-    aborted or fails; those calls name their teardown reason, never the preflight's "startup"."""
-    import launcher
-
-    src = inspect.getsource(launcher.main)
-    assert "_pre_generation_cleanup(" not in src and "_reap_same_install_strays(" not in src
-    reasons = set(re.findall(r"_cleanup_recorded_server_process\(([^)]*)\)", src))
-    assert reasons <= {'"startup_quit"', '"startup_abort"', '"startup_failure"'}, reasons
 
 
-def test_the_panic_and_window_close_path_performs_no_stray_sweep():
-    """BIBLE Emergency Stop: the panic path tears down what it owns and gains no
-    new killing."""
-    import launcher
-
-    assert "_reap_same_install_strays" not in inspect.getsource(
-        launcher._kill_orphaned_children
-    )
 
 
 # ---------------------------------------------------------------------------

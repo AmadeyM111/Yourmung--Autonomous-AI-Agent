@@ -217,14 +217,6 @@ def _target_is_configured(target: Mapping[str, Any]) -> bool:
     provider = str(target.get("provider") or "")
     if provider == "openai-compatible":
         return bool(str(target.get("base_url") or "").strip())
-    if provider == "gigachat":
-        return bool(
-            str(target.get("api_key") or "").strip()
-            or (
-                str(target.get("user") or "").strip()
-                and str(target.get("password") or "").strip()
-            )
-        )
     return bool(str(target.get("api_key") or "").strip())
 
 
@@ -285,19 +277,6 @@ def probe_provider_readiness(
                 return response
 
             dispatch = send_anthropic
-
-        elif provider == "gigachat":
-            # The GigaChat library otherwise imports GIGACHAT_ACCESS_TOKEN from
-            # the environment.  A stale inherited token makes its auth wrapper
-            # resend once after 401 even when transport retries are disabled.
-            remote_client = client._new_gigachat_client(
-                {**target, "access_token": ""}, timeout=timeout, max_retries=0,
-            )
-
-            def send_gigachat(payload):
-                return remote_client.chat(payload)
-
-            dispatch = send_gigachat
 
         else:
             raise ValueError("unsupported provider route")

@@ -129,29 +129,5 @@ def test_cli_refuses_an_invalid_execution_duration_before_posting(monkeypatch, v
     assert cli.main(["run", "--detach", "--execution-timeout", value, "work"]) != 0
 
 
-def test_packaged_cli_start_scan_knows_the_execution_duration_option():
-    from ouroboros.packaged_cli import _run_start_index
-
-    assert _run_start_index(["run", "--execution-timeout", "30", "--start", "work"], 0) == 3
-    assert _run_start_index(["run", "--execution-timeout=30", "--start", "work"], 0) == 2
 
 
-def test_cybergym_request_is_admitted_as_an_execution_duration(gateway, tmp_path):
-    from devtools.benchmarks.cybergym.cybergym_executor import CyberGymExecutor
-    from tests.test_cybergym_executor import _config
-
-    client, queue, data = gateway
-    config = _config(tmp_path, task_timeout_sec=1800)
-    executor = CyberGymExecutor(config)
-    workspace = config.run_root / "task"
-    workspace.mkdir()
-    (workspace / "description.txt").write_text("Find the crash", encoding="utf-8")
-    container = "cybergym-workspace-agent-" + "a" * 24
-    executor._task_containers[container] = "b" * 64
-    body = executor._task_body(SimpleNamespace(task_id="arvo:1", metadata={}), workspace, container, "attempt-1")
-    assert body["execution_timeout_sec"] == 1800 and "timeout_sec" not in body
-    response = client.post("/api/tasks", json=body)
-    assert response.status_code == 200, response.text
-    task = queue.PENDING[0]
-    assert task["execution_timeout_sec"] == 1800 and task["deadline_at"] == ""
-    assert load_task_result(data, response.json()["task_id"])["execution_timeout_sec"] == 1800

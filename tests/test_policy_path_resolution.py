@@ -21,11 +21,17 @@ def candidate_paths() -> set[str]:
     return set(candidate_repo_paths(REPO_ROOT))
 
 
+# Paths the server-only fork deliberately deleted (packaging, CI). The policy
+# file keeps them protected so a re-added file stays guarded.
+REMOVED_IN_THIS_FORK = {".github/workflows/ci.yml", "Ouroboros.spec", "build.sh", "build_linux.sh", "build_windows.ps1"}
+
+
 def test_protected_runtime_paths_and_prefixes_resolve(candidate_paths: set[str]):
     missing = sorted(
         path
         for path in PROTECTED_RUNTIME_PATHS
-        if path not in candidate_paths or not (REPO_ROOT / path).is_file()
+        if (path not in candidate_paths or not (REPO_ROOT / path).is_file())
+        and path not in REMOVED_IN_THIS_FORK
     )
     unresolved = sorted(
         path for path in PROTECTED_RUNTIME_PATHS if not is_protected_runtime_path(path)
@@ -47,7 +53,8 @@ def test_hot_code_paths_resolve(candidate_paths: set[str]):
     missing = sorted(
         path
         for path in update_merge_policy.HOT_CODE_PATHS
-        if path not in candidate_paths or not (REPO_ROOT / path).is_file()
+        if (path not in candidate_paths or not (REPO_ROOT / path).is_file())
+        and path not in REMOVED_IN_THIS_FORK
     )
     unresolved = sorted(
         path

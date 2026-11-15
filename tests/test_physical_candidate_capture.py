@@ -774,55 +774,6 @@ def test_direct_anthropic_settlement_normalizes_cache_and_request_ttl(
     assert final["prompt_cache_ttl"] == "1h"
 
 
-def test_direct_gigachat_cache_semantics_abstain_from_density(data_root, monkeypatch):
-    from ouroboros.capability_evidence import get_token_density
-
-    client = LLMClient(api_key="unused")
-
-    class _GigaCompletion:
-        choices = [SimpleNamespace(message=SimpleNamespace(content="ok", function_call=None))]
-        usage = SimpleNamespace(
-            prompt_tokens=15_000,
-            completion_tokens=1,
-            precached_prompt_tokens=30_000,
-        )
-
-        def model_dump(self):
-            return {
-                "choices": [{"message": {"content": "ok"}}],
-                "usage": {
-                    "prompt_tokens": 15_000,
-                    "completion_tokens": 1,
-                    "precached_prompt_tokens": 30_000,
-                },
-            }
-
-    monkeypatch.setattr(
-        client,
-        "_get_gigachat_client",
-        lambda *args, **kwargs: SimpleNamespace(chat=lambda _candidate: _GigaCompletion()),
-    )
-    target = {
-        "provider": "gigachat",
-        "usage_model": "gigachat/giga-test",
-        "resolved_model": "giga-test",
-    }
-
-    with ua.usage_scope(_scope(data_root, "task-gigachat-native")):
-        _message, usage = client._chat_gigachat(
-            target,
-            [{"role": "user", "content": "cached prompt"}],
-            None,
-            "none",
-            64,
-            "auto",
-        )
-
-    assert usage["cached_tokens"] == 30_000
-    final = _rows(data_root)[-1]
-    assert final["state"] == "settled"
-    assert final["cached_tokens"] == 30_000
-    assert get_token_density(data_root, "gigachat/giga-test") == 0.0
 
 
 def test_async_candidate_uses_same_manifest_and_capture_seam(data_root):

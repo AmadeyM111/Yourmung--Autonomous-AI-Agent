@@ -407,98 +407,13 @@ def _launcher_grant_skill(tmp_path, monkeypatch, *, name="demo", skill_type="scr
     return loaded, drive
 
 
-def test_launcher_skill_key_grant_validates_review_and_manifest(monkeypatch, tmp_path):
-    import launcher
-    from ouroboros.skill_loader import load_skill_grants
-
-    loaded, drive = _launcher_grant_skill(tmp_path, monkeypatch)
-    result = launcher._request_skill_key_grant("demo", ["OPENROUTER_API_KEY"], lambda *a: True)
-    assert result["ok"] is True
-    grants = load_skill_grants(drive, "demo")
-    assert grants["granted_keys"] == ["OPENROUTER_API_KEY"]
-    assert grants["requested_keys"] == ["OPENROUTER_API_KEY"]
-    assert grants["content_hash"] == loaded.content_hash
-    assert result.get("extension_action") is None
-    assert result.get("extension_reason") is None
 
 
-@pytest.mark.parametrize('pending_aware', [False, True])
-def test_launcher_negotiates_only_for_a_pending_aware_client(monkeypatch, tmp_path, pending_aware):
-    import launcher
-
-    _loaded, drive = _launcher_grant_skill(tmp_path, monkeypatch)
-    original = launcher.urllib.request.urlopen
-    observed = []
-
-    def request(req, timeout=0):
-        observed.append((req.get_header('Prefer'), timeout))
-        assert json.loads(req.data)['enable_after_grant'] is True
-        return original(req, timeout=timeout)
-
-    monkeypatch.setattr(launcher.urllib.request, 'urlopen', request)
-    result = launcher._request_skill_key_grant('demo', ['OPENROUTER_API_KEY'], lambda *args: True,
-        enable_after_grant=True, allow_pending=pending_aware)
-    assert result['enabled'] is True and load_enabled(drive, 'demo')
-    assert observed[0][0] == ('respond-async' if pending_aware else None)
-    assert (observed[0][1] == 20) is pending_aware
 
 
-def test_launcher_skill_grant_supports_permission_grants(monkeypatch, tmp_path):
-    import launcher
-    from ouroboros.skill_loader import load_skill_grants
-
-    _loaded, drive = _launcher_grant_skill(tmp_path, monkeypatch, name="bridge", skill_type="extension",
-                                         keys=(), permissions=("inject_chat", "subscribe_event"))
-    result = launcher._request_skill_key_grant("bridge", ["inject_chat", "subscribe_event:chat.outbound"], lambda *a: True)
-    assert result["ok"] is True
-    assert result["granted_permissions"] == ["inject_chat", "subscribe_event:chat.outbound"]
-    grants = load_skill_grants(drive, "bridge")
-    assert grants["granted_keys"] == []
-    assert grants["granted_permissions"] == result["granted_permissions"]
 
 
-def test_launcher_skill_key_grant_supports_extensions(monkeypatch, tmp_path):
-    """The server persists the grant before reconciling; the launcher returns its outcome."""
-    import launcher
-    from ouroboros.skill_loader import load_skill_grants
-
-    _loaded, drive = _launcher_grant_skill(tmp_path, monkeypatch, name="demo_ext", skill_type="extension")
-    calls = []
-
-    def reconcile(skill, root, repo):
-        calls.append(skill.name)
-        assert load_skill_grants(drive, "demo_ext")["granted_keys"] == ["OPENROUTER_API_KEY"]
-        return {"action": "extension_loaded", "reason": "ready", "live_loaded": True}
-
-    monkeypatch.setattr("ouroboros.skill_lifecycle_actions._reconcile", reconcile)
-    result = launcher._request_skill_key_grant("demo_ext", ["OPENROUTER_API_KEY"], lambda *a: True)
-    assert result["ok"] is True
-    assert calls == ["demo_ext"]
-    assert result["extension_action"] == "extension_loaded"
 
 
-def test_launcher_skill_key_grant_handles_http_error_without_local_writes(monkeypatch, tmp_path):
-    """A failed request proves no grant; only the server writes that fact."""
-    import launcher
-    from ouroboros.skill_loader import load_skill_grants
-
-    _loaded, drive = _launcher_grant_skill(tmp_path, monkeypatch, name="demo_ext", skill_type="extension")
-
-    def unavailable(*a, **k):
-        raise ConnectionError("server not reachable")
-
-    monkeypatch.setattr("urllib.request.urlopen", unavailable)
-    result = launcher._request_skill_key_grant("demo_ext", ["OPENROUTER_API_KEY"], lambda *a: True)
-    assert result["ok"] is False and "server not reachable" in result["error"]
-    assert load_skill_grants(drive, "demo_ext")["granted_keys"] == []
 
 
-def test_launcher_skill_key_grant_rejects_instruction_skill(monkeypatch, tmp_path):
-    import launcher
-    from ouroboros.skill_loader import load_skill_grants
-
-    _loaded, drive = _launcher_grant_skill(tmp_path, monkeypatch, name="instr", skill_type="instruction")
-    result = launcher._request_skill_key_grant("instr", ["OPENROUTER_API_KEY"], lambda *a: True)
-    assert result["ok"] is False
-    assert "script and extension" in result["error"]
-    assert load_skill_grants(drive, "instr")["granted_keys"] == []

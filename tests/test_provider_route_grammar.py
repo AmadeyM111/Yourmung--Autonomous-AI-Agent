@@ -59,29 +59,8 @@ def test_normalize_model_identity(value, expected):
     assert normalize_model_identity(value) == expected
 
 
-def test_tables_derive_from_the_kind_table():
-    assert list(pm.PROVIDER_KINDS) == ["openrouter", "openai", "anthropic", "deepseek", "zai", "minimax",
-                                       "cloudru", "gigachat", "openai-compatible"]
-    assert pm.PROVIDER_ENV_KEYS == {kind: spec.fields[0][1] for kind, spec in pm.PROVIDER_KINDS.items()
-                                    if kind not in {"gigachat", "openai-compatible"}}
-    secrets = {flat for spec in pm.PROVIDER_KINDS.values() for _field, flat, secret in spec.fields if secret}
-    assert pm.MODEL_PROVIDER_CREDENTIAL_KEYS == secrets | {pm.CONNECTIONS_KEY}
-    assert secrets == {"OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY",
-                       "ZAI_API_KEY", "MINIMAX_API_KEY", "CLOUDRU_FOUNDATION_MODELS_API_KEY",
-                       "GIGACHAT_CREDENTIALS", "GIGACHAT_PASSWORD", "OPENAI_COMPATIBLE_API_KEY"}
-    assert pm.PROVIDER_CREDENTIAL_GROUPS["openai-compatible"][-2:] == ("OPENAI_API_KEY", "OPENAI_BASE_URL")
-    assert pm.ROUTE_CREDENTIAL_SETTING_KEYS == pm.ALL_PROVIDER_CREDENTIAL_KEYS | {pm.CONNECTIONS_KEY}
-    assert {"OPENAI_API_KEY", "OPENAI_BASE_URL"} <= pm.ROUTE_CREDENTIAL_SETTING_KEYS
-    assert {prefix for prefix, _kind in pm.PROVIDER_PREFIXES} == {f"{k}::" for k in ("claudexor", *pm.PROVIDER_KINDS)}
 
 
-def test_readiness_keys_keep_the_review_migration_digest_membership():
-    # review_pool_migration keys its receipts by this presence set: the membership is pinned.
-    assert pm.READINESS_SETTING_KEYS == {
-        "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MINIMAX_API_KEY", "DEEPSEEK_API_KEY",
-        "ZAI_API_KEY", "CLOUDRU_FOUNDATION_MODELS_API_KEY", "GIGACHAT_CREDENTIALS", "GIGACHAT_USER",
-        "GIGACHAT_PASSWORD", "OPENAI_BASE_URL", "OPENAI_COMPATIBLE_BASE_URL",
-    }
 
 
 def test_connections_setting_is_registered_secret_and_not_exported():

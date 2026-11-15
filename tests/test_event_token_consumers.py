@@ -60,30 +60,6 @@ def test_nested_usage_preserves_the_envelope_version():
     assert evidence["prompt_tokens"]["known_total"] == 0
 
 
-def test_editbench_retains_lower_bounds_deduplicates_and_keeps_money_unchanged(tmp_path):
-    from devtools.benchmarks.editbench.run_editbench import _mine_metrics, _summarize
-
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    rows = [
-        _row(task_id="t", ledger_attempt_ids=["a"], prompt_tokens=10, completion_tokens=3,
-             cached_tokens=0, cache_write_tokens=2, cost=0.25),
-        _row(task_id="t", ledger_attempt_ids=["b"], prompt_tokens=None, completion_tokens=0,
-             cached_tokens=0, cache_write_tokens=None, cost=None),
-    ]
-    (logs / "events.jsonl").write_text("".join(json.dumps(row) + "\n" for row in [*rows, rows[0]]))
-    metrics = _mine_metrics(tmp_path, "t")
-    usage = metrics["usage"]
-    assert usage["llm_calls"] == 2 and usage["cost_usd"] == 0.25
-    assert usage["prompt_tokens"] is None and usage["completion_tokens"] == 3
-    assert usage["cached_tokens"] == 0 and usage["cache_write_tokens"] is None
-    assert usage["token_evidence"]["prompt_tokens"]["known_total"] == 10
-    assert usage["token_evidence"]["prompt_tokens"]["unknown_count"] == 1
-    summary = _summarize([{"config": "full", "pass": True, "files_matched": 1, "wall_sec": 3, **metrics}])
-    assert summary["t1_rename/full"]["avg_prompt_tokens"] is None
-    assert summary["t1_rename/full"]["avg_completion_tokens"] == 3
-    assert summary["t1_rename/full"]["token_evidence"]["prompt_tokens"]["known_total"] == 10
-    assert summary["t1_rename/full"]["token_evidence"]["prompt_tokens"]["unknown_count"] == 1
 
 
 @pytest.mark.parametrize("prompt, expected", [(None, False), (0, False), (8, True)])
@@ -101,19 +77,3 @@ def test_live_scenario_requires_positive_evidence_without_inventing_totals(promp
     assert facts["token_evidence"]["prompt_tokens"]["known_total"] == (prompt or 0)
 
 
-def test_cowork_audit_preserves_legacy_ambiguity_without_changing_money(tmp_path):
-    from devtools.benchmarks.cowork_bench.audit_cowork_bench import audit_task
-
-    logs = tmp_path / "ouroboros"
-    logs.mkdir()
-    rows = [{"type": "llm_usage", "prompt_tokens": 0, "completion_tokens": 4,
-             "cached_tokens": 0, "cost": 0.25}]
-    (logs / "events.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
-    (logs / "tools.jsonl").write_text("")
-    (tmp_path / "ouroboros_summary.json").write_text("{}")
-    audit = audit_task(tmp_path, {"status": "passed"})
-    assert audit["activity"]["prompt_tokens"] is None
-    assert audit["activity"]["completion_tokens"] == 4
-    assert audit["activity"]["cache_write_tokens"] is None
-    assert audit["activity"]["token_evidence"]["prompt_tokens"]["legacy_zero_count"] == 1
-    assert audit["cost"]["total_usd"] == 0.25 and audit["cost"]["complete"] is True

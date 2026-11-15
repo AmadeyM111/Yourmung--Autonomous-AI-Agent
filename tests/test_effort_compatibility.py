@@ -572,26 +572,6 @@ def test_switch_model_next_round_keeps_preference_after_native_projection(tmp_pa
     assert _apply_runtime_overrides(ctx, model, local, effort) == ("openai::future", False, "ultra")
 
 
-def test_native_omission_is_recorded_without_inventing_provider_effort(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-
-    sent = []
-    completion = SimpleNamespace(choices=[SimpleNamespace(
-        message=SimpleNamespace(content="done", function_call=None), finish_reason="stop")])
-    client = LLMClient(api_key="unused")
-    monkeypatch.setattr(client, "_get_gigachat_client", lambda *a, **kw: SimpleNamespace(
-        chat=lambda payload: sent.append(payload) or completion))
-    target = _target("gigachat", "GigaChat")
-    with ua.usage_scope(ua.UsageScope(drive_root=tmp_path, task_id="omitted")):
-        _, usage = client._chat_gigachat(target, [], None, "ultra", 32, "auto")
-    assert len(sent) == 1 and "reasoning_effort" not in sent[0]
-    assert usage["effort"] == {
-        "requested": "ultra", "sent": {}, "sent_state": "omitted", "sent_source": "host_candidate",
-        "reported": None, "report_source": None,
-    }
-    rows = ledger_rows(tmp_path)
-    assert rows[-1]["state"] == "settled"
-    assert rows[-1]["effort"] == usage["effort"]
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])

@@ -303,19 +303,6 @@ def test_cooldown_error_kinds_include_rate_limit_but_not_in_retry_kinds():
 
 # ------------------------------------ credentialed-model resolver parses chain (C2)
 
-def test_resolve_credentialed_model_parses_fallbacks_chain(monkeypatch, tmp_path):
-    from ouroboros.provider_models import resolve_credentialed_model
-    # Only OpenRouter is credentialed in this install; Light saved blank follows Main (route_choice).
-    for k in ("GIGACHAT_CREDENTIALS", "GIGACHAT_USER", "GIGACHAT_PASSWORD",
-              "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CLOUDRU_FOUNDATION_MODELS_API_KEY"):
-        monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "")
-    # First chain entry uncredentialed (gigachat), second routes via OpenRouter.
-    saved_settings(monkeypatch, tmp_path, OPENROUTER_API_KEY="or-key", OUROBOROS_MODEL="gigachat::GigaChat",
-                   OUROBOROS_MODEL_LIGHT="", OUROBOROS_MODEL_FALLBACKS="gigachat::nocreds, anthropic/claude-sonnet-4.6")
-    # The resolver must parse the chain and return the credentialed SECOND entry — not
-    # test the raw comma-string as one (broken) model id, nor skip past it.
-    assert resolve_credentialed_model("gigachat::GigaChat") == "anthropic/claude-sonnet-4.6"
 
 
 def test_empty_light_slot_inherits_main_routing_even_when_models_match(monkeypatch, tmp_path):

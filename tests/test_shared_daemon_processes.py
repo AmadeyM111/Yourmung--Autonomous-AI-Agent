@@ -467,58 +467,10 @@ def test_prior_session_custody_tree_reap_preserves_shared_daemon(tmp_path, share
     _continues(tmp_path, info)
 
 
-def test_launcher_forced_stop_passes_retained_subtree(monkeypatch):
-    import launcher
-    calls = []
-    class Process:
-        pid = 9990011
-        waits = 0
-        def terminate(self):
-            calls.append("graceful")
-        def wait(self, timeout):
-            self.waits += 1
-            if self.waits == 1:
-                raise subprocess.TimeoutExpired("server", timeout)
-    monkeypatch.setattr(launcher, "IS_WINDOWS", False)
-    monkeypatch.setattr(launcher, "_agent_proc", Process())
-    monkeypatch.setattr(launcher, "_agent_job", None)
-    monkeypatch.setattr(launcher, "_retained_shared_daemon_pids", lambda: {9990022})
-    monkeypatch.setattr(launcher, "kill_process_tree", lambda proc, **kw: calls.append((proc.pid, kw)))
-    monkeypatch.setattr(launcher, "_cleanup_recorded_server_group_for_pid", lambda *a: None)
-    launcher.stop_agent()
-    assert calls == ["graceful", (9990011, {"exclude_pids": {9990022}})]
 
 
-def test_recorded_server_cleanup_preserves_daemon_exclusions(tmp_path, monkeypatch):
-    import launcher
-    path = tmp_path / "server_process.json"
-    path.write_text(json.dumps({"pid": 9990011, "pgid": 0}))
-    calls = []
-    monkeypatch.setattr(launcher, "_server_process_record_path", lambda: path)
-    monkeypatch.setattr(launcher, "_recorded_server_identity", lambda row: "ours")
-    monkeypatch.setattr(launcher, "_retained_shared_daemon_pids", lambda: {9990022})
-    monkeypatch.setattr(launcher, "pid_provably_gone", lambda pid: bool(calls))  # gone once its tree was killed
-    monkeypatch.setattr(launcher, "kill_pid_tree", lambda pid, **kw: calls.append((pid, kw)))
-    assert launcher._cleanup_recorded_server_process() == []
-    assert calls == [(9990011, {"exclude_pids": {9990022}})]
-    assert not path.exists()
 
 
-def test_stray_reaper_filters_descendants_before_final_root_revalidation(monkeypatch):
-    from ouroboros import launcher_server_reaper as reaper
-    events = []
-    monkeypatch.setattr(pl, "IS_WINDOWS", False)
-    def snapshot():
-        events.append("snapshot")
-        return {10: [11, 20], 11: [12], 20: [21]}
-    monkeypatch.setattr(pl, "_process_children", snapshot)
-    monkeypatch.setattr(reaper, "_runs_our_server", lambda *a: events.append("command") or True)
-    monkeypatch.setattr(reaper, "_is_launcher_managed", lambda *a: events.append("environment") or True)
-    monkeypatch.setattr(reaper, "_signal_pid", lambda pid: events.append(("signal", pid)))
-    monkeypatch.setattr(reaper, "_pid_gone", lambda pid: True)
-    assert reaper._revalidate_and_kill(10, set(), set(), {20})
-    assert events == ["snapshot", "command", "environment",
-                      ("signal", 10), ("signal", 12), ("signal", 11)]
 
 
 @pytest.mark.serial

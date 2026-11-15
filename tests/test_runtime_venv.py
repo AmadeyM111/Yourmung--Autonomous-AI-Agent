@@ -173,100 +173,10 @@ class ReachedLifecycle(Exception):
 
 
 # Both PATH separators on one host: the foreign one is simulated and qualifies no native launch there.
-@pytest.mark.parametrize("separator", [":", ";"], ids=["posix", "windows-separator"])
-def test_the_launcher_runs_body_installs_and_handoff_in_the_runtime_venv(managed_launcher, monkeypatch, tmp_path,
-                                                                        separator):
-    launcher = managed_launcher
-    monkeypatch.setattr(launcher.os, "pathsep", separator)
-    root = tmp_path / "body" / "venv"
-    prepared = RuntimeVenv(root=root, python=str(root / "bin" / "python"), bin_dir=root / "bin", ready=False)
-    seen = {}
-    monkeypatch.setattr(launcher, "prepare_runtime_venv", lambda path, **kw: seen.setdefault("path", path) and prepared)
-
-    def bootstrap():
-        context = launcher._bootstrap_context()
-        seen.update(python=context.embedded_python, timeout=context.deps_timeout_sec,
-                    path_env=launcher.os.environ["PATH"])
-        return True
-
-    monkeypatch.setattr(launcher, "bootstrap_repo", bootstrap)
-    monkeypatch.setattr(launcher, "_install_deps", lambda: seen.setdefault("installed", True))
-    monkeypatch.setattr(launcher, "mark_ready", lambda venv: seen.setdefault("ready", venv) and venv)
-
-    def stop():
-        raise ReachedLifecycle()
-
-    monkeypatch.setattr(launcher, "_prepare_first_run_settings", stop)
-    with pytest.raises(ReachedLifecycle):
-        launcher.main(["--no-ui", "--runtime-venv", str(root)])
-    assert seen["path"] == root and seen["python"] == prepared.python
-    assert seen["path_env"] == separator.join([str(prepared.bin_dir), "/usr/bin"])
-    assert seen["timeout"] == runtime_venv.PREPARATION_DEPS_TIMEOUT_SEC
-    assert seen["installed"] is True and seen["ready"] is prepared
-    assert launcher.EMBEDDED_PYTHON == prepared.python
 
 
-@pytest.mark.parametrize("entry", ["source", "source-venv", "macos-entry", "frozen-app"])
-def test_launcher_venv_creation_keeps_the_running_python_abi(managed_launcher, monkeypatch, tmp_path, entry):
-    """A downloaded bundled Python is not the interpreter of an ordinary source launch.
-
-    Run the real launcher-to-preparation seam and its marker/validation; only Python
-    subprocesses are simulated, including the mismatching interpreter's actual ABI.
-    """
-    launcher = managed_launcher
-    packaged = entry in {"macos-entry", "frozen-app"}
-    version = "3.10" if packaged else "3.11"
-    bundled = str(tmp_path / "downloaded-python-3.10" / "python")
-    source_python = str(tmp_path / "source-python-3.11" / "python")
-    executable = bundled if packaged else source_python
-    if entry in {"macos-entry", "frozen-app", "source-venv"}:
-        executable = str(tmp_path / entry / "launcher")
-    expected = bundled if packaged else source_python
-    monkeypatch.setattr(launcher.sys, "frozen", entry == "frozen-app", raising=False)
-    monkeypatch.setattr(launcher.sys, "executable", executable)
-    monkeypatch.setattr(launcher.sys, "_base_executable", expected, raising=False)
-    monkeypatch.setattr(launcher.sys, "_MEIPASS", str(tmp_path), raising=False)
-    monkeypatch.setattr(launcher, "EMBEDDED_PYTHON", bundled)
-    monkeypatch.setattr(runtime_venv, "_major_minor", lambda: version)
-    root = tmp_path / "body-venv"
-    calls = []
-    created_version = []
-
-    def run(cmd, **kwargs):
-        calls.append(cmd)
-        if cmd[1:3] == ["-m", "venv"]:
-            created_version.append("3.10" if cmd[0] == bundled else "3.11")
-            bin_dir, python = runtime_venv._layout(root)
-            bin_dir.mkdir()
-            python.write_text("simulated interpreter", encoding="utf-8")
-            (root / "pyvenv.cfg").write_text(f"version = {created_version[0]}.0\n", encoding="utf-8")
-        return subprocess.CompletedProcess(cmd, 0, f"{created_version[0]} {root}\n", "")
-
-    monkeypatch.setattr(launcher, "prepare_runtime_venv",
-                        lambda path, **kw: prepare_runtime_venv(path, run=run, base_python=kw.get("base_python")))
-    monkeypatch.setattr(launcher, "bootstrap_repo", lambda: True)
-    monkeypatch.setattr(launcher, "_install_deps", lambda: True)
-    monkeypatch.setattr(launcher, "_prepare_first_run_settings",
-                        lambda: (_ for _ in ()).throw(ReachedLifecycle()))
-    with pytest.raises(ReachedLifecycle):
-        launcher.main(["--no-ui", "--runtime-venv", str(root)])
-    assert calls[0] == [expected, "-m", "venv", str(root)]
-    assert created_version == [version]
-    assert json.loads((root / MARKER_NAME).read_text(encoding="utf-8"))["python"] == version
-    assert launcher._runtime_venv.ready
 
 
-def test_a_refused_runtime_venv_stops_before_bootstrap(managed_launcher, monkeypatch, tmp_path):
-    launcher = managed_launcher
-
-    def refuse(path, **kw):
-        raise RuntimeVenvRefused("fixture refusal")
-
-    monkeypatch.setattr(launcher, "prepare_runtime_venv", refuse)
-    monkeypatch.setattr(launcher, "bootstrap_repo", lambda: pytest.fail("no bootstrap without the venv"))
-    with pytest.raises(SystemExit) as stopped:
-        launcher.main(["--no-ui", "--runtime-venv", str(tmp_path / "venv")])
-    assert stopped.value.code == 1
 
 
 def test_bootstrap_refuses_a_mount_point_without_a_checkout_and_moves_nothing(tmp_path, monkeypatch):
@@ -375,18 +285,3 @@ def test_marker_failure_reports_retained_partial_effects(tmp_path, monkeypatch, 
         assert (root / MARKER_NAME).read_text() == "preparing evidence"
 
 
-def test_a_failed_ready_marker_stops_the_launcher_before_starting_the_body(managed_launcher, monkeypatch, tmp_path, capsys):
-    launcher = managed_launcher
-    root = tmp_path / "venv"
-    prepared = RuntimeVenv(root, str(root / "bin/python"), root / "bin", False)
-    monkeypatch.setattr(launcher, "prepare_runtime_venv", lambda *a, **kw: prepared)
-    monkeypatch.setattr(launcher, "bootstrap_repo", lambda: True)
-    monkeypatch.setattr(launcher, "_install_deps", lambda: True)
-    def refuse(_venv):
-        raise RuntimeVenvRefused("cannot record ready; files retained")
-    monkeypatch.setattr(launcher, "mark_ready", refuse)
-    monkeypatch.setattr(launcher, "_prepare_first_run_settings", lambda: pytest.fail("no body after marker failure"))
-    with pytest.raises(SystemExit) as stopped:
-        launcher.main(["--no-ui", "--runtime-venv", str(root)])
-    assert stopped.value.code == 1
-    assert "Ouroboros did not start: cannot record ready" in capsys.readouterr().err

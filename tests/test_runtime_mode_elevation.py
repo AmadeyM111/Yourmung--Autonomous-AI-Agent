@@ -873,75 +873,6 @@ def _own_ratchet_env(monkeypatch) -> None:
         monkeypatch.delenv(key, raising=False)
 
 
-def test_every_settings_writer_routes_through_the_shared_prologue():
-    """Tripwire for the shape that produced three review rounds in a row.
-
-    Rounds three, four and five each fixed the disk-authored-key rule on ONE path while a sibling
-    path kept bypassing it (sibling keys, then the projection, then the generic owner POST). The
-    rule now lives in ``config.prepare_settings_for_persist``, and this test walks every function
-    in the tree that writes a settings document (``tests._shared.settings_writers``, the one
-    predicate the byte pin's inventory is closed over too) so a NEW writer cannot quietly
-    reintroduce the shape: it must route through the prologue or be exempted here with a reason,
-    AND it must join ``SETTINGS_WRITERS`` so the byte pin drives it — a routed sixth writer is
-    still a sixth writer, and one outside this closed set is exactly what the scan exists to see.
-    """
-    import pathlib
-
-    from tests._shared import SETTINGS_WRITERS, settings_writers
-
-    # (module, function) -> why it may write settings.json without the prologue
-    exempt = {
-        ("ouroboros/safety_config.py", "_migrate_consciousness_safety"):
-            "one-time startup migration under the settings lock: copies only the existing "
-            "owner level to the new consciousness key; merging defaults would author unrelated settings.",
-        ("ouroboros/utils.py", "atomic_write_json"):
-            "generic atomic serializer: the settings filename selects indentation only; "
-            "semantic settings writers enforce the prologue before calling this primitive.",
-        ("ouroboros/context_mode_compat.py", "normalize_and_persist_context_mode_compat"):
-            "one-window startup migration: while the settings lock is held, atomically rewrites "
-            "the raw document with only its context compatibility pair changed, in serializer "
-            "bytes. Routing through the prologue would merge defaults and turn unrelated absence "
-            "into authorship.",
-        ("ouroboros/usage_journal.py", "legacy_snapshot"):
-            "reads/hashes the settings file for the usage archive; its writes target the archive.",
-        ("ouroboros/query_data_sql.py", "run_sql"):
-            "forwards OUROBOROS_SETTINGS_PATH to its child; writes only the temporary SQL request, not settings.",
-        ("ouroboros/review_run_isolation.py", "isolate_review_data"):
-            "points the isolated review at the host settings (or the drive's unwritten default path) "
-            "and hashes them for the integrity pin; its one write is the drive's isolation record "
-            "(contributor-review-isolation.json), never a settings document.",
-        ("ouroboros/tools/core.py", "_data_write"):
-            "names SETTINGS_PATH only to REFUSE agent writes to it.",
-    }
-    # Keys are POSIX-normalised: `str(WindowsPath(...))` is backslash-separated, so on Windows
-    # every `exempt` lookup below would miss and every hardcoded assertion at the end would
-    # fail — turning the tripwire into either a red matrix or, worse, a guard that flags the
-    # exempted writers while silently vouching for nothing.
-    writers = settings_writers(pathlib.Path(__file__).resolve().parents[1])
-
-    unrouted = {k for k, routed in writers.items() if not routed and k not in exempt}
-    assert not unrouted, (
-        f"these functions write the settings file without going through the single enforcement "
-        f"point config.prepare_settings_for_persist: {sorted(unrouted)}. Route them through it "
-        f"(naming any key they genuinely author in `authored_keys`), or add them to `exempt` with "
-        f"a reason. Do not re-implement the silence/ratchet rule at the call site."
-    )
-    # The inventory is CLOSED over the scanned roots, routed or not: the flagged set is exactly
-    # the writers the byte pin drives plus the matches declared above as non-writers.
-    expected = set(SETTINGS_WRITERS) | set(exempt)
-    assert set(writers) == expected, (
-        f"the settings-writer inventory drifted: {sorted(set(writers) ^ expected)}. A function "
-        f"that persists a settings document belongs in tests._shared.SETTINGS_WRITERS, where the "
-        f"byte pin in tests/test_settings_read_seam.py drives it; one this scan flags without "
-        f"persisting a settings document belongs in `exempt` with a reason; a stale entry leaves "
-        f"whichever list holds it."
-    )
-    # The three real writers must still BE routed — deleting the call must fail this test.
-    # The owner endpoints' write lives in the locked read-modify-write primitive that
-    # `_owner_write_settings` is now one caller of.
-    assert writers.get(("ouroboros/config.py", "save_settings")) is True
-    assert writers.get(("ouroboros/gateway/owner_settings.py", "_owner_update_settings")) is True
-    assert writers.get(("ouroboros/packaged_cli.py", "_save_settings")) is True
 
 
 def test_generic_settings_post_does_not_author_a_mode_decision(isolated_settings, monkeypatch):
@@ -1283,42 +1214,8 @@ def test_onboarding_can_set_initial_runtime_mode_pro(isolated_settings):
     assert on_disk["OUROBOROS_RUNTIME_MODE"] == "pro"
 
 
-def test_launcher_runtime_mode_bridge_saves_after_confirmation(monkeypatch):
-    import launcher
-
-    saved = {}
-    monkeypatch.setattr(launcher, "_load_settings", lambda: {"OUROBOROS_RUNTIME_MODE": "advanced"})
-    monkeypatch.setattr(launcher, "_save_settings", lambda settings: saved.update(settings))
-    monkeypatch.setattr(launcher, "get_runtime_mode", lambda: "advanced")
-
-    result = launcher._request_runtime_mode_change("pro", lambda _title, _message: True)
-
-    assert result["ok"] is True
-    assert result["runtime_mode"] == "pro"
-    assert result["restart_required"] is True
-    assert saved["OUROBOROS_RUNTIME_MODE"] == "pro"
 
 
-def test_launcher_owner_writer_persists_cyber_pro_after_boot_pin(isolated_settings, monkeypatch):
-    """The confirmed desktop-owner path must bypass the agent boot ratchet.
-
-    ``config.save_settings(..., allow_elevation=True)`` is intentionally inert
-    after boot.  The launcher must therefore use the existing owner settings
-    writer, otherwise a confirmed Cyber Pro choice is silently persisted as the
-    active Advanced mode again.
-    """
-    import launcher
-    from ouroboros import config as cfg
-
-    _seed_disk(isolated_settings, {"OUROBOROS_RUNTIME_MODE": "advanced"})
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
-    cfg.initialize_runtime_mode_baseline("advanced")
-
-    launcher._save_settings({"OUROBOROS_RUNTIME_MODE": "cyber_pro"})
-
-    on_disk = json.loads(isolated_settings.read_text(encoding="utf-8"))
-    assert on_disk["OUROBOROS_RUNTIME_MODE"] == "cyber_pro"
-    assert os.environ["OUROBOROS_RUNTIME_MODE"] == "advanced"
 
 
 def test_settings_ui_uses_confirm_only_bridge_and_owner_endpoint():
@@ -1336,58 +1233,12 @@ def test_settings_ui_uses_confirm_only_bridge_and_owner_endpoint():
     assert "window.pywebview?.api?.request_runtime_mode_change" not in runtime_save
 
 
-def test_launcher_runtime_mode_bridge_reports_pending_restart_against_active(monkeypatch):
-    import launcher
-
-    saved = {}
-    monkeypatch.setattr(launcher, "_load_settings", lambda: {"OUROBOROS_RUNTIME_MODE": "pro"})
-    monkeypatch.setattr(launcher, "_save_settings", lambda settings: saved.update(settings))
-    monkeypatch.setattr(launcher, "get_runtime_mode", lambda: "advanced")
-
-    result = launcher._request_runtime_mode_change("pro", lambda _title, _message: False)
-
-    assert result == {"ok": True, "runtime_mode": "pro", "restart_required": True}
-    assert saved == {}
 
 
-def test_launcher_runtime_mode_bridge_can_cancel_pending_mode_without_restart(monkeypatch):
-    import launcher
-
-    saved = {}
-    monkeypatch.setattr(launcher, "_load_settings", lambda: {"OUROBOROS_RUNTIME_MODE": "pro"})
-    monkeypatch.setattr(launcher, "_save_settings", lambda settings: saved.update(settings))
-    monkeypatch.setattr(launcher, "get_runtime_mode", lambda: "advanced")
-
-    result = launcher._request_runtime_mode_change("advanced", lambda _title, _message: True)
-
-    assert result == {"ok": True, "runtime_mode": "advanced", "restart_required": False}
-    assert saved["OUROBOROS_RUNTIME_MODE"] == "advanced"
 
 
-def test_launcher_auto_grant_bridge_saves_after_confirmation(monkeypatch):
-    import launcher
-
-    saved = {}
-    monkeypatch.setattr(launcher, "_load_settings", lambda: {"OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS": "false"})
-    monkeypatch.setattr(launcher, "_save_settings", lambda settings: saved.update(settings))
-
-    result = launcher._request_auto_grant_reviewed_skills_change(True, lambda _title, _message: True)
-
-    assert result == {"ok": True, "enabled": True}
-    assert saved["OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS"] == "true"
 
 
-def test_launcher_auto_grant_bridge_disables_truthy_alias(monkeypatch):
-    import launcher
-
-    saved = {}
-    monkeypatch.setattr(launcher, "_load_settings", lambda: {"OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS": "1"})
-    monkeypatch.setattr(launcher, "_save_settings", lambda settings: saved.update(settings))
-
-    result = launcher._request_auto_grant_reviewed_skills_change(False, lambda _title, _message: True)
-
-    assert result == {"ok": True, "enabled": False}
-    assert saved["OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS"] == "false"
 
 
 

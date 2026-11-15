@@ -252,36 +252,6 @@ def _ci_pytest_suite_commands(job: str) -> list[tuple[str, str]]:
                       r'tests/ -m "([^"]+)"(.*)', block.group(1))
 
 
-@pytest.mark.parametrize("job", ["quick-test", "full-test-runs"])
-def test_each_ci_job_runs_the_same_split_the_gate_runs(job, monkeypatch):
-    """The gate's whole promise is "what CI will do, before you push". Both jobs
-    must carry BOTH passes with the gate's own markexprs and the gate's own
-    parallel flag vector — checked per job, because a search of the whole
-    workflow file stays green while either job alone drifts, and it never
-    compared `PARALLEL_PASS_FLAGS` against any CI command at all."""
-    from ouroboros import preflight_runner as pr
-
-    monkeypatch.delenv("OUROBOROS_PREFLIGHT_SERIAL", raising=False)
-    commands = _ci_pytest_suite_commands(job)
-    assert len(commands) == 2, f"{job} runs {len(commands)} full-suite passes, expected 2"
-    (ci_parallel_markexpr, ci_parallel_tail), (ci_serial_markexpr, ci_serial_tail) = commands
-
-    gate_parallel, gate_serial = pr._preflight_pass_specs()
-    assert ci_parallel_markexpr == gate_parallel.args[2], f"{job} parallel markexpr drifted from the gate"
-    assert ci_serial_markexpr == gate_serial.args[2], f"{job} serial markexpr drifted from the gate"
-
-    # The exact flag VECTOR, contiguous and in order: `--dist loadscope` without
-    # `--max-worker-restart=0` is a different gate, and so is the same set in an
-    # order that separates a flag from its value.
-    assert " ".join(pr.PARALLEL_PASS_FLAGS) in ci_parallel_tail, (
-        f"{job}'s parallel pass no longer runs PARALLEL_PASS_FLAGS verbatim: {ci_parallel_tail!r}"
-    )
-    # ...and the serial pass carries the gate's serial flags and none of the xdist ones.
-    assert " ".join(pr.SERIAL_PASS_FLAGS) in ci_serial_tail, (
-        f"{job}'s serial pass no longer runs SERIAL_PASS_FLAGS verbatim: {ci_serial_tail!r}"
-    )
-    for flag in set(pr.PARALLEL_PASS_FLAGS) - set(pr.SERIAL_PASS_FLAGS):
-        assert flag not in ci_serial_tail.split(), f"{job}'s serial pass carries {flag}"
 
 
 def test_explicit_pytest_args_stay_single_pass():
@@ -423,28 +393,6 @@ def test_plugin_verification_passes_on_the_interpreter_running_this_suite(tmp_pa
     assert _verify_preflight_plugins(sys.executable, tmp_path) == []
 
 
-def test_the_real_spawn_lane_declares_which_tests_go_dark_when_it_skips():
-    """The skip must be self-reporting. Twelve `s` characters in pytest's dot
-    output are indistinguishable from twelve passes at a glance, and the whole
-    point of the marker is that the tests it guards are the ONLY behavioural
-    proofs of the forced-plugin and worker-probe machinery the gate injects into
-    every real parallel pass. So the reason names the distributions to install
-    AND the flag that converts the skip into a failure."""
-    assert "pytest-xdist>=3.5" in _REAL_SPAWN_SKIP_REASON
-    assert "pytest-timeout>=2.1" in _REAL_SPAWN_SKIP_REASON
-    assert _REQUIRE_PLUGINS_ENV in _REAL_SPAWN_SKIP_REASON
-    # ...and CI, which provisions the plugins, declares the flag — otherwise no
-    # shipped environment ever executes the lane and the pins stay inert.
-    ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    for job in ("quick-test", "full-test-runs"):
-        block = re.search(
-            rf"^  {re.escape(job)}:\n(.*?)(?=^  [A-Za-z0-9_-]+:$|\Z)", ci, re.MULTILINE | re.DOTALL
-        )
-        assert block, f"ci.yml has no `{job}:` job"
-        assert f'{_REQUIRE_PLUGINS_ENV}: "1"' in block.group(1), (
-            f"{job} installs the plugins but does not require them, so a provisioning "
-            "regression there would show up as silent skips"
-        )
 
 
 def test_plugin_verification_reports_an_absent_module(tmp_path):

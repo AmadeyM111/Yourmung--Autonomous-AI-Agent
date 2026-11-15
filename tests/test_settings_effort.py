@@ -193,26 +193,6 @@ def test_factory_pool_seats_main_once_in_anthropic_only_mode():
     ]
 
 
-def test_factory_pool_routes_to_gigachat_in_gigachat_only_mode(monkeypatch):
-    """v6.14.0: GigaChat joins the direct-provider review panel. A GigaChat-only
-    install (no other provider) gets a gigachat:: review pool, never an empty one
-    or an unconfigured foreign provider — the single-isolated-provider invariant
-    (docs/DEVELOPMENT.md "Provider Independence"). GIGACHAT_DIRECT_DEFAULTS uses the
-    universally available GigaChat-2-Max for every slot, so the panel is Main once — one
-    catalog row (PR-3; owner Q5=A)."""
-    monkeypatch.setenv("GIGACHAT_CREDENTIALS", "giga-creds")
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
-    monkeypatch.delenv("OPENAI_COMPATIBLE_API_KEY", raising=False)
-    monkeypatch.delenv("CLOUDRU_FOUNDATION_MODELS_API_KEY", raising=False)
-    monkeypatch.delenv("OUROBOROS_MODEL_LIGHT", raising=False)
-    monkeypatch.setenv("OUROBOROS_MODEL", "gigachat::GigaChat-2-Max")
-
-    assert _factory_pool_models({"GIGACHAT_CREDENTIALS": "giga-creds", "OUROBOROS_MODEL": "gigachat::GigaChat-2-Max"}) == [
-        "gigachat::GigaChat-2-Max",
-    ]
 
 
 def test_from_zero_local_only_review_slots_inherit_main_and_stay_local(monkeypatch):

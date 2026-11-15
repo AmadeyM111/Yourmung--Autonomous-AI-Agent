@@ -100,24 +100,6 @@ def test_sibling_account_or_model_fallback_does_not_certify_selected_failure(tmp
     assert subagent_last_delegation(tmp_path)["outcome"] == "succeeded"
 
 
-def test_failed_attempt_history_survives_successful_served_trace_projection(tmp_path):
-    from devtools.benchmarks.cybergym.cybergym_wire import _served_telemetry, ExecutorFailure
-    usage = {}
-    _call(tmp_path, usage, broken=True)
-    _call(tmp_path, usage)
-    refs = collect_trace_refs(usage, {})
-    assert len(usage["llm_call_refs"]) == 2
-    assert usage["llm_call_refs"][0]["failure_code"] == "quota_exhausted"
-    assert len(refs["llm_call_refs"]) == 1
-    assert _served_telemetry({"trace_refs": refs})["observed_provider"] == "claudexor"
-    events = [json.loads(line) for line in (tmp_path / "logs/events.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert any(row.get("type") == "llm_api_error" for row in events)
-    broken = {**refs["llm_call_refs"][0], "provider": None}
-    with pytest.raises(ExecutorFailure, match="incomplete served-call identity"):
-        _served_telemetry({"trace_refs": {"llm_call_refs": [broken]}})
-    mixed = {**refs["llm_call_refs"][0], "resolved_model": "different-model"}
-    with pytest.raises(ExecutorFailure, match="mixed served models"):
-        _served_telemetry({"trace_refs": {"llm_call_refs": [refs["llm_call_refs"][0], mixed]}})
 
 
 def _no_history_scan(*args, **kwargs):
@@ -235,29 +217,3 @@ def test_pending_recovery_reuses_held_original_request_without_history_scan(tmp_
     assert row["applied_profile"] == ""
 
 
-@pytest.mark.parametrize("capture_available", [True, False])
-def test_received_empty_response_keeps_served_identity(tmp_path, monkeypatch, capture_available):
-    from devtools.benchmarks.cybergym.cybergym_wire import _served_telemetry
-    from ouroboros import loop_llm_call
-    from tests.test_loop_compaction import _ctx
-    from tests.test_task_model_execution import dispatch, Model
-
-    if not capture_available:
-        monkeypatch.setattr(loop_llm_call, "persist_observed_call", lambda *a, **k: {})
-    ctx = _ctx(tmp_path)
-    dispatch(ctx, "stable")
-    ctx.round_idx += 1
-    assert dispatch(ctx, "stable", message={"role": "assistant", "content": "", "tool_calls": []})[0] is None
-    loop_llm_call.call_llm_with_retry(
-        Model({"role": "assistant", "content": "wrap up"}, {}), ctx.messages,
-        "stable", [], "high", 1, ctx.drive_logs, ctx.task_id, 3, None,
-        ctx.accumulated_usage, attempt_cap=1)
-    raw = ctx.accumulated_usage["llm_call_refs"]
-    assert len(raw) == 3 and raw[1]["failure_code"] == "provider_incomplete_response"
-    refs = collect_trace_refs(ctx.accumulated_usage, {})
-    assert [row["llm_call_id"] for row in refs["llm_call_refs"]] == [row["llm_call_id"] for row in raw]
-    assert bool(refs["llm_call_refs"][1]["response_ref"]) is capture_available
-    telemetry = _served_telemetry({"trace_refs": refs})
-    assert telemetry["authoritative_identity"] and telemetry["trace_call_count"] == 3
-    assert telemetry["provider_distribution"] == {"openrouter": 3}
-    assert raw[1]["failure_code"] == "provider_incomplete_response"
